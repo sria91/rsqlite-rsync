@@ -1,0 +1,54 @@
+[package]
+name = "rsqlite-rsync"
+version = "0.1.0"
+edition = "2024"
+description = "Bandwidth-efficient SQLite database sync tool, inspired by sqlite3_rsync"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sria91/rsqlite-rsync"
+
+[[bin]]
+name = "rsqlite-rsync"
+path = "src/main.rs"
+
+[lib]
+name = "rsqlite_rsync"
+path = "src/lib.rs"
+
+[dependencies]
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.11"
+blake3 = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[[test]]
+name = "error_cases"
+path = "tests/integration/error_cases.rs"
+
+[[test]]
+name = "live_writes"
+path = "tests/integration/live_writes.rs"
+
+[[test]]
+name = "local_sync"
+path = "tests/integration/local_sync.rs"
+
+[[test]]
+name = "property_tests"
+path = "tests/integration/property_tests.rs"
