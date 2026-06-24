@@ -13,9 +13,9 @@ use clap::{Parser, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use rsqlite_rsync::SyncTuning;
 use rsqlite_rsync::error::{Result, SyncError};
 use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
+use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI definition
@@ -233,7 +233,7 @@ async fn run(args: Args) -> Result<()> {
                 eprintln!("dry-run: would push {o:?} → {user_host}:{path}");
                 return Ok(());
             }
-            push_sync(
+            push_sync_with_tuning(
                 &o,
                 &user_host,
                 &path,
@@ -250,7 +250,7 @@ async fn run(args: Args) -> Result<()> {
                 eprintln!("dry-run: would pull {user_host}:{path} → {r:?}");
                 return Ok(());
             }
-            pull_sync(
+            pull_sync_with_tuning(
                 &user_host,
                 &path,
                 &r,
@@ -323,84 +323,6 @@ async fn dry_run_local(origin: &Path, replica: &Path) -> Result<()> {
         "dry-run: origin has {page_count} pages ({} bytes)",
         page_count as u64 * o.page_size() as u64
     );
-    Ok(())
-}
-
-/// Push local origin to remote replica over SSH.
-async fn push_sync(
-    origin_path: &Path,
-    user_host: &str,
-    remote_replica: &str,
-    remote_exe: &str,
-    ssh_opts: &[String],
-    ssh_options: &SshConnectOptions,
-    tuning: &SyncTuning,
-) -> Result<()> {
-    use libsqlite3_sys as ffi;
-    use rsqlite_rsync::db::Connection;
-    use rsqlite_rsync::protocol::origin;
-    use rsqlite_rsync::snapshot::Snapshot;
-    use rsqlite_rsync::transport::Transport;
-    use rsqlite_rsync::transport::ssh::SshTransport;
-
-    let origin_conn = Connection::open(origin_path, ffi::SQLITE_OPEN_READONLY)?;
-    let snap = Snapshot::begin(&origin_conn)?;
-
-    let mut transport = SshTransport::connect(
-        user_host,
-        remote_replica,
-        remote_exe,
-        "--server-replica",
-        ssh_opts,
-        ssh_options,
-    )
-    .await?;
-
-    let run_result = origin::run_with_tuning(&snap, &mut transport, tuning).await;
-    let close_result = transport.close().await;
-
-    run_result?;
-    close_result?;
-    snap.commit()?;
-    Ok(())
-}
-
-/// Pull remote origin to local replica over SSH.
-async fn pull_sync(
-    user_host: &str,
-    remote_origin: &str,
-    replica_path: &Path,
-    remote_exe: &str,
-    ssh_opts: &[String],
-    ssh_options: &SshConnectOptions,
-    tuning: &SyncTuning,
-) -> Result<()> {
-    use libsqlite3_sys as ffi;
-    use rsqlite_rsync::db::Connection;
-    use rsqlite_rsync::protocol::replica;
-    use rsqlite_rsync::transport::Transport;
-    use rsqlite_rsync::transport::ssh::SshTransport;
-
-    let replica_conn = Connection::open(
-        replica_path,
-        ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
-    )?;
-
-    let mut transport = SshTransport::connect(
-        user_host,
-        remote_origin,
-        remote_exe,
-        "--server-origin",
-        ssh_opts,
-        ssh_options,
-    )
-    .await?;
-
-    let run_result = replica::run_with_tuning(&replica_conn, &mut transport, tuning).await;
-    let close_result = transport.close().await;
-
-    run_result?;
-    close_result?;
     Ok(())
 }
 

@@ -62,7 +62,9 @@ use crate::db::Connection;
 use crate::error::Result;
 use crate::protocol::{origin, replica};
 use crate::snapshot::Snapshot;
+use crate::transport::Transport;
 use crate::transport::local::LocalTransport;
+use crate::transport::ssh::SshConnectOptions;
 
 const LOCAL_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -127,8 +129,9 @@ impl SyncTuning {
 /// Synchronise two local SQLite databases: make `replica_path` a consistent
 /// copy of `origin_path`.
 ///
-/// This is the primary entry point for local-to-local synchronisation.  For
-/// remote sync, use the CLI or build a custom [`transport::Transport`].
+/// This is the primary entry point for local-to-local synchronisation. For
+/// remote sync, use [`push_sync`] or [`pull_sync`], or build a custom
+/// [`transport::Transport`].
 ///
 /// # Errors
 ///
@@ -184,5 +187,120 @@ pub async fn sync_local_with_tuning(
     replica_res?;
     snap.commit()?;
 
+    Ok(())
+}
+
+/// Push a local origin database to a remote replica over SSH.
+pub async fn push_sync(
+    origin_path: &Path,
+    user_host: &str,
+    remote_replica: &str,
+    remote_exe: &str,
+    ssh_opts: &[String],
+    ssh_options: &SshConnectOptions,
+) -> Result<()> {
+    let tuning = SyncTuning::from_env();
+    push_sync_with_tuning(
+        origin_path,
+        user_host,
+        remote_replica,
+        remote_exe,
+        ssh_opts,
+        ssh_options,
+        &tuning,
+    )
+    .await
+}
+
+/// Push a local origin database to a remote replica over SSH with explicit
+/// runtime tuning.
+pub async fn push_sync_with_tuning(
+    origin_path: &Path,
+    user_host: &str,
+    remote_replica: &str,
+    remote_exe: &str,
+    ssh_opts: &[String],
+    ssh_options: &SshConnectOptions,
+    tuning: &SyncTuning,
+) -> Result<()> {
+    use crate::transport::ssh::SshTransport;
+
+    let origin_conn = Connection::open(origin_path, ffi::SQLITE_OPEN_READONLY)?;
+    let snap = Snapshot::begin(&origin_conn)?;
+
+    let mut transport = SshTransport::connect(
+        user_host,
+        remote_replica,
+        remote_exe,
+        "--server-replica",
+        ssh_opts,
+        ssh_options,
+    )
+    .await?;
+
+    let run_result = origin::run_with_tuning(&snap, &mut transport, tuning).await;
+    let close_result = transport.close().await;
+
+    run_result?;
+    close_result?;
+    snap.commit()?;
+    Ok(())
+}
+
+/// Pull a remote origin database into a local replica over SSH.
+pub async fn pull_sync(
+    user_host: &str,
+    remote_origin: &str,
+    replica_path: &Path,
+    remote_exe: &str,
+    ssh_opts: &[String],
+    ssh_options: &SshConnectOptions,
+) -> Result<()> {
+    let tuning = SyncTuning::from_env();
+    pull_sync_with_tuning(
+        user_host,
+        remote_origin,
+        replica_path,
+        remote_exe,
+        ssh_opts,
+        ssh_options,
+        &tuning,
+    )
+    .await
+}
+
+/// Pull a remote origin database into a local replica over SSH with explicit
+/// runtime tuning.
+pub async fn pull_sync_with_tuning(
+    user_host: &str,
+    remote_origin: &str,
+    replica_path: &Path,
+    remote_exe: &str,
+    ssh_opts: &[String],
+    ssh_options: &SshConnectOptions,
+    tuning: &SyncTuning,
+) -> Result<()> {
+    use crate::transport::ssh::SshTransport;
+
+    let replica_conn = Connection::open(
+        replica_path,
+        ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+    )?;
+
+    let mut transport = SshTransport::connect(
+        user_host,
+        remote_origin,
+        remote_exe,
+        "--server-origin",
+        ssh_opts,
+        ssh_options,
+    )
+    .await?;
+
+    let run_result = replica::run_with_tuning(&replica_conn, &mut transport, tuning).await;
+    let close_result = transport.close().await;
+
+    run_result?;
+    close_result?;
     Ok(())
 }
