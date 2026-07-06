@@ -48,6 +48,7 @@
 
 pub mod db;
 pub mod error;
+pub mod ha;
 pub mod hash;
 pub mod protocol;
 pub mod snapshot;

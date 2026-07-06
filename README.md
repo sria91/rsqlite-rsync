@@ -15,6 +15,8 @@ of SQLite transaction boundaries.
 
 ```
 rsqlite-rsync [OPTIONS] ORIGIN REPLICA
+rsqlite-rsync --ha [HA OPTIONS]
+rsqlite-rsync --batch-manifest PATH [BATCH OPTIONS]
 ```
 
 ORIGIN may remain live while the tool runs. REPLICA should be treated as
@@ -93,6 +95,212 @@ The binary also exposes hidden flags used by the SSH transport:
 
 These are internal implementation details and are not intended for direct use.
 
+### Batch mode (multiple databases)
+
+Use `--batch-manifest` to run multiple origin/replica syncs in one invocation.
+
+Example:
+
+```bash
+rsqlite-rsync --batch-manifest batch-sync.json --batch-jobs 4
+```
+
+Batch options:
+
+- `--batch-manifest PATH` (required for batch mode)
+- `--batch-format <auto|json|yaml|toml>` (default: `auto`)
+- `--batch-jobs N` (default: `1`, must be greater than `0`)
+- `--batch-retries N` (default: `0`; applies per entry attempt loop)
+- `--batch-timeout-secs SECONDS` (default: `0`, disabled when `0`)
+- `--batch-retry-backoff-ms MS` (default: `0`, disabled when `0`)
+- `--batch-retry-backoff-max-ms MS` (default: `0`, no cap when `0`)
+- `--batch-retry-jitter-pct PCT` (default: `0`, valid range `0..=100`)
+
+Manifest schema (JSON):
+
+```json
+{
+  "version": 1,
+  "syncs": [
+    {
+      "name": "users-db",
+      "origin": "/data/origin-users.db",
+      "replica": "/data/replica-users.db"
+    },
+    {
+      "name": "events-db",
+      "origin": "db-primary:/var/lib/sqlite/events.db",
+      "replica": "/var/lib/sqlite/events.db",
+      "dry_run": false,
+      "retries": 2,
+      "timeout_secs": 20,
+      "retry_backoff_ms": 100,
+      "retry_backoff_max_ms": 1000,
+      "retry_jitter_pct": 15
+    }
+  ]
+}
+```
+
+Manifest example (YAML):
+
+```yaml
+version: 1
+syncs:
+  - name: users-db
+    origin: /data/origin-users.db
+    replica: /data/replica-users.db
+    retries: 1
+  - name: events-db
+    origin: db-primary:/var/lib/sqlite/events.db
+    replica: /var/lib/sqlite/events.db
+    timeout_secs: 20
+    retry_backoff_ms: 100
+    retry_backoff_max_ms: 1000
+    retry_jitter_pct: 15
+```
+
+Manifest example (TOML):
+
+```toml
+version = 1
+
+[[syncs]]
+name = "users-db"
+origin = "/data/origin-users.db"
+replica = "/data/replica-users.db"
+retries = 1
+
+[[syncs]]
+name = "events-db"
+origin = "db-primary:/var/lib/sqlite/events.db"
+replica = "/var/lib/sqlite/events.db"
+timeout_secs = 20
+retry_backoff_ms = 100
+retry_backoff_max_ms = 1000
+retry_jitter_pct = 15
+```
+
+Batch semantics:
+
+- Best-effort: all entries are attempted, even if some fail.
+- Exit code: non-zero when any entry fails.
+- Summary: stderr includes total/succeeded/failed and each failed entry.
+- Retries: effective attempts per entry are `1 + retries`.
+- Timeout: may be set globally (`--batch-timeout-secs`) or per entry (`timeout_secs`).
+- Backoff: retries can use exponential delay starting at `--batch-retry-backoff-ms`.
+- Jitter: optional +/- percentage spread on retry delay via `--batch-retry-jitter-pct`.
+- Overrides: per-entry values (for retries, timeout, backoff, jitter) take precedence over global CLI defaults.
+
+Batch option precedence:
+
+| Setting | Global CLI default | Per-entry manifest key | Effective value |
+|------|------|------|------|
+| Retries | `--batch-retries` | `retries` | Entry value if set, else CLI default |
+| Timeout | `--batch-timeout-secs` | `timeout_secs` | Entry value if set, else CLI default |
+| Backoff base | `--batch-retry-backoff-ms` | `retry_backoff_ms` | Entry value if set, else CLI default |
+| Backoff max | `--batch-retry-backoff-max-ms` | `retry_backoff_max_ms` | Entry value if set, else CLI default |
+| Jitter % | `--batch-retry-jitter-pct` | `retry_jitter_pct` | Entry value if set, else CLI default |
+
+### HA control loop mode
+
+`rsqlite-rsync` also includes an HA control loop mode for single-writer
+orchestration. In this mode, the binary continuously evaluates lease/freshness
+inputs and writes role state and action audit outputs.
+
+Example:
+
+```bash
+rsqlite-rsync --ha \
+  --ha-node-id node-a \
+  --ha-lease-file /var/run/rsqlite-rsync/lease.txt \
+  --ha-freshness-file /var/run/rsqlite-rsync/freshness.txt \
+  --ha-role-state-file /var/run/rsqlite-rsync/role_state.txt \
+  --ha-audit-log-file /var/log/rsqlite-rsync/ha_audit.log \
+  --ha-tick-interval-ms 1000 \
+  --ha-min-source-generation 0 \
+  --ha-max-freshness-age-secs 10 \
+  --ha-max-future-skew-secs 2
+```
+
+Required HA flags:
+
+- `--ha-node-id`
+- `--ha-role-state-file`
+- `--ha-audit-log-file`
+
+Lease source flags:
+
+- `--ha-lease-source` (`file` or `kubernetes`, default: `file`)
+- For `file`: `--ha-lease-file`
+- For `kubernetes`: `--ha-kube-lease-name`
+
+Optional Kubernetes lease flags:
+
+- `--ha-kube-namespace` (default: `default`)
+- `--ha-kube-context`
+- `--ha-kubeconfig`
+- `--ha-kubectl-path` (default: `kubectl`)
+
+Optional HA flags:
+
+- `--ha-freshness-file`
+- `--ha-readiness-file`
+- `--ha-readiness-http-bind` (for example, `127.0.0.1:8088`)
+- `--ha-tick-interval-ms` (minimum enforced tick: `50ms`)
+- `--ha-min-source-generation`
+- `--ha-max-freshness-age-secs`
+- `--ha-max-future-skew-secs`
+- `--ha-continue-on-error`
+- `--ha-startup-fence-mode` (`permissive` or `require-writer`)
+
+Lease file format (`--ha-lease-file`):
+
+```text
+holder_node_id=node-a
+generation=12
+renewed_at_secs=1731000100
+ttl_secs=15
+```
+
+- Use `none` (or an empty file) to represent no active lease.
+
+Kubernetes Lease mapping (`--ha-lease-source kubernetes`):
+
+- `spec.holderIdentity` -> `holder_node_id`
+- `metadata.annotations["rsqlite-rsync.dev/generation"]` -> `generation`
+- `spec.renewTime` -> `renewed_at_secs`
+- `spec.leaseDurationSeconds` -> `ttl_secs`
+
+Freshness file format (`--ha-freshness-file`):
+
+```text
+source_node_id=node-a
+source_generation=12
+synced_at_secs=1731000099
+```
+
+- Use `none` (or an empty file) to represent unknown freshness.
+- Invalid lease or freshness content is treated as an error for that tick.
+- When `--ha-readiness-file` is set, readiness is written as `ready` for writer
+  mode and `not-ready` otherwise.
+- When `--ha-readiness-http-bind` is set, the endpoint returns HTTP `200` with
+  `ready` on `/ready` while writer-active and HTTP `503` with `not-ready`
+  otherwise. The `/live` endpoint always returns HTTP `200` with `live` while
+  the process is running.
+- When `--ha-startup-fence-mode=require-writer`, process startup fails unless
+  the first HA tick can promote/confirm writer state.
+- Stop the loop cleanly with `Ctrl-C`.
+
+Kubernetes deployment references:
+
+- [docs/ha-kubernetes.md](docs/ha-kubernetes.md)
+- [docs/k3s-ha-runbook.md](docs/k3s-ha-runbook.md)
+- [examples/k8s/ha-deployment.yaml](examples/k8s/ha-deployment.yaml) (lease-manager RBAC)
+- [examples/k8s/ha-deployment-readonly.yaml](examples/k8s/ha-deployment-readonly.yaml) (read-only RBAC)
+- [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml) (k3s-oriented StatefulSet + writer Service + lease updater + replica-sync contract)
+- [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) (one-command apply with required image and replica sync command env vars)
+
 ## Protocol
 
 See [`docs/protocol.md`](docs/protocol.md) for the full message grammar and
@@ -136,6 +344,19 @@ Runtime hashing behavior can be tuned with environment variables:
 
 ```bash
 cargo test
+```
+
+Run focused HA suites:
+
+```bash
+cargo test --bin rsqlite-rsync
+cargo test --test ha_mode
+```
+
+Run Kubernetes manifest validator tests:
+
+```bash
+bash tests/integration/validate_k8s_manifests.sh
 ```
 
 ## Running benchmarks

@@ -1,0 +1,314 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sqlite-ha
+  labels:
+    app: sqlite-ha
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sqlite-ha-lease-manager
+  labels:
+    app: sqlite-ha
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["sqlite-writer-lease"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sqlite-ha-lease-manager
+  labels:
+    app: sqlite-ha
+subjects:
+  - kind: ServiceAccount
+    name: sqlite-ha
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sqlite-ha-lease-manager
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sqlite-ha-scripts
+  labels:
+    app: sqlite-ha
+data:
+  lease-updater.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    lease_name="${LEASE_NAME:-sqlite-writer-lease}"
+    lease_duration="${LEASE_DURATION_SECONDS:-15}"
+    renew_sleep="${LEASE_RENEW_SLEEP_SECONDS:-2}"
+    role_file="${ROLE_STATE_FILE:-/var/run/rsqlite-rsync/role_state.txt}"
+
+    current_generation() {
+      kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.metadata.annotations.rsqlite-rsync\.dev/generation}' 2>/dev/null || true
+    }
+
+    while true; do
+      role_state=""
+      if [ -f "$role_file" ]; then
+        role_state="$(cat "$role_file" 2>/dev/null || true)"
+      fi
+
+      case "$role_state" in
+        writer:*)
+          local_generation="${role_state#writer:}"
+          now_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          observed_generation="$(current_generation)"
+          if [ -n "$observed_generation" ] && [ "$observed_generation" != "$local_generation" ]; then
+            if [ "$observed_generation" -gt "$local_generation" ] 2>/dev/null; then
+              local_generation="$observed_generation"
+            fi
+          fi
+
+          kubectl -n "${POD_NAMESPACE}" patch lease "${lease_name}" --type merge -p "{\"metadata\":{\"annotations\":{\"rsqlite-rsync.dev/generation\":\"${local_generation}\"}},\"spec\":{\"holderIdentity\":\"${POD_NAME}\",\"leaseDurationSeconds\":${lease_duration},\"renewTime\":\"${now_rfc3339}\"}}" >/dev/null 2>&1 || \
+          kubectl -n "${POD_NAMESPACE}" apply -f - >/dev/null <<EOF
+          apiVersion: coordination.k8s.io/v1
+          kind: Lease
+          metadata:
+            name: ${lease_name}
+            annotations:
+              rsqlite-rsync.dev/generation: "${local_generation}"
+          spec:
+            holderIdentity: "${POD_NAME}"
+            leaseDurationSeconds: ${lease_duration}
+            renewTime: "${now_rfc3339}"
+          EOF
+          ;;
+        *)
+          # Not writer; do not publish ownership.
+          ;;
+      esac
+
+      sleep "$renew_sleep"
+    done
+
+  replica-sync.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    role_file="${ROLE_STATE_FILE:-/var/run/rsqlite-rsync/role_state.txt}"
+    freshness_file="${FRESHNESS_FILE:-/var/run/rsqlite-rsync/freshness.txt}"
+    sync_sleep="${SYNC_INTERVAL_SECONDS:-5}"
+    sync_cmd="${RSQLITE_RSYNC_REPLICA_SYNC_COMMAND:-}"
+    lease_name="${LEASE_NAME:-sqlite-writer-lease}"
+
+    while true; do
+      role_state=""
+      if [ -f "$role_file" ]; then
+        role_state="$(cat "$role_file" 2>/dev/null || true)"
+      fi
+
+      case "$role_state" in
+        writer:*)
+          # Writer does not run replica pull-sync.
+          ;;
+        *)
+          if [ -n "$sync_cmd" ]; then
+            if sh -c "$sync_cmd"; then
+              holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+              generation="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.metadata.annotations.rsqlite-rsync\.dev/generation}' 2>/dev/null || true)"
+              now_secs="$(date +%s)"
+              if [ -n "$holder" ] && [ -n "$generation" ]; then
+                cat > "$freshness_file" <<EOF
+                source_node_id=${holder}
+                source_generation=${generation}
+                synced_at_secs=${now_secs}
+                EOF
+              fi
+            fi
+          fi
+          ;;
+      esac
+
+      sleep "$sync_sleep"
+    done
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqlite-ha
+  labels:
+    app: sqlite-ha
+spec:
+  clusterIP: None
+  selector:
+    app: sqlite-ha
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqlite-ha-writer
+  labels:
+    app: sqlite-ha
+spec:
+  selector:
+    app: sqlite-ha
+  ports:
+    - name: probe-http
+      port: 8088
+      targetPort: 8088
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sqlite-ha
+  labels:
+    app: sqlite-ha
+spec:
+  serviceName: sqlite-ha
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sqlite-ha
+  template:
+    metadata:
+      labels:
+        app: sqlite-ha
+    spec:
+      serviceAccountName: sqlite-ha
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: rsqlite-rsync
+          image: __RSQLITE_RSYNC_IMAGE__
+          imagePullPolicy: IfNotPresent
+          args:
+            - --ha
+            - --ha-node-id=$(POD_NAME)
+            - --ha-lease-source=kubernetes
+            - --ha-kube-namespace=$(POD_NAMESPACE)
+            - --ha-kube-lease-name=sqlite-writer-lease
+            - --ha-role-state-file=/var/run/rsqlite-rsync/role_state.txt
+            - --ha-audit-log-file=/var/log/rsqlite-rsync/ha_audit.log
+            - --ha-freshness-file=/var/run/rsqlite-rsync/freshness.txt
+            - --ha-readiness-file=/var/run/rsqlite-rsync/readiness.txt
+            - --ha-readiness-http-bind=0.0.0.0:8088
+            - --ha-startup-fence-mode=permissive
+            - --ha-tick-interval-ms=250
+            - --ha-max-freshness-age-secs=10
+            - --ha-max-future-skew-secs=2
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: probe-http
+              containerPort: 8088
+          startupProbe:
+            httpGet:
+              path: /live
+              port: probe-http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: probe-http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: probe-http
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/rsqlite-rsync
+            - name: log
+              mountPath: /var/log/rsqlite-rsync
+            - name: data
+              mountPath: /var/lib/sqlite
+
+        - name: lease-updater
+          image: bitnami/kubectl:1.31
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/lease-updater.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ROLE_STATE_FILE
+              value: /var/run/rsqlite-rsync/role_state.txt
+            - name: LEASE_NAME
+              value: sqlite-writer-lease
+            - name: LEASE_DURATION_SECONDS
+              value: "15"
+            - name: LEASE_RENEW_SLEEP_SECONDS
+              value: "2"
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/rsqlite-rsync
+            - name: scripts
+              mountPath: /scripts
+
+        - name: replica-sync
+          image: bitnami/kubectl:1.31
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/replica-sync.sh"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ROLE_STATE_FILE
+              value: /var/run/rsqlite-rsync/role_state.txt
+            - name: FRESHNESS_FILE
+              value: /var/run/rsqlite-rsync/freshness.txt
+            - name: LEASE_NAME
+              value: sqlite-writer-lease
+            - name: SYNC_INTERVAL_SECONDS
+              value: "5"
+            # Set this to your real replication command.
+            - name: RSQLITE_RSYNC_REPLICA_SYNC_COMMAND
+              value: "__RSQLITE_RSYNC_REPLICA_SYNC_COMMAND__"
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/rsqlite-rsync
+            - name: scripts
+              mountPath: /scripts
+            - name: data
+              mountPath: /var/lib/sqlite
+
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: log
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: sqlite-ha-scripts
+            defaultMode: 0755
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: __RSQLITE_RSYNC_STORAGE_CLASS__
+        resources:
+          requests:
+            storage: 10Gi

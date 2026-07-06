@@ -22,3 +22,15 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Docs
         run: cargo doc --no-deps
+      - name: Test Kubernetes manifest validator
+        run: bash tests/integration/validate_k8s_manifests.sh
+      - name: Setup kubeconform
+        run: |
+          KUBECONFORM_VERSION=0.6.7
+          curl -fsSL -o /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp kubeconform
+          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+      - name: Validate Kubernetes manifests
+        run: ./scripts/validate-k8s-manifests.sh
