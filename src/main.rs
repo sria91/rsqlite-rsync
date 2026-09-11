@@ -20,6 +20,7 @@ use clap::{Parser, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use rsqlite_rsync::endpoint::Endpoint;
 use rsqlite_rsync::error::{Result, SyncError};
 use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
 use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
@@ -234,71 +235,6 @@ impl From<CliSshAuthMode> for SshAuthMode {
             CliSshAuthMode::NonInteractive => SshAuthMode::NonInteractive,
             CliSshAuthMode::Interactive => SshAuthMode::Interactive,
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Remote address parsing
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Parsed form of an ORIGIN or REPLICA argument.
-enum Endpoint {
-    Local(PathBuf),
-    Remote { user_host: String, path: String },
-}
-
-impl Endpoint {
-    fn looks_like_remote_host(host_part: &str) -> bool {
-        if host_part.is_empty()
-            || host_part.contains('/')
-            || host_part.contains('\\')
-            || host_part.chars().any(char::is_whitespace)
-        {
-            return false;
-        }
-
-        if host_part.contains('@') {
-            return true;
-        }
-
-        if host_part.eq_ignore_ascii_case("localhost") {
-            return true;
-        }
-
-        if host_part.parse::<std::net::IpAddr>().is_ok() {
-            return true;
-        }
-
-        // Conservative heuristic: bare tokens like "data" are treated as local
-        // paths, while hostnames with dots are treated as remote.
-        host_part.contains('.')
-    }
-
-    fn parse(s: &str) -> Self {
-        // A single letter before ':' on Windows would be a drive letter.
-        // For other paths, only parse as remote when the host segment matches
-        // a conservative remote-host pattern.
-        if let Some(colon) = s.find(':') {
-            let host_part = &s[..colon];
-            let path_part = &s[colon + 1..];
-            let is_windows_drive = host_part.len() == 1
-                && host_part
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic());
-            if !is_windows_drive && !path_part.is_empty() && Self::looks_like_remote_host(host_part)
-            {
-                return Endpoint::Remote {
-                    user_host: host_part.to_owned(),
-                    path: path_part.to_owned(),
-                };
-            }
-        }
-        Endpoint::Local(PathBuf::from(s))
-    }
-
-    fn is_remote(&self) -> bool {
-        matches!(self, Endpoint::Remote { .. })
     }
 }
 
@@ -703,6 +639,9 @@ async fn run_readiness_http_server(
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    const READ_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_REQUEST_SIZE: usize = 4096;
+
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -715,8 +654,15 @@ async fn run_readiness_http_server(
                     continue;
                 };
 
-                let mut request_buf = [0u8; 1024];
-                let read_len = stream.read(&mut request_buf).await.unwrap_or(0);
+                let mut request_buf = [0u8; MAX_REQUEST_SIZE];
+                let read_res = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut request_buf)).await;
+                let read_len = match read_res {
+                    Ok(Ok(n)) if n > 0 => n,
+                    _ => {
+                        let _ = stream.shutdown().await;
+                        continue;
+                    }
+                };
 
                 let request = String::from_utf8_lossy(&request_buf[..read_len]);
                 let request_line = request.lines().next().unwrap_or_default();

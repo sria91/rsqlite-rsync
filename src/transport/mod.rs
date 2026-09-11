@@ -19,7 +19,11 @@ pub(crate) fn try_take_framed_message(buf: &mut Vec<u8>) -> Result<Option<Messag
         return Ok(None);
     }
 
-    let payload_len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+    let payload_len = u32::from_le_bytes(
+        buf[..4]
+            .try_into()
+            .expect("slice length is guaranteed to be at least 4 bytes"),
+    ) as usize;
     if payload_len > MAX_MESSAGE_SIZE {
         return Err(SyncError::Codec(format!(
             "message frame exceeds max size: {payload_len} > {MAX_MESSAGE_SIZE}"

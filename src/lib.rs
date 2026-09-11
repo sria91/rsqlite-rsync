@@ -47,6 +47,7 @@
 //! ```
 
 pub mod db;
+pub mod endpoint;
 pub mod error;
 pub mod ha;
 pub mod hash;

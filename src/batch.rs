@@ -1,9 +1,10 @@
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use tracing::info;
 
+use rsqlite_rsync::endpoint::Endpoint;
 use rsqlite_rsync::error::{Result, SyncError};
 use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
 use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
@@ -279,62 +280,6 @@ pub(crate) async fn run_batch_sync(
         succeeded,
         failed,
         results,
-    }
-}
-
-#[derive(Debug, Clone)]
-enum Endpoint {
-    Local(PathBuf),
-    Remote { user_host: String, path: String },
-}
-
-impl Endpoint {
-    fn looks_like_remote_host(host_part: &str) -> bool {
-        if host_part.is_empty()
-            || host_part.contains('/')
-            || host_part.contains('\\')
-            || host_part.chars().any(char::is_whitespace)
-        {
-            return false;
-        }
-
-        if host_part.contains('@') {
-            return true;
-        }
-
-        if host_part.eq_ignore_ascii_case("localhost") {
-            return true;
-        }
-
-        if host_part.parse::<std::net::IpAddr>().is_ok() {
-            return true;
-        }
-
-        host_part.contains('.')
-    }
-
-    fn parse(s: &str) -> Self {
-        if let Some(colon) = s.find(':') {
-            let host_part = &s[..colon];
-            let path_part = &s[colon + 1..];
-            let is_windows_drive = host_part.len() == 1
-                && host_part
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic());
-            if !is_windows_drive && !path_part.is_empty() && Self::looks_like_remote_host(host_part)
-            {
-                return Endpoint::Remote {
-                    user_host: host_part.to_owned(),
-                    path: path_part.to_owned(),
-                };
-            }
-        }
-        Endpoint::Local(PathBuf::from(s))
-    }
-
-    fn is_remote(&self) -> bool {
-        matches!(self, Endpoint::Remote { .. })
     }
 }
 

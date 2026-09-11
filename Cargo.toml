@@ -37,6 +37,7 @@ toml = "0.8"
 tempfile = "3"
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
+which = "6"
 
 [[bench]]
 name = "sync_bench"
@@ -65,3 +66,7 @@ path = "tests/integration/ha_mode.rs"
 [[test]]
 name = "batch_mode"
 path = "tests/integration/batch_mode.rs"
+
+[[test]]
+name = "ssh_transport"
+path = "tests/integration/ssh_transport.rs"
