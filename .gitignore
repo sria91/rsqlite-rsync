@@ -1,2 +1,6 @@
 /target
 /Cargo.lock
+.codebase-memory
+.cursor
+.vscode
+.zed/settings.json
