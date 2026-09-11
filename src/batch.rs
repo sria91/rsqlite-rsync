@@ -192,14 +192,14 @@ pub(crate) fn load_manifest(path: &Path, format: ManifestFormat) -> Result<Vec<B
                 idx
             )));
         }
-        if let (Some(base), Some(max)) = (entry.retry_backoff_ms, entry.retry_backoff_max_ms) {
-            if max > 0 && base > max {
-                return Err(SyncError::Protocol(format!(
-                    "batch manifest {} entry {} retry_backoff_max_ms must be >= retry_backoff_ms",
-                    path.display(),
-                    idx
-                )));
-            }
+        if let (Some(base), Some(max)) = (entry.retry_backoff_ms, entry.retry_backoff_max_ms)
+            && max > 0 && base > max
+        {
+            return Err(SyncError::Protocol(format!(
+                "batch manifest {} entry {} retry_backoff_max_ms must be >= retry_backoff_ms",
+                path.display(),
+                idx
+            )));
         }
 
         specs.push(BatchSyncSpec {
@@ -422,53 +422,6 @@ fn retry_delay_for_attempt_core(
     Some(Duration::from_millis(millis))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::retry_delay_for_attempt_core;
-    use std::time::Duration;
-
-    #[test]
-    fn retry_delay_grows_exponentially_without_jitter() {
-        let base = Duration::from_millis(10);
-
-        let d1 = retry_delay_for_attempt_core(base, None, 0, 1, 0).unwrap();
-        let d2 = retry_delay_for_attempt_core(base, None, 0, 2, 0).unwrap();
-        let d3 = retry_delay_for_attempt_core(base, None, 0, 3, 0).unwrap();
-
-        assert_eq!(d1, Duration::from_millis(10));
-        assert_eq!(d2, Duration::from_millis(20));
-        assert_eq!(d3, Duration::from_millis(40));
-    }
-
-    #[test]
-    fn retry_delay_respects_max_cap() {
-        let base = Duration::from_millis(100);
-        let cap = Some(Duration::from_millis(250));
-
-        let d1 = retry_delay_for_attempt_core(base, cap, 0, 1, 0).unwrap();
-        let d2 = retry_delay_for_attempt_core(base, cap, 0, 2, 0).unwrap();
-        let d3 = retry_delay_for_attempt_core(base, cap, 0, 3, 0).unwrap();
-
-        assert_eq!(d1, Duration::from_millis(100));
-        assert_eq!(d2, Duration::from_millis(200));
-        assert_eq!(d3, Duration::from_millis(250));
-    }
-
-    #[test]
-    fn retry_delay_jitter_stays_within_expected_bounds() {
-        let base = Duration::from_millis(100);
-        let jitter_pct = 15;
-        let expected_min = Duration::from_millis(85);
-        let expected_max = Duration::from_millis(115);
-
-        let low = retry_delay_for_attempt_core(base, None, jitter_pct, 1, 0).unwrap();
-        let high = retry_delay_for_attempt_core(base, None, jitter_pct, 1, u128::MAX).unwrap();
-
-        assert!(low >= expected_min && low <= expected_max);
-        assert!(high >= expected_min && high <= expected_max);
-    }
-}
-
 async fn run_one_inner(
     spec: &BatchSyncSpec,
     dry_run: bool,
@@ -564,4 +517,51 @@ async fn dry_run_local(origin: &Path, replica: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_delay_for_attempt_core;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_delay_grows_exponentially_without_jitter() {
+        let base = Duration::from_millis(10);
+
+        let d1 = retry_delay_for_attempt_core(base, None, 0, 1, 0).unwrap();
+        let d2 = retry_delay_for_attempt_core(base, None, 0, 2, 0).unwrap();
+        let d3 = retry_delay_for_attempt_core(base, None, 0, 3, 0).unwrap();
+
+        assert_eq!(d1, Duration::from_millis(10));
+        assert_eq!(d2, Duration::from_millis(20));
+        assert_eq!(d3, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn retry_delay_respects_max_cap() {
+        let base = Duration::from_millis(100);
+        let cap = Some(Duration::from_millis(250));
+
+        let d1 = retry_delay_for_attempt_core(base, cap, 0, 1, 0).unwrap();
+        let d2 = retry_delay_for_attempt_core(base, cap, 0, 2, 0).unwrap();
+        let d3 = retry_delay_for_attempt_core(base, cap, 0, 3, 0).unwrap();
+
+        assert_eq!(d1, Duration::from_millis(100));
+        assert_eq!(d2, Duration::from_millis(200));
+        assert_eq!(d3, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn retry_delay_jitter_stays_within_expected_bounds() {
+        let base = Duration::from_millis(100);
+        let jitter_pct = 15;
+        let expected_min = Duration::from_millis(85);
+        let expected_max = Duration::from_millis(115);
+
+        let low = retry_delay_for_attempt_core(base, None, jitter_pct, 1, 0).unwrap();
+        let high = retry_delay_for_attempt_core(base, None, jitter_pct, 1, u128::MAX).unwrap();
+
+        assert!(low >= expected_min && low <= expected_max);
+        assert!(high >= expected_min && high <= expected_max);
+    }
 }

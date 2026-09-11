@@ -1255,7 +1255,7 @@ mod tests {
         fn read_lease(&mut self) -> Result<Option<LeaseRecord>, Self::Error> {
             self.replies
                 .pop_front()
-                .unwrap_or_else(|| Err("no lease reply"))
+                .unwrap_or(Err("no lease reply"))
         }
     }
 
