@@ -15,6 +15,7 @@ pub enum Endpoint {
 impl Endpoint {
     fn looks_like_remote_host(host_part: &str) -> bool {
         if host_part.is_empty()
+            || host_part.starts_with('.')
             || host_part.contains('/')
             || host_part.contains('\\')
             || host_part.chars().any(char::is_whitespace)
@@ -47,26 +48,61 @@ impl Endpoint {
     /// On Windows, a single letter before `:` is treated as a drive letter
     /// rather than a remote host.
     pub fn parse(s: &str) -> Self {
-        // A single letter before ':' on Windows would be a drive letter.
-        // For other paths, only parse as remote when the host segment matches
-        // a conservative remote-host pattern.
-        if let Some(colon) = s.find(':') {
-            let host_part = &s[..colon];
-            let path_part = &s[colon + 1..];
-            let is_windows_drive = host_part.len() == 1
-                && host_part
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic());
-            if !is_windows_drive && !path_part.is_empty() && Self::looks_like_remote_host(host_part)
-            {
-                return Endpoint::Remote {
-                    user_host: host_part.to_owned(),
-                    path: path_part.to_owned(),
-                };
-            }
+        // Support bracketed IPv6 (`[addr]:path`) and split on the final `:`
+        // for unbracketed inputs so hosts containing `:` remain intact.
+        if let Some((user_host, path)) = Self::parse_remote_parts(s) {
+            return Endpoint::Remote { user_host, path };
         }
         Endpoint::Local(PathBuf::from(s))
+    }
+
+    fn parse_remote_parts(s: &str) -> Option<(String, String)> {
+        if let Some(end_bracket) = s.find("]:") {
+            if s.starts_with('[') {
+                let host = &s[1..end_bracket];
+                let path = &s[end_bracket + 2..];
+                if !host.is_empty() && !path.is_empty() {
+                    return Some((host.to_owned(), path.to_owned()));
+                }
+            }
+        }
+
+        if s.contains('@') {
+            if let Some((host_part, path_part)) = s.split_once(':') {
+                if Self::is_remote_candidate(host_part, path_part) {
+                    return Some((host_part.to_owned(), path_part.to_owned()));
+                }
+            }
+        }
+
+        if let Some(colon) = s.rfind(':') {
+            let host_part = &s[..colon];
+            let path_part = &s[colon + 1..];
+            if Self::is_remote_candidate(host_part, path_part)
+                && host_part.parse::<std::net::IpAddr>().is_ok()
+            {
+                return Some((host_part.to_owned(), path_part.to_owned()));
+            }
+        }
+
+        if let Some((host_part, path_part)) = s.split_once(':') {
+            if Self::is_remote_candidate(host_part, path_part) {
+                return Some((host_part.to_owned(), path_part.to_owned()));
+            }
+        }
+
+        None
+    }
+
+    fn is_remote_candidate(host_part: &str, path_part: &str) -> bool {
+        // A single letter before ':' on Windows would be a drive letter.
+        let is_windows_drive = host_part.len() == 1
+            && host_part
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic());
+
+        !is_windows_drive && !path_part.is_empty() && Self::looks_like_remote_host(host_part)
     }
 
     /// Returns `true` if this endpoint is remote.
