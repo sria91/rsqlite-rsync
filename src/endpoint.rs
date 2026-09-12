@@ -57,22 +57,21 @@ impl Endpoint {
     }
 
     fn parse_remote_parts(s: &str) -> Option<(String, String)> {
-        if let Some(end_bracket) = s.find("]:") {
-            if s.starts_with('[') {
-                let host = &s[1..end_bracket];
-                let path = &s[end_bracket + 2..];
-                if !host.is_empty() && !path.is_empty() {
-                    return Some((host.to_owned(), path.to_owned()));
-                }
+        if let Some(end_bracket) = s.find("]:")
+            && s.starts_with('[')
+        {
+            let host = &s[1..end_bracket];
+            let path = &s[end_bracket + 2..];
+            if !host.is_empty() && !path.is_empty() {
+                return Some((host.to_owned(), path.to_owned()));
             }
         }
 
-        if s.contains('@') {
-            if let Some((host_part, path_part)) = s.split_once(':') {
-                if Self::is_remote_candidate(host_part, path_part) {
-                    return Some((host_part.to_owned(), path_part.to_owned()));
-                }
-            }
+        if s.contains('@')
+            && let Some((host_part, path_part)) = s.split_once(':')
+            && Self::is_remote_candidate(host_part, path_part)
+        {
+            return Some((host_part.to_owned(), path_part.to_owned()));
         }
 
         if let Some(colon) = s.rfind(':') {
@@ -85,10 +84,10 @@ impl Endpoint {
             }
         }
 
-        if let Some((host_part, path_part)) = s.split_once(':') {
-            if Self::is_remote_candidate(host_part, path_part) {
-                return Some((host_part.to_owned(), path_part.to_owned()));
-            }
+        if let Some((host_part, path_part)) = s.split_once(':')
+            && Self::is_remote_candidate(host_part, path_part)
+        {
+            return Some((host_part.to_owned(), path_part.to_owned()));
         }
 
         None
