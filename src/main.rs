@@ -42,7 +42,7 @@ struct Args {
     /// Destination database path (local path or `[user@]host:path`).
     replica: Option<String>,
 
-    /// Show transfer progress (pages synced, bytes transferred).
+    /// Enable verbose logging for sync decisions and transport operations.
     #[arg(short, long)]
     verbose: bool,
 
@@ -246,14 +246,15 @@ impl From<CliSshAuthMode> for SshAuthMode {
 async fn main() -> std::process::ExitCode {
     let args = Args::parse();
 
-    // Initialise tracing; set RUST_LOG to override.
+    // Initialise tracing; allow RUST_LOG to override these defaults.
     let filter = if args.verbose {
         "rsqlite_rsync=debug,info"
     } else {
         "rsqlite_rsync=warn"
     };
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(filter))
+        .with_env_filter(env_filter)
         .with_target(false)
         .init();
 
@@ -999,7 +1000,15 @@ mod tests {
             Endpoint::Local(_)
         ));
         assert!(matches!(
+            Endpoint::parse(".hidden:2026.db"),
+            Endpoint::Local(_)
+        ));
+        assert!(matches!(
             Endpoint::parse("data:2026.db"),
+            Endpoint::Local(_)
+        ));
+        assert!(matches!(
+            Endpoint::parse("./relative:withcolon"),
             Endpoint::Local(_)
         ));
         assert!(matches!(
@@ -1020,6 +1029,18 @@ mod tests {
         ));
         assert!(matches!(
             Endpoint::parse("127.0.0.1:/tmp/db.sqlite"),
+            Endpoint::Remote { .. }
+        ));
+        assert!(matches!(
+            Endpoint::parse("[fe80::1]:/tmp/db.sqlite"),
+            Endpoint::Remote { .. }
+        ));
+        assert!(matches!(
+            Endpoint::parse("fe80::1:/tmp/db.sqlite"),
+            Endpoint::Remote { .. }
+        ));
+        assert!(matches!(
+            Endpoint::parse("user@example.com:/tmp/path:withcolon.sqlite"),
             Endpoint::Remote { .. }
         ));
     }
