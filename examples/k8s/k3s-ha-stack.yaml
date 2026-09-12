@@ -63,7 +63,7 @@ data:
       case "$role_state" in
         writer:*)
           local_generation="${role_state#writer:}"
-          now_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          now_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
 
           observed_generation="$(current_generation)"
           if [ -n "$observed_generation" ] && [ "$observed_generation" != "$local_generation" ]; then
@@ -72,25 +72,14 @@ data:
             fi
           fi
 
-          kubectl -n "${POD_NAMESPACE}" patch lease "${lease_name}" --type merge -p "{\"metadata\":{\"annotations\":{\"rsqlite-rsync.dev/generation\":\"${local_generation}\"}},\"spec\":{\"holderIdentity\":\"${POD_NAME}\",\"leaseDurationSeconds\":${lease_duration},\"renewTime\":\"${now_rfc3339}\"}}" >/dev/null 2>&1 || \
-          kubectl -n "${POD_NAMESPACE}" apply -f - >/dev/null <<EOF
-          apiVersion: coordination.k8s.io/v1
-          kind: Lease
-          metadata:
-            name: ${lease_name}
-            annotations:
-              rsqlite-rsync.dev/generation: "${local_generation}"
-          spec:
-            holderIdentity: "${POD_NAME}"
-            leaseDurationSeconds: ${lease_duration}
-            renewTime: "${now_rfc3339}"
-          EOF
+          if ! kubectl -n "${POD_NAMESPACE}" patch lease "${lease_name}" --type merge -p "{\"metadata\":{\"annotations\":{\"rsqlite-rsync.dev/generation\":\"${local_generation}\"}},\"spec\":{\"holderIdentity\":\"${POD_NAME}\",\"leaseDurationSeconds\":${lease_duration},\"renewTime\":\"${now_rfc3339}\"}}" >/dev/null 2>&1; then
+            printf '{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"%s","annotations":{"rsqlite-rsync.dev/generation":"%s"}},"spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}}\n' \
+              "${lease_name}" "${local_generation}" "${POD_NAME}" "${lease_duration}" "${now_rfc3339}" | kubectl -n "${POD_NAMESPACE}" apply -f - >/dev/null 2>&1 || true
+          fi
           ;;
         *)
-          # Not writer; do not publish ownership.
           ;;
       esac
-
       sleep "$renew_sleep"
     done
 
@@ -112,7 +101,6 @@ data:
 
       case "$role_state" in
         writer:*)
-          # Writer does not run replica pull-sync.
           ;;
         *)
           if [ -n "$sync_cmd" ]; then
@@ -121,17 +109,13 @@ data:
               generation="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.metadata.annotations.rsqlite-rsync\.dev/generation}' 2>/dev/null || true)"
               now_secs="$(date +%s)"
               if [ -n "$holder" ] && [ -n "$generation" ]; then
-                cat > "$freshness_file" <<EOF
-                source_node_id=${holder}
-                source_generation=${generation}
-                synced_at_secs=${now_secs}
-                EOF
+                printf 'source_node_id=%s\nsource_generation=%s\nsynced_at_secs=%s\n' \
+                  "${holder}" "${generation}" "${now_secs}" > "$freshness_file"
               fi
             fi
           fi
           ;;
       esac
-
       sleep "$sync_sleep"
     done
 ---
@@ -142,7 +126,10 @@ metadata:
   labels:
     app: sqlite-ha
 spec:
-  clusterIP: None
+  ports:
+    - port: 8088
+      targetPort: probe-http
+      name: probe-http
   selector:
     app: sqlite-ha
 ---
@@ -153,12 +140,12 @@ metadata:
   labels:
     app: sqlite-ha
 spec:
+  ports:
+    - port: 8088
+      targetPort: probe-http
+      name: probe-http
   selector:
     app: sqlite-ha
-  ports:
-    - name: probe-http
-      port: 8088
-      targetPort: 8088
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -168,6 +155,7 @@ metadata:
     app: sqlite-ha
 spec:
   serviceName: sqlite-ha
+  podManagementPolicy: Parallel
   replicas: 3
   selector:
     matchLabels:
@@ -239,7 +227,7 @@ spec:
               mountPath: /var/lib/sqlite
 
         - name: lease-updater
-          image: bitnami/kubectl:1.31
+          image: bitnami/kubectl:latest
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/scripts/lease-updater.sh"]
           env:
@@ -266,7 +254,7 @@ spec:
               mountPath: /scripts
 
         - name: replica-sync
-          image: bitnami/kubectl:1.31
+          image: bitnami/kubectl:latest
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/scripts/replica-sync.sh"]
           env:
@@ -282,7 +270,6 @@ spec:
               value: sqlite-writer-lease
             - name: SYNC_INTERVAL_SECONDS
               value: "5"
-            # Set this to your real replication command.
             - name: RSQLITE_RSYNC_REPLICA_SYNC_COMMAND
               value: "__RSQLITE_RSYNC_REPLICA_SYNC_COMMAND__"
           volumeMounts:
@@ -292,7 +279,6 @@ spec:
               mountPath: /scripts
             - name: data
               mountPath: /var/lib/sqlite
-
       volumes:
         - name: run
           emptyDir: {}
@@ -301,8 +287,6 @@ spec:
         - name: scripts
           configMap:
             name: sqlite-ha-scripts
-            defaultMode: 0755
-
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -311,4 +295,4 @@ spec:
         storageClassName: __RSQLITE_RSYNC_STORAGE_CLASS__
         resources:
           requests:
-            storage: 10Gi
+            storage: 1Gi
