@@ -265,30 +265,48 @@ data:
 
     writer_host="${holder}.sqlite-ha.${POD_NAMESPACE}.svc.cluster.local"
 
-    remote_dbs="$(ssh -o IdentityFile="$ssh_key" -o StrictHostKeyChecking=no \
+    # The remote `ls` is followed by `; true` so its own exit status (e.g.
+    # nonzero when the glob matches nothing) never becomes the ssh command's
+    # exit status -- that status is reserved for genuine connectivity/auth
+    # failure (ssh's own nonzero, typically 255). Without this, "writer
+    # unreachable" and "writer has no *.db files yet" were indistinguishable
+    # and both looked like a successful, empty sync -- see below.
+    if ! remote_dbs="$(ssh -o IdentityFile="$ssh_key" -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$ssh_port" \
-      "${ssh_user}@${writer_host}" "ls ${data_dir}/*.db 2>/dev/null" 2>/dev/null || true)"
+      "${ssh_user}@${writer_host}" "ls ${data_dir}/*.db 2>/dev/null; true")"; then
+      echo "default-replica-sync: failed to reach ${writer_host} over ssh" >&2
+      exit 1
+    fi
     [ -z "$remote_dbs" ] && exit 0
 
+    # Every file is still attempted even if one fails (a transient failure
+    # on one database shouldn't stall the others), but any failure makes the
+    # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
+    # sync as fresh -- an incomplete sync must not look complete to the
+    # freshness ledger that failover promotion decisions read.
+    sync_failed=0
     for remote_path in $remote_dbs; do
       name="$(basename "$remote_path")"
-      # Per-file failures don't block the rest -- the loop just retries
-      # every database again next tick (SYNC_INTERVAL_SECONDS).
       # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
       # src/transport/ssh.rs), so each one needs the combined -oKey=Value
       # form rather than a bare Key=Value -- and clap rejects a
       # hyphen-looking value passed as a separate token unless given as
       # --flag=value (no space), since it otherwise looks like an
       # unrecognized flag of its own.
-      rsqlite-rsync \
+      if ! rsqlite-rsync \
         --ssh-opt="-oIdentityFile=${ssh_key}" \
         --ssh-opt="-oStrictHostKeyChecking=no" \
         --ssh-opt="-oUserKnownHostsFile=/dev/null" \
         --ssh-opt="-oPort=${ssh_port}" \
         --ssh-connect-timeout 5 \
         "${ssh_user}@${writer_host}:${remote_path}" \
-        "${data_dir}/${name}" || true
+        "${data_dir}/${name}"; then
+        echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
+        sync_failed=1
+      fi
     done
+
+    exit "$sync_failed"
 
   sshd-entrypoint.sh: |
     #!/usr/bin/env sh

@@ -15,7 +15,7 @@ mod batch;
 mod cli;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -725,7 +725,8 @@ impl rsqlite_rsync::ha::LeaseReader for AnyLeaseReader {
 async fn run_readiness_http_server(
     listener: tokio::net::TcpListener,
     readiness: Arc<AtomicBool>,
-    initialized: Arc<AtomicBool>,
+    last_tick_secs: Arc<AtomicU64>,
+    healthz_stale_after: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -773,10 +774,17 @@ async fn run_readiness_http_server(
                     }
                     "/live" => ("HTTP/1.1 200 OK", "live\n"),
                     "/healthz" => {
-                        if initialized.load(Ordering::SeqCst) {
-                            ("HTTP/1.1 200 OK", "healthy\n")
-                        } else {
+                        let last_tick = last_tick_secs.load(Ordering::SeqCst);
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(u64::MAX);
+                        if last_tick == 0 {
                             ("HTTP/1.1 503 Service Unavailable", "initializing\n")
+                        } else if now.saturating_sub(last_tick) > healthz_stale_after.as_secs() {
+                            ("HTTP/1.1 503 Service Unavailable", "stale\n")
+                        } else {
+                            ("HTTP/1.1 200 OK", "healthy\n")
                         }
                     }
                     _ => ("HTTP/1.1 404 Not Found", "not-found\n"),
@@ -851,13 +859,17 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         }
     };
     let readiness_state = Arc::new(AtomicBool::new(false));
-    // True once the HA reconcile loop has completed at least one tick,
-    // regardless of whether that tick decided writer or replica. Unlike
-    // `readiness_state` (writer-only), this is what a Kubernetes
-    // readinessProbe should gate rollout progression on: a replica pod is
-    // healthy and should be considered "ready" for StatefulSet update
-    // sequencing purposes, even though it will never pass `/ready`.
-    let initialized = Arc::new(AtomicBool::new(false));
+    // Unix timestamp (seconds) of the most recently completed HA reconcile
+    // tick, regardless of whether that tick decided writer or replica; 0
+    // means the loop has never ticked. Unlike `readiness_state`
+    // (writer-only), this is what a Kubernetes readinessProbe should gate
+    // rollout progression on: a replica pod is healthy and should be
+    // considered "ready" for StatefulSet update sequencing purposes, even
+    // though it will never pass `/ready`. Using a heartbeat instead of a
+    // one-shot "has ticked at least once" flag means `/healthz` also flips
+    // back to unhealthy if the reconcile loop stops making progress after
+    // its first tick, rather than staying permanently green.
+    let last_tick_secs = Arc::new(AtomicU64::new(0));
     let mut executor = ReadinessAwareExecutor::new(
         TracingExecutor::new(
             FileActionExecutor::new(role_state_file.clone(), audit_log_file.clone()),
@@ -871,6 +883,12 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         SyncError::Protocol(format!("failed writing initial readiness state: {error}"))
     })?;
     let tick_interval = Duration::from_millis(args.ha_tick_interval_ms.max(50));
+    // How long /healthz tolerates a missed heartbeat before reporting
+    // unhealthy, e.g. because the reconcile loop is blocked or has died
+    // while the process otherwise stays alive. Generous relative to
+    // tick_interval to absorb a slow tick (e.g. a delayed kubectl call)
+    // without flapping readiness.
+    let healthz_stale_after = tick_interval.saturating_mul(5).max(Duration::from_secs(10));
 
     info!(
         node_id = %node_id,
@@ -901,7 +919,8 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         Some(tokio::spawn(run_readiness_http_server(
             listener,
             readiness_state,
-            initialized.clone(),
+            last_tick_secs.clone(),
+            healthz_stale_after,
             shutdown_rx,
         )))
     } else {
@@ -1072,9 +1091,11 @@ async fn run_ha_mode(args: Args) -> Result<()> {
             }
         }
 
-        // The loop ran — that's the `/healthz` signal, independent of
+        // The loop ran — that's the `/healthz` heartbeat, independent of
         // whether this tick's outcome was Executed or LeaseReadFailed.
-        initialized.store(true, Ordering::SeqCst);
+        // Refreshed every tick (not just the first) so `/healthz` goes
+        // unhealthy again if the loop later stops making progress.
+        last_tick_secs.store(now_secs, Ordering::SeqCst);
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
