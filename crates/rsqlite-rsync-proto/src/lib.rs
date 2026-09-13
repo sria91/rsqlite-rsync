@@ -8,6 +8,9 @@
 
 pub mod rsqlite {
     pub mod v1 {
+        // tonic's generated client/server code returns `tonic::Status`
+        // (176+ bytes) as the `Err` variant; that's out of our control here.
+        #![allow(clippy::result_large_err)]
         tonic::include_proto!("rsqlite.v1");
     }
 }
