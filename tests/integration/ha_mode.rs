@@ -1181,3 +1181,143 @@ fn ha_mode_kubernetes_source_require_writer_startup_fence_fails_on_lease_read_er
         "expected startup fence to fail when kubectl lease read returns non-notfound error"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// --kube-lease client discovery regression (post client-crate extraction)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The gRPC client's `--kube-lease` discovery used to be a `DiscoveryMode`
+// variant inside the client itself; it now lives entirely in the CLI layer
+// as a `KubeLeaseResolver` adapter over the lean `rsqlite-rsync-client`
+// crate's `LeaderResolver` hook. These tests prove that move preserved
+// behavior exactly, reusing the same fake-kubectl technique as the tests
+// above.
+
+#[test]
+fn cli_kube_lease_resolver_builds_endpoint_from_fake_kubectl() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_kubectl_path = write_fake_kubectl_script(temp.path());
+    let lease_json_path = temp.path().join("lease.json");
+    write_kubernetes_lease_json(&lease_json_path, "node-a", 1, "2024-01-01T00:00:00Z", 30);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rsqlite-rsync"))
+        .arg("client")
+        .arg("--kube-lease")
+        .arg("sqlite-writer-lease")
+        .arg("--kube-namespace")
+        .arg("sqlite-ha")
+        .arg("--kube-service")
+        .arg("sqlite-ha")
+        .arg("--kubectl-path")
+        .arg(&fake_kubectl_path)
+        .arg("--grpc-port")
+        .arg("50051")
+        .arg("--max-retries")
+        .arg("1")
+        .arg("--timeout")
+        .arg("2")
+        .arg("status")
+        .env("RSQLITE_RSYNC_FAKE_KUBELEASE_JSON", &lease_json_path)
+        .output()
+        .expect("failed to run CLI");
+
+    assert!(
+        !output.status.success(),
+        "no real gateway is listening at the resolved endpoint"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("node-a.sqlite-ha:50051"),
+        "expected the KubeLeaseResolver-built endpoint in the connection error, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_kube_lease_resolver_builds_bare_endpoint_when_service_name_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_kubectl_path = write_fake_kubectl_script(temp.path());
+    let lease_json_path = temp.path().join("lease.json");
+    write_kubernetes_lease_json(&lease_json_path, "node-a", 1, "2024-01-01T00:00:00Z", 30);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rsqlite-rsync"))
+        .arg("client")
+        .arg("--kube-lease")
+        .arg("sqlite-writer-lease")
+        .arg("--kube-service")
+        .arg("")
+        .arg("--kubectl-path")
+        .arg(&fake_kubectl_path)
+        .arg("--grpc-port")
+        .arg("50051")
+        .arg("--max-retries")
+        .arg("1")
+        .arg("--timeout")
+        .arg("2")
+        .arg("status")
+        .env("RSQLITE_RSYNC_FAKE_KUBELEASE_JSON", &lease_json_path)
+        .output()
+        .expect("failed to run CLI");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("node-a:50051") && !stderr.contains("node-a."),
+        "expected a bare node-a:50051 endpoint (no service suffix), got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_kube_lease_resolver_errors_on_missing_lease_holder() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_kubectl_path = write_fake_kubectl_script(temp.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rsqlite-rsync"))
+        .arg("client")
+        .arg("--kube-lease")
+        .arg("sqlite-writer-lease")
+        .arg("--kubectl-path")
+        .arg(&fake_kubectl_path)
+        .arg("--max-retries")
+        .arg("1")
+        .arg("--timeout")
+        .arg("2")
+        .arg("status")
+        .env("RSQLITE_RSYNC_FAKE_KUBELEASE_MODE", "notfound")
+        .output()
+        .expect("failed to run CLI");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("discovery"),
+        "expected a leader-discovery error, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_kube_lease_resolver_errors_when_kubectl_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_kubectl_path = write_fake_kubectl_script(temp.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rsqlite-rsync"))
+        .arg("client")
+        .arg("--kube-lease")
+        .arg("sqlite-writer-lease")
+        .arg("--kubectl-path")
+        .arg(&fake_kubectl_path)
+        .arg("--max-retries")
+        .arg("1")
+        .arg("--timeout")
+        .arg("2")
+        .arg("status")
+        .env("RSQLITE_RSYNC_FAKE_KUBELEASE_MODE", "fail")
+        .output()
+        .expect("failed to run CLI");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("discovery"),
+        "expected a leader-discovery error, got: {stderr}"
+    );
+}

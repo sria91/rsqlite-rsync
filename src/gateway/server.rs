@@ -11,19 +11,17 @@ use tonic::{Request, Response, Status};
 use crate::gateway::engine::DatabaseEngine;
 use crate::ha::HaSharedState;
 use crate::proto::rsqlite::v1::{
-    BatchRequest, BatchResponse, BatchTransactionMode, ClusterStatusRequest,
-    ClusterStatusResponse, ConsistencyLevel, ExecuteRequest, ExecuteResponse,
-    LeaseStatus, NodeRole, QueryChunk, QueryRequest, QueryResponse,
-    sql_gateway_server::SqlGateway,
+    BatchRequest, BatchResponse, BatchTransactionMode, ClusterStatusRequest, ClusterStatusResponse,
+    ConsistencyLevel, ExecuteRequest, ExecuteResponse, LeaseStatus, NodeRole, QueryChunk,
+    QueryRequest, QueryResponse, sql_gateway_server::SqlGateway,
 };
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const HEADER_RSQLITE_CODE: &str = "x-rsqlite-code";
-pub const HEADER_RSQLITE_LEADER_ID: &str = "x-rsqlite-leader-id";
-pub const HEADER_RSQLITE_GENERATION: &str = "x-rsqlite-generation";
-pub const HEADER_RSQLITE_LEADER_ENDPOINT: &str = "x-rsqlite-leader-endpoint";
-pub const CODE_NOT_LEADER: &str = "NOT_LEADER";
+pub use rsqlite_rsync_proto::metadata::{
+    CODE_NOT_LEADER, HEADER_RSQLITE_CODE, HEADER_RSQLITE_GENERATION,
+    HEADER_RSQLITE_LEADER_ENDPOINT, HEADER_RSQLITE_LEADER_ID,
+};
 
 /// Implementation of the `SqlGateway` gRPC service.
 #[derive(Clone)]
@@ -76,6 +74,11 @@ impl SqlGatewayServer {
         )
     }
 
+    // `Status` is mandated by the generated `SqlGateway` trait's error type at
+    // every call site (`self.check_write_access()?` inside a method returning
+    // `Result<_, Status>`); boxing it here would just add an unbox step per
+    // call for no benefit on this non-hot-path.
+    #[allow(clippy::result_large_err)]
     fn check_write_access(&self) -> std::result::Result<u64, Status> {
         let state = self.ha_state.read().unwrap();
         let now = Self::now_secs();
@@ -85,7 +88,11 @@ impl SqlGatewayServer {
         Ok(state.generation)
     }
 
-    fn check_read_access(&self, consistency: ConsistencyLevel) -> std::result::Result<(u64, bool), Status> {
+    #[allow(clippy::result_large_err)]
+    fn check_read_access(
+        &self,
+        consistency: ConsistencyLevel,
+    ) -> std::result::Result<(u64, bool), Status> {
         let state = self.ha_state.read().unwrap();
         let now = Self::now_secs();
         let is_writer = state.is_writer(now);
@@ -158,7 +165,8 @@ impl SqlGateway for SqlGatewayServer {
         Ok(Response::new(resp))
     }
 
-    type StreamQueryStream = Pin<Box<dyn Stream<Item = std::result::Result<QueryChunk, Status>> + Send + 'static>>;
+    type StreamQueryStream =
+        Pin<Box<dyn Stream<Item = std::result::Result<QueryChunk, Status>> + Send + 'static>>;
 
     async fn stream_query(
         &self,
@@ -198,7 +206,9 @@ impl SqlGateway for SqlGatewayServer {
         });
 
         let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(Box::pin(output_stream) as Self::StreamQueryStream))
+        Ok(Response::new(
+            Box::pin(output_stream) as Self::StreamQueryStream
+        ))
     }
 
     async fn batch(
@@ -215,7 +225,13 @@ impl SqlGateway for SqlGatewayServer {
         let engine = self.engine.clone();
         let stop_on_error = req.stop_on_error;
         let resp = tokio::task::spawn_blocking(move || {
-            engine.batch(&req.database, &req.statements, tx_mode, stop_on_error, generation)
+            engine.batch(
+                &req.database,
+                &req.statements,
+                tx_mode,
+                stop_on_error,
+                generation,
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("task join error: {e}")))?

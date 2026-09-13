@@ -63,3 +63,14 @@ impl SyncError {
         }
     }
 }
+
+impl From<rsqlite_rsync_client::ClientError> for SyncError {
+    fn from(error: rsqlite_rsync_client::ClientError) -> Self {
+        match error {
+            rsqlite_rsync_client::ClientError::Connect { .. } => {
+                SyncError::Network(error.to_string())
+            }
+            other => SyncError::Protocol(other.to_string()),
+        }
+    }
+}

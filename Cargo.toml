@@ -1,3 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/rsqlite-rsync-proto", "crates/rsqlite-rsync-client"]
+default-members = [".", "crates/rsqlite-rsync-proto", "crates/rsqlite-rsync-client"]
+
 [package]
 name = "rsqlite-rsync"
 version = "0.1.0"
@@ -34,13 +39,10 @@ futures = "0.3"
 serde_yaml = "0.9"
 toml = "0.8"
 tonic = "0.12"
-prost = "0.13"
-prost-types = "0.13"
 comfy-table = "7"
 rustyline = "14"
-
-[build-dependencies]
-tonic-build = "0.12"
+rsqlite-rsync-proto = { path = "crates/rsqlite-rsync-proto" }
+rsqlite-rsync-client = { path = "crates/rsqlite-rsync-client" }
 
 [dev-dependencies]
 tempfile = "3"

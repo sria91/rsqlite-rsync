@@ -15,13 +15,13 @@ jobs:
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
       - name: Build
-        run: cargo build
+        run: cargo build --workspace
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Docs
-        run: cargo doc --no-deps
+        run: cargo doc --workspace --no-deps
       - name: Test Kubernetes manifest validator
         run: bash tests/integration/validate_k8s_manifests.sh
       - name: Setup kubeconform

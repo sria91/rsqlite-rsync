@@ -11,11 +11,14 @@ use comfy_table::{Cell, Color, ContentArrangement, Row, Table};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use rsqlite_rsync::client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
+use rsqlite_rsync::client::{
+    BoxError, ClientConfig, DiscoveryMode, LeaderResolver, SqlGatewayClient,
+};
 use rsqlite_rsync::error::{Result, SyncError};
+use rsqlite_rsync::ha::{KubectlLeaseReader, LeaseReader};
 use rsqlite_rsync::proto::rsqlite::v1::{
-    BatchResponse, BatchTransactionMode, ClusterStatusResponse, ConsistencyLevel,
-    ExecuteResponse, NamedParameter, NodeRole, Parameters, QueryResponse, Statement, Value,
+    BatchResponse, BatchTransactionMode, ClusterStatusResponse, ConsistencyLevel, ExecuteResponse,
+    NamedParameter, NodeRole, Parameters, QueryResponse, Statement, Value,
 };
 
 /// Output formats supported by the client CLI.
@@ -112,21 +115,51 @@ pub struct ClientConnectionArgs {
     pub timeout: u64,
 }
 
+/// Resolves the current writer's endpoint from a Kubernetes Lease via
+/// `kubectl`, implementing the lean client crate's [`LeaderResolver`] hook
+/// so `--kube-lease` discovery lives entirely in the CLI layer rather than
+/// in `rsqlite-rsync-client` (which has no Kubernetes/`kubectl` dependency).
+struct KubeLeaseResolver {
+    reader: KubectlLeaseReader,
+    service_name: String,
+    grpc_port: u16,
+}
+
+#[async_trait::async_trait]
+impl LeaderResolver for KubeLeaseResolver {
+    async fn resolve(&self) -> std::result::Result<String, BoxError> {
+        let mut reader = self.reader.clone();
+        let lease_result = tokio::task::spawn_blocking(move || reader.read_lease())
+            .await
+            .map_err(|e| Box::new(e) as BoxError)?;
+        let lease = lease_result.map_err(|e| -> BoxError { e.into() })?;
+        let lease = lease.ok_or_else(|| -> BoxError { "k8s lease has no active holder".into() })?;
+
+        // E.g. sqlite-ha-0.sqlite-ha.sqlite-ha.svc.cluster.local:50051
+        let host = if self.service_name.is_empty() {
+            lease.holder_node_id
+        } else {
+            format!("{}.{}", lease.holder_node_id, self.service_name)
+        };
+        Ok(format!("http://{host}:{}", self.grpc_port))
+    }
+}
+
 impl ClientConnectionArgs {
     /// Build client configuration from CLI arguments.
     pub fn to_client_config(&self) -> ClientConfig {
         let discovery = if let Some(ref ep) = self.endpoint {
             DiscoveryMode::Direct(ep.clone())
         } else if let Some(ref lease_name) = self.kube_lease {
-            DiscoveryMode::KubernetesLease {
-                namespace: self.kube_namespace.clone(),
-                lease_name: lease_name.clone(),
+            let mut reader =
+                KubectlLeaseReader::new(&self.kubectl_path, &self.kube_namespace, lease_name);
+            reader.set_kube_context(self.kube_context.clone());
+            reader.set_kubeconfig(self.kubeconfig.clone());
+            DiscoveryMode::Custom(std::sync::Arc::new(KubeLeaseResolver {
+                reader,
                 service_name: self.kube_service.clone(),
                 grpc_port: self.grpc_port,
-                kube_context: self.kube_context.clone(),
-                kubeconfig: self.kubeconfig.clone(),
-                kubectl_path: self.kubectl_path.clone(),
-            }
+            }))
         } else if !self.endpoints.is_empty() {
             DiscoveryMode::Candidates(self.endpoints.clone())
         } else {
@@ -257,13 +290,7 @@ pub async fn run_client_command(
         } => {
             let parameters = parse_cli_parameters(params)?;
             let resp = client
-                .query(
-                    database,
-                    sql,
-                    parameters,
-                    *max_rows,
-                    (*consistency).into(),
-                )
+                .query(database, sql, parameters, *max_rows, (*consistency).into())
                 .await?;
             print_query_response(&resp, *format);
         }
@@ -369,13 +396,8 @@ async fn run_repl(
                 let _ = rl.add_history_entry(trimmed);
 
                 if trimmed.starts_with('.') {
-                    if handle_metacommand(
-                        client,
-                        trimmed,
-                        &mut current_db,
-                        &mut current_format,
-                    )
-                    .await?
+                    if handle_metacommand(client, trimmed, &mut current_db, &mut current_format)
+                        .await?
                     {
                         break;
                     }
@@ -385,13 +407,7 @@ async fn run_repl(
                 // Execute SQL statement
                 if is_query_sql(trimmed) {
                     match client
-                        .query(
-                            &current_db,
-                            trimmed,
-                            None,
-                            0,
-                            ConsistencyLevel::Strong,
-                        )
+                        .query(&current_db, trimmed, None, 0, ConsistencyLevel::Strong)
                         .await
                     {
                         Ok(resp) => print_query_response(&resp, current_format),
@@ -451,7 +467,10 @@ async fn handle_metacommand(
         }
         ".tables" => {
             let sql = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;";
-            match client.query(current_db, sql, None, 0, ConsistencyLevel::Strong).await {
+            match client
+                .query(current_db, sql, None, 0, ConsistencyLevel::Strong)
+                .await
+            {
                 Ok(resp) => print_query_response(&resp, *current_format),
                 Err(e) => eprintln!("Error: {e}"),
             }
@@ -460,14 +479,26 @@ async fn handle_metacommand(
         ".schema" => {
             let table = parts.get(1);
             let sql = if let Some(t) = table {
-                format!("SELECT sql FROM sqlite_master WHERE type='table' AND name='{}';", t.replace('\'', "''"))
+                format!(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='{}';",
+                    t.replace('\'', "''")
+                )
             } else {
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;".to_string()
             };
-            match client.query(current_db, &sql, None, 0, ConsistencyLevel::Strong).await {
+            match client
+                .query(current_db, &sql, None, 0, ConsistencyLevel::Strong)
+                .await
+            {
                 Ok(resp) => {
                     for row in resp.rows {
-                        if let Some(Value { value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(sql_text)) }) = row.values.first() {
+                        if let Some(Value {
+                            value:
+                                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
+                                    sql_text,
+                                )),
+                        }) = row.values.first()
+                        {
                             println!("{sql_text};\n");
                         }
                     }
@@ -493,7 +524,9 @@ async fn handle_metacommand(
                     "csv" => *current_format = OutputFormat::Csv,
                     "tsv" => *current_format = OutputFormat::Tsv,
                     "raw" => *current_format = OutputFormat::Raw,
-                    other => eprintln!("Unknown output format: '{other}'. Available: table, json, csv, tsv, raw"),
+                    other => eprintln!(
+                        "Unknown output format: '{other}'. Available: table, json, csv, tsv, raw"
+                    ),
                 }
                 println!("Output mode: {:?}", current_format);
             } else {
@@ -514,7 +547,10 @@ async fn handle_metacommand(
                     Ok(content) => {
                         let stmts = split_sql_statements(&content);
                         println!("Executing {} statements from {}...", stmts.len(), file_path);
-                        match client.batch(current_db, stmts, BatchTransactionMode::Deferred, true).await {
+                        match client
+                            .batch(current_db, stmts, BatchTransactionMode::Deferred, true)
+                            .await
+                        {
                             Ok(resp) => print_batch_response(&resp),
                             Err(e) => eprintln!("Batch execution failed: {e}"),
                         }
@@ -558,7 +594,11 @@ pub fn print_execute_response(resp: &ExecuteResponse) {
 pub fn print_batch_response(resp: &BatchResponse) {
     println!(
         "Batch transaction {} in {:.2} ms. Statements executed: {} (Generation: {})",
-        if resp.committed { "COMMITTED" } else { "FAILED" },
+        if resp.committed {
+            "COMMITTED"
+        } else {
+            "FAILED"
+        },
         resp.total_execution_time_us as f64 / 1000.0,
         resp.results.len(),
         resp.generation
@@ -631,14 +671,26 @@ fn print_json(resp: &QueryResponse) {
     for row in &resp.rows {
         let mut obj = serde_json::Map::new();
         for (i, v) in row.values.iter().enumerate() {
-            let col_name = resp.columns.get(i).map(|c| c.name.clone()).unwrap_or_else(|| format!("col_{i}"));
+            let col_name = resp
+                .columns
+                .get(i)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("col_{i}"));
             let json_val = match &v.value {
-                None | Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(_)) => serde_json::Value::Null,
-                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(i)) => serde_json::Value::Number((*i).into()),
-                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(f)) => {
-                    serde_json::Number::from_f64(*f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+                None | Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(_)) => {
+                    serde_json::Value::Null
                 }
-                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(t)) => serde_json::Value::String(t.clone()),
+                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(i)) => {
+                    serde_json::Value::Number((*i).into())
+                }
+                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(f)) => {
+                    serde_json::Number::from_f64(*f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(t)) => {
+                    serde_json::Value::String(t.clone())
+                }
                 Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(b)) => {
                     serde_json::Value::String(format!("x'{}'", hex_encode(b)))
                 }
@@ -677,10 +729,7 @@ fn print_delimited(resp: &QueryResponse, delimiter: char) {
     }
 }
 
-pub fn print_cluster_status(
-    status: &ClusterStatusResponse,
-    format: OutputFormat,
-) {
+pub fn print_cluster_status(status: &ClusterStatusResponse, format: OutputFormat) {
     let role_str = node_role_str(status.role);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -730,7 +779,11 @@ pub fn print_cluster_status(
             println!("Uptime:       {}s", status.uptime_secs);
             println!(
                 "Active Leader:{}",
-                if status.current_leader_id.is_empty() { "none" } else { &status.current_leader_id }
+                if status.current_leader_id.is_empty() {
+                    "none"
+                } else {
+                    &status.current_leader_id
+                }
             );
             if !status.current_leader_endpoint.is_empty() {
                 println!("Leader URL:   {}", status.current_leader_endpoint);
@@ -787,17 +840,23 @@ fn node_role_str(role: i32) -> &'static str {
 fn is_null_value(val: &Value) -> bool {
     matches!(
         &val.value,
-        None | Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(_))
+        None | Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(
+            _
+        ))
     )
 }
 
 fn format_proto_value(val: &Value) -> String {
     match &val.value {
-        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(_)) | None => "NULL".to_string(),
+        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(_)) | None => {
+            "NULL".to_string()
+        }
         Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(i)) => i.to_string(),
         Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(f)) => f.to_string(),
         Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(t)) => t.clone(),
-        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(b)) => format!("x'{}'", hex_encode(b)),
+        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(b)) => {
+            format!("x'{}'", hex_encode(b))
+        }
     }
 }
 
@@ -842,7 +901,9 @@ fn parse_cli_parameters(raw_params: &[String]) -> Result<Option<Parameters>> {
 fn parse_string_to_value(s: &str) -> Value {
     if s.eq_ignore_ascii_case("null") {
         Value {
-            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true)),
+            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(
+                true,
+            )),
         }
     } else if let Ok(i) = s.parse::<i64>() {
         Value {
@@ -850,7 +911,9 @@ fn parse_string_to_value(s: &str) -> Value {
         }
     } else if let Ok(f) = s.parse::<f64>() {
         Value {
-            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(f)),
+            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(
+                f,
+            )),
         }
     } else if let Some(hex) = s.strip_prefix("x'").and_then(|h| h.strip_suffix('\'')) {
         let bytes = (0..hex.len())
@@ -858,11 +921,15 @@ fn parse_string_to_value(s: &str) -> Value {
             .filter_map(|i| u8::from_str_radix(&hex[i..(i + 2).min(hex.len())], 16).ok())
             .collect();
         Value {
-            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(bytes)),
+            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(
+                bytes,
+            )),
         }
     } else {
         Value {
-            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(s.to_string())),
+            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
+                s.to_string(),
+            )),
         }
     }
 }

@@ -46,17 +46,29 @@
 //! }
 //! ```
 
-pub mod client;
 pub mod db;
 pub mod endpoint;
 pub mod error;
 pub mod gateway;
 pub mod ha;
 pub mod hash;
-pub mod proto;
 pub mod protocol;
 pub mod snapshot;
 pub mod transport;
+
+/// gRPC SQL Gateway client with leader discovery and automatic failover.
+///
+/// Re-exported from the standalone [`rsqlite_rsync_client`] crate — which
+/// any external Rust service can depend on directly, without pulling in
+/// this crate's SQLite/HA/CLI machinery — so existing
+/// `rsqlite_rsync::client::...` paths keep resolving unchanged.
+pub use rsqlite_rsync_client as client;
+
+/// Generated protobuf/gRPC types for the SQL Gateway wire contract.
+///
+/// Re-exported from the standalone [`rsqlite_rsync_proto`] crate so existing
+/// `rsqlite_rsync::proto::...` paths keep resolving unchanged.
+pub use rsqlite_rsync_proto as proto;
 
 use std::path::Path;
 use std::time::Duration;
