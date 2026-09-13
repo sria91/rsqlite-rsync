@@ -43,23 +43,13 @@ metadata:
   labels:
     app: sqlite-ha
 spec:
-  ports:
-    - port: 8088
-      targetPort: probe-http
-      name: probe-http
-    - port: 50051
-      targetPort: grpc
-      name: grpc
-  selector:
-    app: sqlite-ha
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: sqlite-ha-writer
-  labels:
-    app: sqlite-ha
-spec:
+  # Headless: this is the StatefulSet's governing service (serviceName
+  # below), so per-pod DNS records (e.g. sqlite-ha-0.sqlite-ha...) only get
+  # created by CoreDNS when this is unset. That per-pod DNS is what the
+  # client's --kube-service / Lease-based writer discovery depends on
+  # (see rsqlite-rsync-client's KubeLeaseResolver) now that there is no
+  # separate writer-routing Service — see README "SQL Gateway and client".
+  clusterIP: None
   ports:
     - port: 8088
       targetPort: probe-http
@@ -132,7 +122,13 @@ spec:
             failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /ready
+              # /healthz ("has the reconcile loop ticked"), not /ready
+              # ("is this node currently the writer") — every replica pod
+              # is permanently /ready==503 by design, and gating Pod
+              # readiness (and therefore StatefulSet rollout progression)
+              # on that would stall the rollout after one pod. See README
+              # "Behavior notes".
+              path: /healthz
               port: probe-http
             periodSeconds: 2
             timeoutSeconds: 1

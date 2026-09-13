@@ -102,7 +102,13 @@ spec:
             failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /ready
+              # /healthz ("has the reconcile loop ticked"), not /ready
+              # ("is this node currently the writer") — every replica pod
+              # is permanently /ready==503 by design, and gating Pod
+              # readiness (and therefore StatefulSet rollout progression)
+              # on that would stall the rollout after one pod. See README
+              # "Behavior notes".
+              path: /healthz
               port: probe-http
             periodSeconds: 2
             timeoutSeconds: 1

@@ -17,7 +17,17 @@ Each pod in a `StatefulSet` runs three containers:
   - when local role is replica, executes a sync command you provide
   - writes freshness ledger after successful sync
 
-Traffic is routed through a single ClusterIP Service (`sqlite-ha-writer`) that only sends traffic to ready endpoints. In HA mode, only writer-active pods return ready.
+There is no Service that routes only to the writer — a readiness-filtered
+Service can't safely do that (see [HTTP Probe
+Endpoints](ha-kubernetes.md#probe-endpoints)) without also stalling
+StatefulSet rollouts. Instead, `sqlite-ha` is a plain headless Service used
+for stable per-pod DNS and general access, and clients find the current
+writer themselves: the gRPC client follows `NOT_LEADER` redirects
+automatically, or discovers it directly via the Kubernetes `Lease`
+(`--kube-lease`/`--kube-service`, see README [SQL Gateway and
+client](../README.md#sql-gateway-and-client)). Within the cluster,
+`role_state.txt` on each pod (`writer:N` or `replica`) is the ground truth
+for which pod currently holds the role.
 
 ## Prerequisites
 
@@ -29,7 +39,12 @@ Traffic is routed through a single ClusterIP Service (`sqlite-ha-writer`) that o
 ## Apply The Stack
 
 1. Apply with required variables:
-   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync sqlite-ha-writer:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
+   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
+     — `<writer-host>` is a placeholder: there's no Service that resolves
+     to "whichever pod is currently the writer" (see Architecture above),
+     so resolve it in your real sync command (e.g. by reading the Lease
+     or `role_state.txt` from within the sync sidecar) before substituting
+     it into this variable.
 2. Optional overrides:
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
    - `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`)
@@ -37,8 +52,9 @@ Traffic is routed through a single ClusterIP Service (`sqlite-ha-writer`) that o
    - `kubectl rollout status statefulset/sqlite-ha`
 4. Inspect role transitions:
    - `kubectl logs statefulset/sqlite-ha -c rsqlite-rsync --tail=200`
-5. Verify writer service endpoint:
-   - `kubectl get endpoints sqlite-ha-writer -o wide`
+5. Verify which pod is currently the writer:
+   - `kubectl exec sqlite-ha-0 -c rsqlite-rsync -- cat /var/run/rsqlite-rsync/role_state.txt`
+     (repeat per pod, or grep the audit log — exactly one pod should report `writer:N`)
 
 ## Node Storage
 
@@ -60,7 +76,7 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 ## Important Operational Notes
 
-- This pattern defaults to `--ha-startup-fence-mode=permissive` so all pods can start and only writer becomes ready.
+- This pattern defaults to `--ha-startup-fence-mode=permissive`, so all pods start and pass Kubernetes readiness (`/healthz`) once their reconcile loop has ticked — writer or replica. `/ready` (writer-only status) still reflects role and is what `role_state.txt`/the audit log/`rsqlite-rsync client status` show.
 - If you use `require-writer`, non-writer pods can fail startup by design.
 - `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` is required by [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) so you can plug in your real transport and auth model.
 - Freshness ledger is written by the sync sidecar to `/var/run/rsqlite-rsync/freshness.txt`, which HA mode consumes for promotion safety.
@@ -68,7 +84,7 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 ## Failover Validation Checklist
 
-1. Confirm one ready endpoint behind `sqlite-ha-writer`.
+1. Confirm exactly one pod reports `writer:N` in `role_state.txt` (step 5 above).
 2. Delete the current writer pod.
 3. Confirm another pod becomes ready.
 4. Confirm lease holder and generation update.

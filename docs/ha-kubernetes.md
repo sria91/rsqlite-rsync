@@ -33,6 +33,16 @@ When --ha-readiness-http-bind is enabled:
 - /ready:
   - 200 when node is writer-active.
   - 503 when node is replica, denied, or demoted.
+  - Writer status, not Pod health — every replica is permanently 503 by
+    design. Do not wire this to readinessProbe (see /healthz below); query
+    it directly when you need to know which node is the writer.
+- /healthz:
+  - 200 once the HA reconcile loop has completed at least one tick
+    (writer or replica — role-independent).
+  - 503 before the first tick completes.
+  - Use this as readinessProbe: it passes for replica nodes too, so Pod
+    readiness (and StatefulSet rollout progression) isn't gated on which
+    single pod happens to be the writer, unlike /ready.
 - /live:
   - 200 while process is alive.
 - Any other path:
@@ -44,7 +54,11 @@ This allows direct httpGet probes without sidecar file checks.
 
 With --ha-startup-fence-mode=require-writer, process startup fails unless initial HA reconciliation can confirm writer state.
 
-Use startupProbe with /ready to keep pod unready until writer eligibility is proven.
+Use startupProbe with /live (all example manifests do this) to give the
+process time to start before Kubernetes evaluates readiness/liveness at
+all; --ha-startup-fence-mode=require-writer is what actually keeps the
+process itself from starting (it exits) when writer eligibility can't be
+proven on the first tick, independent of any probe.
 
 ## Lease Requirements
 

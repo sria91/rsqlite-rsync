@@ -25,7 +25,6 @@ else
   allow_cross_file_duplicates=(
     "Lease/sqlite-writer-lease"
     "Service/sqlite-ha"
-    "Service/sqlite-ha-writer"
     "ServiceAccount/sqlite-ha"
     "StatefulSet/sqlite-ha"
   )
