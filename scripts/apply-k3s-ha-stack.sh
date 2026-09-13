@@ -13,7 +13,7 @@ fi
 : "${RSQLITE_RSYNC_REPLICA_SYNC_COMMAND:?Set RSQLITE_RSYNC_REPLICA_SYNC_COMMAND to your replica pull-sync command}"
 
 RSQLITE_RSYNC_NAMESPACE="${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}"
-RSQLITE_RSYNC_STORAGE_CLASS="${RSQLITE_RSYNC_STORAGE_CLASS:-local-path}"
+RSQLITE_RSYNC_HOST_DATA_DIR="${RSQLITE_RSYNC_HOST_DATA_DIR:-/var/lib/rsqlite-rsync-ha}"
 
 rendered="$(mktemp)"
 trap 'rm -f "$rendered"' EXIT
@@ -24,12 +24,12 @@ escape_sed_replacement() {
 
 image_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_IMAGE")"
 sync_cmd_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_REPLICA_SYNC_COMMAND")"
-storage_class_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_STORAGE_CLASS")"
+host_data_dir_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_HOST_DATA_DIR")"
 
 sed \
   -e "s|__RSQLITE_RSYNC_IMAGE__|$image_escaped|g" \
   -e "s|__RSQLITE_RSYNC_REPLICA_SYNC_COMMAND__|$sync_cmd_escaped|g" \
-  -e "s|__RSQLITE_RSYNC_STORAGE_CLASS__|$storage_class_escaped|g" \
+  -e "s|__RSQLITE_RSYNC_HOST_DATA_DIR__|$host_data_dir_escaped|g" \
   "$template" > "$rendered"
 
 kubectl get namespace "$RSQLITE_RSYNC_NAMESPACE" >/dev/null 2>&1 || kubectl create namespace "$RSQLITE_RSYNC_NAMESPACE"
@@ -37,5 +37,5 @@ kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f "$rendered"
 
 echo "Applied k3s HA stack"
 echo "namespace: $RSQLITE_RSYNC_NAMESPACE"
-echo "storageClass: $RSQLITE_RSYNC_STORAGE_CLASS"
+echo "hostDataDir: $RSQLITE_RSYNC_HOST_DATA_DIR"
 echo "image: $RSQLITE_RSYNC_IMAGE"

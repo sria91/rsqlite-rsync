@@ -411,7 +411,7 @@ RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@sqlite-ha-writer:/var/lib
 Optional environment variables:
 
 - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
-- `RSQLITE_RSYNC_STORAGE_CLASS` (default: `local-path`)
+- `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`) — a hostPath on the node, not a PVC/StorageClass; see [Node Storage](k3s-ha-runbook.md#node-storage) in the k3s runbook for the k3d bind-mount caveat.
 
 ## Summary
 

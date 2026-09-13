@@ -21,7 +21,7 @@ Traffic is routed through a single ClusterIP Service (`sqlite-ha-writer`) that o
 
 ## Prerequisites
 
-- k3s cluster with default storage class
+- k3s cluster with a writable node filesystem path for hostPath storage (see [Node Storage](#node-storage) below)
 - image for `rsqlite-rsync` available to cluster
 - RBAC permission for lease updater (`get/list/watch/create/update/patch` on Lease)
 - a sync command for replica pods (for example SSH-based sync, or a sidecar that can reach the writer DB path)
@@ -32,13 +32,29 @@ Traffic is routed through a single ClusterIP Service (`sqlite-ha-writer`) that o
    - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync sqlite-ha-writer:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
 2. Optional overrides:
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
-   - `RSQLITE_RSYNC_STORAGE_CLASS` (default: `local-path`)
+   - `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`)
 3. Watch rollout:
    - `kubectl rollout status statefulset/sqlite-ha`
 4. Inspect role transitions:
    - `kubectl logs statefulset/sqlite-ha -c rsqlite-rsync --tail=200`
 5. Verify writer service endpoint:
    - `kubectl get endpoints sqlite-ha-writer -o wide`
+
+## Node Storage
+
+Each replica pod mounts a shared `hostPath` volume at `RSQLITE_RSYNC_HOST_DATA_DIR`, with `subPathExpr: $(POD_NAME)` giving it its own subdirectory (`.../sqlite-ha-0`, `.../sqlite-ha-1`, `.../sqlite-ha-2`). Data persists at a known, explicit path on the node, independent of the StatefulSet/pod lifecycle — no PVC or StorageClass is involved. An init container (`data-dir-permissions`) fixes ownership/permissions on that subdirectory before the main containers start, since `hostPath` directories are created root-owned by kubelet and the `rsqlite-rsync` container runs as non-root UID `10001`.
+
+**k3d caveat:** a k3d "node" is a Docker container, so a plain `hostPath` lives inside that container's writable layer and is lost if the node container itself is ever recreated (e.g. `k3d cluster delete`). To back it with a real directory on your host machine, recreate the cluster with a bind mount:
+
+```bash
+k3d cluster delete ha-test
+k3d cluster create ha-test \
+  --volume "$HOME/rsqlite-rsync-ha-data:/var/lib/rsqlite-rsync-ha@server:0"
+```
+
+This is a **manual, user-run, destructive step** — it wipes the entire existing cluster and all its state, not just this app's data. Only do this deliberately; never as part of a routine redeploy.
+
+**Node-pinning caveat:** in a genuine multi-node cluster, a pod rescheduled to a different node starts with an empty directory there. This is the same limitation the `local-path` PVC provisioner it replaces already had — not a regression.
 
 ## Important Operational Notes
 

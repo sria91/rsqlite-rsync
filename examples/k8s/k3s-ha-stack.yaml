@@ -118,6 +118,56 @@ data:
       esac
       sleep "$sync_sleep"
     done
+
+  lease-bootstrap.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    # Only the ordinal-0 pod attempts genesis/recovery bootstrap, and only
+    # when the lease is missing or already expired with nobody renewing it.
+    # This runs on every restart of pod 0, but is a no-op whenever a live
+    # lease is already held, so it never overrides a real election result.
+    #
+    # The expired case matters because the Lease object is independent of
+    # the StatefulSet: it outlives a `kubectl delete statefulset`, so a
+    # recreated cluster can inherit a stale lease whose last holder is gone.
+    # Nothing else can ever reclaim that lease, since lease-updater.sh only
+    # renews it for a node that is already writer, and no node can become
+    # writer while the lease it would need to hold is expired.
+    case "${POD_NAME}" in
+      *-0) ;;
+      *) exit 0 ;;
+    esac
+
+    lease_name="${LEASE_NAME:-sqlite-writer-lease}"
+    lease_duration="${LEASE_DURATION_SECONDS:-15}"
+    freshness_file="${FRESHNESS_FILE:-/var/run/rsqlite-rsync/freshness.txt}"
+
+    now_secs="$(date +%s)"
+    existing_renew_time="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.renewTime}' 2>/dev/null || true)"
+
+    if [ -n "${existing_renew_time}" ]; then
+      renewed_at_secs="$(date -u -d "${existing_renew_time}" +%s 2>/dev/null || echo 0)"
+      existing_duration="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.leaseDurationSeconds}' 2>/dev/null || echo "${lease_duration}")"
+      if [ "$((renewed_at_secs + existing_duration))" -ge "${now_secs}" ]; then
+        exit 0
+      fi
+    fi
+
+    prior_generation="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.metadata.annotations.rsqlite-rsync\.dev/generation}' 2>/dev/null || true)"
+    case "${prior_generation}" in
+      ''|*[!0-9]*) next_generation=0 ;;
+      *) next_generation=$((prior_generation + 1)) ;;
+    esac
+
+    now_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
+
+    printf '{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"%s","annotations":{"rsqlite-rsync.dev/generation":"%s"}},"spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}}\n' \
+      "${lease_name}" "${next_generation}" "${POD_NAME}" "${lease_duration}" "${now_rfc3339}" \
+      | kubectl -n "${POD_NAMESPACE}" apply -f -
+
+    printf 'source_node_id=%s\nsource_generation=%s\nsynced_at_secs=%s\n' \
+      "${POD_NAME}" "${next_generation}" "${now_secs}" > "${freshness_file}"
 ---
 apiVersion: v1
 kind: Service
@@ -173,6 +223,53 @@ spec:
     spec:
       serviceAccountName: sqlite-ha
       terminationGracePeriodSeconds: 20
+      initContainers:
+        - name: data-dir-permissions
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /var/lib/sqlite
+              chown 10001:10001 /var/lib/sqlite
+              chmod 2775 /var/lib/sqlite
+          securityContext:
+            runAsUser: 0
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/sqlite
+              subPathExpr: $(POD_NAME)
+        - name: lease-bootstrap
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/lease-bootstrap.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LEASE_NAME
+              value: sqlite-writer-lease
+            - name: LEASE_DURATION_SECONDS
+              value: "15"
+            - name: FRESHNESS_FILE
+              value: /var/run/rsqlite-rsync/freshness.txt
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/rsqlite-rsync
+            - name: scripts
+              mountPath: /scripts
       containers:
         - name: rsqlite-rsync
           image: __RSQLITE_RSYNC_IMAGE__
@@ -235,6 +332,7 @@ spec:
               mountPath: /var/log/rsqlite-rsync
             - name: data
               mountPath: /var/lib/sqlite
+              subPathExpr: $(POD_NAME)
 
         - name: lease-updater
           image: bitnami/kubectl:latest
@@ -267,7 +365,13 @@ spec:
           image: bitnami/kubectl:latest
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/scripts/replica-sync.sh"]
+          securityContext:
+            runAsGroup: 10001
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
@@ -289,6 +393,7 @@ spec:
               mountPath: /scripts
             - name: data
               mountPath: /var/lib/sqlite
+              subPathExpr: $(POD_NAME)
       volumes:
         - name: run
           emptyDir: {}
@@ -297,12 +402,7 @@ spec:
         - name: scripts
           configMap:
             name: sqlite-ha-scripts
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: __RSQLITE_RSYNC_STORAGE_CLASS__
-        resources:
-          requests:
-            storage: 1Gi
+        - name: data
+          hostPath:
+            path: __RSQLITE_RSYNC_HOST_DATA_DIR__
+            type: DirectoryOrCreate
