@@ -42,7 +42,9 @@ Traffic is routed through a single ClusterIP Service (`sqlite-ha-writer`) that o
 
 ## Node Storage
 
-Each replica pod mounts a shared `hostPath` volume at `RSQLITE_RSYNC_HOST_DATA_DIR`, with `subPathExpr: $(POD_NAME)` giving it its own subdirectory (`.../sqlite-ha-0`, `.../sqlite-ha-1`, `.../sqlite-ha-2`). Data persists at a known, explicit path on the node, independent of the StatefulSet/pod lifecycle — no PVC or StorageClass is involved. An init container (`data-dir-permissions`) fixes ownership/permissions on that subdirectory before the main containers start, since `hostPath` directories are created root-owned by kubelet and the `rsqlite-rsync` container runs as non-root UID `10001`.
+Each pod mounts a `hostPath` volume directly at `RSQLITE_RSYNC_HOST_DATA_DIR` — the same absolute path on whichever node it lands on, with no per-pod subdirectory. Data persists at a known, explicit path on the node, independent of the StatefulSet/pod lifecycle — no PVC or StorageClass is involved. An init container (`data-dir-permissions`) fixes ownership/permissions on that path before the main containers start, since `hostPath` directories are created root-owned by kubelet and the `rsqlite-rsync` container runs as non-root UID `10001`.
+
+Using the same path on every node only works because the pod template also sets a **required** pod anti-affinity rule (`app: sqlite-ha`, `topologyKey: kubernetes.io/hostname`): the scheduler will never place two `sqlite-ha` pods on the same node. Without that rule, two pods sharing a node would both write to the same host directory and silently corrupt each other's SQLite files. This introduces a prerequisite that didn't exist before: **the cluster must have at least as many schedulable nodes as `replicas`** (3 by default), or the extra pod(s) will stay `Pending` instead of doubling up on a node.
 
 **k3d caveat:** a k3d "node" is a Docker container, so a plain `hostPath` lives inside that container's writable layer and is lost if the node container itself is ever recreated (e.g. `k3d cluster delete`). To back it with a real directory on your host machine, recreate the cluster with a bind mount:
 

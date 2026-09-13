@@ -223,6 +223,13 @@ spec:
     spec:
       serviceAccountName: sqlite-ha
       terminationGracePeriodSeconds: 20
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sqlite-ha
+              topologyKey: kubernetes.io/hostname
       initContainers:
         - name: data-dir-permissions
           image: bitnami/kubectl:latest
@@ -245,7 +252,6 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/sqlite
-              subPathExpr: $(POD_NAME)
         - name: lease-bootstrap
           image: bitnami/kubectl:latest
           imagePullPolicy: IfNotPresent
@@ -332,7 +338,6 @@ spec:
               mountPath: /var/log/rsqlite-rsync
             - name: data
               mountPath: /var/lib/sqlite
-              subPathExpr: $(POD_NAME)
 
         - name: lease-updater
           image: bitnami/kubectl:latest
@@ -393,7 +398,6 @@ spec:
               mountPath: /scripts
             - name: data
               mountPath: /var/lib/sqlite
-              subPathExpr: $(POD_NAME)
       volumes:
         - name: run
           emptyDir: {}
