@@ -1074,6 +1074,43 @@ impl HaRuntime {
         execute_controller_plan(plan, executor, stop_on_error)
     }
 }
+/// Shared HA cluster state synchronized between the HA control loop and the gRPC gateway.
+#[derive(Debug, Clone)]
+pub struct HaSharedState {
+    pub node_id: String,
+    pub role: NodeRole,
+    pub generation: u64,
+    pub active_leader_id: Option<String>,
+    pub active_leader_endpoint: Option<String>,
+    pub lease_record: Option<LeaseRecord>,
+    pub allow_replica_reads: bool,
+}
+
+impl HaSharedState {
+    pub fn new(node_id: impl Into<String>, allow_replica_reads: bool) -> Self {
+        Self {
+            node_id: node_id.into(),
+            role: NodeRole::Replica,
+            generation: 0,
+            active_leader_id: None,
+            active_leader_endpoint: None,
+            lease_record: None,
+            allow_replica_reads,
+        }
+    }
+
+    pub fn is_writer(&self, now_secs: u64) -> bool {
+        if self.role != NodeRole::Writer {
+            return false;
+        }
+        if let Some(ref lease) = self.lease_record {
+            enforce_write_fence(now_secs, &self.node_id, self.generation, lease).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
 /// Enforce single-writer fencing for local write path.
 ///
 /// Rules:

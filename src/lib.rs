@@ -46,11 +46,14 @@
 //! }
 //! ```
 
+pub mod client;
 pub mod db;
 pub mod endpoint;
 pub mod error;
+pub mod gateway;
 pub mod ha;
 pub mod hash;
+pub mod proto;
 pub mod protocol;
 pub mod snapshot;
 pub mod transport;

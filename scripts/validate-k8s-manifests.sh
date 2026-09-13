@@ -24,6 +24,8 @@ if [[ -n "${RSQLITE_RSYNC_ALLOW_CROSS_FILE_DUPLICATES:-}" ]]; then
 else
   allow_cross_file_duplicates=(
     "Lease/sqlite-writer-lease"
+    "Service/sqlite-ha"
+    "Service/sqlite-ha-writer"
     "ServiceAccount/sqlite-ha"
     "StatefulSet/sqlite-ha"
   )

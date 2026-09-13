@@ -1,4 +1,11 @@
 # Lease-manager variant: includes permissions to update/patch/create the Lease.
+#
+# NOTE: the RBAC here grants update/patch/create so a lease-claiming sidecar
+# or controller can be added later, but nothing in this manifest actually
+# claims/renews the Lease or writes the freshness ledger yet — the binary
+# only reads both. Without one of those in place, every pod stays a
+# permanent replica (no crash-loop, but no writer either). For local testing
+# without that piece, see local-dev-file-lease.yaml.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -35,6 +42,40 @@ roleRef:
   kind: Role
   name: sqlite-ha-lease-manager
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqlite-ha
+  labels:
+    app: sqlite-ha
+spec:
+  ports:
+    - port: 8088
+      targetPort: probe-http
+      name: probe-http
+    - port: 50051
+      targetPort: grpc
+      name: grpc
+  selector:
+    app: sqlite-ha
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqlite-ha-writer
+  labels:
+    app: sqlite-ha
+spec:
+  ports:
+    - port: 8088
+      targetPort: probe-http
+      name: probe-http
+    - port: 50051
+      targetPort: grpc
+      name: grpc
+  selector:
+    app: sqlite-ha
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -44,6 +85,7 @@ metadata:
 spec:
   serviceName: sqlite-ha
   replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: sqlite-ha
@@ -63,11 +105,14 @@ spec:
             - --ha-lease-source=kubernetes
             - --ha-kube-namespace=$(POD_NAMESPACE)
             - --ha-kube-lease-name=sqlite-writer-lease
+            - --ha-freshness-file=/var/run/rsqlite-rsync/freshness.txt
             - --ha-role-state-file=/var/run/rsqlite-rsync/role_state.txt
             - --ha-audit-log-file=/var/log/rsqlite-rsync/ha_audit.log
             - --ha-readiness-file=/var/run/rsqlite-rsync/readiness.txt
             - --ha-readiness-http-bind=0.0.0.0:8088
-            - --ha-startup-fence-mode=require-writer
+            - --ha-grpc-bind=0.0.0.0:50051
+            - --ha-data-dir=/var/lib/sqlite
+            - --ha-startup-fence-mode=permissive
             - --ha-tick-interval-ms=250
             - --ha-max-freshness-age-secs=10
             - --ha-max-future-skew-secs=2
@@ -83,9 +128,11 @@ spec:
           ports:
             - name: probe-http
               containerPort: 8088
+            - name: grpc
+              containerPort: 50051
           startupProbe:
             httpGet:
-              path: /ready
+              path: /live
               port: probe-http
             periodSeconds: 2
             failureThreshold: 30

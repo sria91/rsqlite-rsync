@@ -1,41 +1,32 @@
-# Read-only variant: Lease must be pre-created and maintained by an external
-# leader-election component. The freshness ledger at --ha-freshness-file must
-# likewise be maintained externally (e.g. by whatever replicates data onto
-# each pod) — without it, promotion is denied with MissingFreshness even once
-# a pod correctly holds the Lease.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: sqlite-ha
-  labels:
-    app: sqlite-ha
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: sqlite-ha-lease-readonly
-  labels:
-    app: sqlite-ha
-rules:
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    resourceNames: ["sqlite-writer-lease"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: sqlite-ha-lease-readonly
-  labels:
-    app: sqlite-ha
-subjects:
-  - kind: ServiceAccount
-    name: sqlite-ha
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: sqlite-ha-lease-readonly
----
+# Local dev/test variant for exercising the gRPC SQL Gateway + client against
+# a real k3d/k3s cluster WITHOUT relying on Kubernetes Lease-based election.
+#
+# The kubernetes-lease-source manifests (ha-deployment.yaml, etc.) assume
+# something continuously claims/renews the coordination.k8s.io Lease and
+# refreshes each replica's freshness ledger; today nothing in this repo does
+# that (it was previously handled by sidecars that no longer exist), so a
+# fresh cluster using --ha-lease-source=kubernetes can never produce a writer.
+#
+# This manifest sidesteps that gap for local testing by using
+# --ha-lease-source=file with a static lease/freshness ConfigMap that
+# permanently names sqlite-ha-0 as the writer. To simulate failover, patch
+# the sqlite-ha-demo-lease ConfigMap's lease.txt to a different holder_node_id
+# (bump generation, refresh renewed_at_secs) and re-apply; the mounted file
+# updates in each pod within roughly a kubelet sync interval.
+#
+# Usage:
+#   docker build -t rsqlite-rsync:dev .
+#   k3d image import rsqlite-rsync:dev -c <cluster-name>
+#   kubectl create namespace sqlite-ha
+#   kubectl -n sqlite-ha create configmap sqlite-ha-demo-lease \
+#     --from-literal=lease.txt="holder_node_id=sqlite-ha-0
+#   generation=1
+#   renewed_at_secs=$(date +%s)
+#   ttl_secs=86400" \
+#     --from-literal=freshness.txt="source_node_id=sqlite-ha-0
+#   source_generation=1
+#   synced_at_secs=$(date +%s)"
+#   kubectl apply -n sqlite-ha -f examples/k8s/local-dev-file-lease.yaml
 apiVersion: v1
 kind: Service
 metadata:
@@ -43,23 +34,7 @@ metadata:
   labels:
     app: sqlite-ha
 spec:
-  ports:
-    - port: 8088
-      targetPort: probe-http
-      name: probe-http
-    - port: 50051
-      targetPort: grpc
-      name: grpc
-  selector:
-    app: sqlite-ha
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: sqlite-ha-writer
-  labels:
-    app: sqlite-ha
-spec:
+  clusterIP: None
   ports:
     - port: 8088
       targetPort: probe-http
@@ -88,18 +63,17 @@ spec:
       labels:
         app: sqlite-ha
     spec:
-      serviceAccountName: sqlite-ha
       terminationGracePeriodSeconds: 20
       containers:
         - name: rsqlite-rsync
-          image: ghcr.io/sria91/rsqlite-rsync:latest
+          image: rsqlite-rsync:dev
+          imagePullPolicy: IfNotPresent
           args:
             - --ha
             - --ha-node-id=$(POD_NAME)
-            - --ha-lease-source=kubernetes
-            - --ha-kube-namespace=$(POD_NAMESPACE)
-            - --ha-kube-lease-name=sqlite-writer-lease
-            - --ha-freshness-file=/var/run/rsqlite-rsync/freshness.txt
+            - --ha-lease-source=file
+            - --ha-lease-file=/etc/rsqlite-ha/lease.txt
+            - --ha-freshness-file=/etc/rsqlite-ha/freshness.txt
             - --ha-role-state-file=/var/run/rsqlite-rsync/role_state.txt
             - --ha-audit-log-file=/var/log/rsqlite-rsync/ha_audit.log
             - --ha-readiness-file=/var/run/rsqlite-rsync/readiness.txt
@@ -108,17 +82,13 @@ spec:
             - --ha-data-dir=/var/lib/sqlite
             - --ha-startup-fence-mode=permissive
             - --ha-tick-interval-ms=250
-            - --ha-max-freshness-age-secs=10
-            - --ha-max-future-skew-secs=2
+            - --ha-max-freshness-age-secs=999999999
+            - --ha-max-future-skew-secs=999999999
           env:
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
           ports:
             - name: probe-http
               containerPort: 8088
@@ -144,30 +114,19 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 1
             failureThreshold: 3
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - /bin/sh
-                  - -c
-                  - "sleep 3"
           volumeMounts:
             - name: run
               mountPath: /var/run/rsqlite-rsync
             - name: log
               mountPath: /var/log/rsqlite-rsync
+            - name: ha-lease
+              mountPath: /etc/rsqlite-ha
+              readOnly: true
       volumes:
         - name: run
           emptyDir: {}
         - name: log
           emptyDir: {}
----
-apiVersion: coordination.k8s.io/v1
-kind: Lease
-metadata:
-  name: sqlite-writer-lease
-  annotations:
-    rsqlite-rsync.dev/generation: "1"
-spec:
-  holderIdentity: ""
-  leaseDurationSeconds: 15
+        - name: ha-lease
+          configMap:
+            name: sqlite-ha-demo-lease

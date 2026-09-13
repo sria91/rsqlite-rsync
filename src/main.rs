@@ -5,23 +5,32 @@
 //!     rsqlite-rsync [OPTIONS] <ORIGIN> <REPLICA>
 //!     rsqlite-rsync --ha [HA OPTIONS]
 //!     rsqlite-rsync --batch-manifest <PATH> [BATCH OPTIONS]
+//!     rsqlite-rsync client <SUBCOMMAND> [OPTIONS]
+//!     rsqlite-rsync sql [OPTIONS] -d <DATABASE> "<SQL>"
 //! ```
 //!
 //! See `--help` for the full option list.
 
 mod batch;
+mod cli;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use cli::{
+    ClientCommand, ClientConnectionArgs, OutputFormat, run_client_command, run_sql_shorthand,
+};
 use rsqlite_rsync::endpoint::Endpoint;
 use rsqlite_rsync::error::{Result, SyncError};
+use rsqlite_rsync::gateway::{DatabaseEngine, SqlGatewayServer};
+use rsqlite_rsync::ha::{HaSharedState, NodeRole};
+use rsqlite_rsync::proto::rsqlite::v1::sql_gateway_server::SqlGatewayServer as TonicSqlGatewayServer;
 use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
 use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
 
@@ -29,13 +38,16 @@ use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
 // CLI definition
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Bandwidth-efficient SQLite database sync tool.
+/// Bandwidth-efficient SQLite database sync tool and HA SQL Gateway.
 ///
 /// Makes REPLICA a consistent snapshot of ORIGIN using a two-phase hash
 /// comparison protocol that transfers only changed pages.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<CliCommandGroup>,
+
     /// Source database path (local path or `[user@]host:path`).
     origin: Option<String>,
 
@@ -178,6 +190,26 @@ struct Args {
     #[arg(long, requires = "ha")]
     ha_readiness_http_bind: Option<String>,
 
+    /// Optional gRPC server bind address for embedded SQL gateway (for example, `0.0.0.0:50051`).
+    #[arg(long, requires = "ha")]
+    ha_grpc_bind: Option<String>,
+
+    /// Data directory holding SQLite databases for the gRPC gateway.
+    #[arg(long, requires = "ha")]
+    ha_data_dir: Option<PathBuf>,
+
+    /// Allow eventual-consistency read queries on replica nodes.
+    #[arg(long, requires = "ha")]
+    ha_allow_replica_reads: bool,
+
+    /// Headless service name for cluster DNS in Kubernetes (e.g. `sqlite-ha`).
+    #[arg(long, default_value = "sqlite-ha", requires = "ha")]
+    ha_service_name: String,
+
+    /// gRPC port for cluster nodes.
+    #[arg(long, default_value_t = 50051, requires = "ha")]
+    ha_grpc_port: u16,
+
     /// Tick interval in milliseconds for HA mode.
     #[arg(long, default_value_t = 1_000, requires = "ha")]
     ha_tick_interval_ms: u64,
@@ -201,6 +233,34 @@ struct Args {
     /// Startup fence mode for HA mode.
     #[arg(long, value_enum, default_value_t = HaStartupFenceMode::Permissive, requires = "ha")]
     ha_startup_fence_mode: HaStartupFenceMode,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommandGroup {
+    /// Client interface to the SQLite HA cluster with leader discovery and failover.
+    Client {
+        #[clap(flatten)]
+        connection: ClientConnectionArgs,
+
+        #[command(subcommand)]
+        command: ClientCommand,
+    },
+    /// Shorthand command to execute SQL on the active cluster leader.
+    Sql {
+        #[clap(flatten)]
+        connection: ClientConnectionArgs,
+
+        /// Target database name (e.g. `app.db`).
+        #[arg(short, long)]
+        database: String,
+
+        /// SQL statement or query to execute.
+        sql: String,
+
+        /// Output formatting mode.
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -268,6 +328,25 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(args: Args) -> Result<()> {
+    if let Some(cmd) = args.command {
+        match cmd {
+            CliCommandGroup::Client {
+                connection,
+                command,
+            } => {
+                return run_client_command(&connection, &command).await;
+            }
+            CliCommandGroup::Sql {
+                connection,
+                database,
+                sql,
+                format,
+            } => {
+                return run_sql_shorthand(&connection, &database, &sql, format).await;
+            }
+        }
+    }
+
     if args.batch_manifest.is_some() {
         return run_batch_mode(args).await;
     }
@@ -279,7 +358,7 @@ async fn run(args: Args) -> Result<()> {
     let origin = args
         .origin
         .as_deref()
-        .ok_or_else(|| SyncError::Protocol("ORIGIN is required unless --ha is set".into()))?;
+        .ok_or_else(|| SyncError::Protocol("ORIGIN is required unless --ha or a client subcommand is set".into()))?;
 
     if args.server_replica {
         return server_replica_mode(Path::new(origin), &SyncTuning::from_env()).await;
@@ -546,6 +625,22 @@ fn unix_now_secs() -> Result<u64> {
         .map_err(|error| SyncError::Protocol(format!("system clock before unix epoch: {error}")))
 }
 
+/// Extract the currently-visible lease record (if any) from a reconcile tick's
+/// lease observation, for populating the gRPC gateway's cluster status.
+fn lease_from_observation(
+    observation: &rsqlite_rsync::ha::LeaseObservation,
+) -> Option<rsqlite_rsync::ha::LeaseRecord> {
+    use rsqlite_rsync::ha::LeaseObservation;
+    match observation {
+        LeaseObservation::Missing => None,
+        LeaseObservation::Acquired(lease)
+        | LeaseObservation::Renewed(lease)
+        | LeaseObservation::Replaced(lease)
+        | LeaseObservation::Unchanged(lease) => Some(lease.clone()),
+        LeaseObservation::Transferred { current, .. } => Some(current.clone()),
+    }
+}
+
 enum AnyLeaseReader {
     File(rsqlite_rsync::ha::FileLeaseReader),
     Kubernetes(rsqlite_rsync::ha::KubectlLeaseReader),
@@ -556,6 +651,7 @@ struct ReadinessAwareExecutor {
     inner: rsqlite_rsync::ha::TracingExecutor<rsqlite_rsync::ha::FileActionExecutor>,
     readiness_path: Option<PathBuf>,
     readiness_state: Arc<AtomicBool>,
+    ha_state: Arc<RwLock<HaSharedState>>,
 }
 
 impl ReadinessAwareExecutor {
@@ -563,11 +659,13 @@ impl ReadinessAwareExecutor {
         inner: rsqlite_rsync::ha::TracingExecutor<rsqlite_rsync::ha::FileActionExecutor>,
         readiness_path: Option<PathBuf>,
         readiness_state: Arc<AtomicBool>,
+        ha_state: Arc<RwLock<HaSharedState>>,
     ) -> Self {
         Self {
             inner,
             readiness_path,
             readiness_state,
+            ha_state,
         }
     }
 
@@ -590,12 +688,19 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
 
     fn ensure_replica(&mut self) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::ensure_replica(&mut self.inner)?;
-        self.write_readiness(false)
+        self.write_readiness(false)?;
+        let mut st = self.ha_state.write().unwrap();
+        st.role = NodeRole::Replica;
+        Ok(())
     }
 
     fn enable_writer(&mut self, generation: u64) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::enable_writer(&mut self.inner, generation)?;
-        self.write_readiness(true)
+        self.write_readiness(true)?;
+        let mut st = self.ha_state.write().unwrap();
+        st.role = NodeRole::Writer;
+        st.generation = generation;
+        Ok(())
     }
 
     fn disable_writer(
@@ -603,12 +708,18 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
         reason: &rsqlite_rsync::ha::DemotionReason,
     ) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::disable_writer(&mut self.inner, reason)?;
-        self.write_readiness(false)
+        self.write_readiness(false)?;
+        let mut st = self.ha_state.write().unwrap();
+        st.role = NodeRole::Replica;
+        Ok(())
     }
 
     fn keep_writer(&mut self) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::keep_writer(&mut self.inner)?;
-        self.write_readiness(true)
+        self.write_readiness(true)?;
+        let mut st = self.ha_state.write().unwrap();
+        st.role = NodeRole::Writer;
+        Ok(())
     }
 
     fn record_promotion_denied(
@@ -616,7 +727,10 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
         violation: &rsqlite_rsync::ha::PromotionViolation,
     ) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::record_promotion_denied(&mut self.inner, violation)?;
-        self.write_readiness(false)
+        self.write_readiness(false)?;
+        let mut st = self.ha_state.write().unwrap();
+        st.role = NodeRole::Replica;
+        Ok(())
     }
 }
 
@@ -715,6 +829,11 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         .ha_audit_log_file
         .ok_or_else(|| SyncError::Protocol("--ha-audit-log-file is required with --ha".into()))?;
 
+    let ha_shared_state = Arc::new(RwLock::new(HaSharedState::new(
+        node_id.clone(),
+        args.ha_allow_replica_reads,
+    )));
+
     let mut controller = HaController::new(node_id.clone());
     controller.set_min_source_generation(args.ha_min_source_generation);
     controller.set_promotion_config(PromotionConfig {
@@ -756,6 +875,7 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         ),
         args.ha_readiness_file.clone(),
         readiness_state.clone(),
+        ha_shared_state.clone(),
     );
     executor.initialize_not_ready().map_err(|error| {
         SyncError::Protocol(format!("failed writing initial readiness state: {error}"))
@@ -772,6 +892,8 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         audit_log_file = %audit_log_file.display(),
         ha_readiness_file = ?args.ha_readiness_file.as_ref().map(|p| p.display().to_string()),
         ha_readiness_http_bind = ?args.ha_readiness_http_bind,
+        ha_grpc_bind = ?args.ha_grpc_bind,
+        ha_data_dir = ?args.ha_data_dir.as_ref().map(|p| p.display().to_string()),
         startup_fence_mode = ?args.ha_startup_fence_mode,
         tick_interval_ms = args.ha_tick_interval_ms.max(50),
         "starting HA control loop"
@@ -794,6 +916,37 @@ async fn run_ha_mode(args: Args) -> Result<()> {
     } else {
         None
     };
+
+    let grpc_server = if let Some(bind_addr) = args.ha_grpc_bind.clone() {
+        let data_dir = args
+            .ha_data_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let engine = DatabaseEngine::new(data_dir)?;
+        let gateway_server = SqlGatewayServer::new(engine, ha_shared_state.clone());
+        let svc = TonicSqlGatewayServer::new(gateway_server);
+        let mut shutdown_rx_grpc = shutdown_tx.subscribe();
+
+        let addr: std::net::SocketAddr = bind_addr.parse().map_err(|error| {
+            SyncError::Protocol(format!("invalid gRPC bind address '{bind_addr}': {error}"))
+        })?;
+
+        info!(grpc_bind = %bind_addr, "starting embedded SQL Gateway gRPC server");
+        Some(tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_shutdown(addr, async move {
+                    let _ = shutdown_rx_grpc.changed().await;
+                })
+                .await
+                .map_err(|e| SyncError::Network(format!("gRPC server error: {e}")))
+        }))
+    } else {
+        None
+    };
+
+    let service_name = args.ha_service_name.clone();
+    let grpc_port = args.ha_grpc_port;
 
     if args.ha_startup_fence_mode == HaStartupFenceMode::RequireWriter {
         if let Some(path) = args.ha_freshness_file.as_deref() {
@@ -841,7 +994,37 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         }
 
         let now_secs = unix_now_secs()?;
-        match controller.tick_with_reader(now_secs, &mut lease_reader, &mut executor) {
+        let tick_outcome = controller.tick_with_reader(now_secs, &mut lease_reader, &mut executor);
+
+        // Update shared state lease record and active leader identity
+        let current_lease = match &tick_outcome {
+            ControllerTickOutcome::Executed(report) => {
+                lease_from_observation(&report.plan.outcome.lease_observation)
+            }
+            ControllerTickOutcome::LeaseReadFailed { .. } => None,
+        };
+
+        {
+            let mut state = ha_shared_state.write().unwrap();
+            state.lease_record = current_lease.clone();
+            if let Some(ref l) = current_lease {
+                state.active_leader_id = Some(l.holder_node_id.clone());
+                if !service_name.is_empty() {
+                    state.active_leader_endpoint = Some(format!(
+                        "http://{}.{}:{}",
+                        l.holder_node_id, service_name, grpc_port
+                    ));
+                } else {
+                    state.active_leader_endpoint =
+                        Some(format!("http://{}:{}", l.holder_node_id, grpc_port));
+                }
+            } else {
+                state.active_leader_id = None;
+                state.active_leader_endpoint = None;
+            }
+        }
+
+        match tick_outcome {
             ControllerTickOutcome::Executed(report) => {
                 if !report.is_success() {
                     tracing::warn!(
@@ -883,6 +1066,20 @@ async fn run_ha_mode(args: Args) -> Result<()> {
             Err(error) => {
                 return Err(SyncError::Protocol(format!(
                     "readiness http server task join failed: {error}"
+                )));
+            }
+        }
+    }
+
+    if let Some(task) = grpc_server {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(SyncError::Protocol(format!("gRPC server failed: {error}")));
+            }
+            Err(error) => {
+                return Err(SyncError::Protocol(format!(
+                    "gRPC server task join failed: {error}"
                 )));
             }
         }
@@ -975,7 +1172,7 @@ mod tests {
         assert!(matches!(
             err,
             Err(SyncError::Protocol(message))
-                if message.contains("ORIGIN is required unless --ha is set")
+                if message.contains("ORIGIN is required")
         ));
     }
 
@@ -990,6 +1187,44 @@ mod tests {
             err,
             Err(SyncError::Protocol(message))
                 if message.contains("REPLICA is required")
+        ));
+    }
+
+    #[test]
+    fn client_command_parses() {
+        let args = Args::try_parse_from([
+            "rsqlite-rsync",
+            "client",
+            "exec",
+            "-d",
+            "app.db",
+            "CREATE TABLE test (id INTEGER);",
+        ])
+        .expect("client args should parse");
+
+        assert!(matches!(
+            args.command,
+            Some(CliCommandGroup::Client {
+                command: ClientCommand::Exec { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sql_shorthand_parses() {
+        let args = Args::try_parse_from([
+            "rsqlite-rsync",
+            "sql",
+            "-d",
+            "app.db",
+            "SELECT * FROM test;",
+        ])
+        .expect("sql args should parse");
+
+        assert!(matches!(
+            args.command,
+            Some(CliCommandGroup::Sql { .. })
         ));
     }
 

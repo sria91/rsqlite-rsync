@@ -259,9 +259,24 @@ impl Connection {
         }
     }
 
-    /// Return the raw `*mut sqlite3` pointer (needed by [`Backup`]).
-    pub(crate) fn as_ptr(&self) -> *mut ffi::sqlite3 {
+    /// Return the raw `*mut sqlite3` pointer.
+    pub fn as_ptr(&self) -> *mut ffi::sqlite3 {
         self.db
+    }
+
+    /// Number of rows modified, inserted or deleted by the most recent statement.
+    pub fn changes(&self) -> u64 {
+        unsafe { ffi::sqlite3_changes(self.db) as u64 }
+    }
+
+    /// Rowid of the most recent successful INSERT into a rowid table.
+    pub fn last_insert_rowid(&self) -> i64 {
+        unsafe { ffi::sqlite3_last_insert_rowid(self.db) }
+    }
+
+    /// Prepare a SQL statement for execution and parameter binding.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        PreparedStatement::new(self, sql)
     }
 
     // ── private helpers ──────────────────────────────────────────────────────
@@ -412,6 +427,245 @@ impl Backup {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Prepared Statement & Typed SQL Values
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// SQLite column data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnDataType {
+    Integer,
+    Float,
+    Text,
+    Blob,
+    Null,
+}
+
+/// Dynamically typed SQLite value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+/// Result of stepping a prepared statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepResult {
+    Row,
+    Done,
+}
+
+/// A prepared SQLite statement.
+pub struct PreparedStatement {
+    stmt: *mut ffi::sqlite3_stmt,
+    db: *mut ffi::sqlite3,
+}
+
+// SAFETY: `sqlite3_stmt` is owned and accessed from a single thread.
+unsafe impl Send for PreparedStatement {}
+
+impl PreparedStatement {
+    /// Prepare a new SQL statement on the connection.
+    pub fn new(conn: &Connection, sql: &str) -> Result<Self> {
+        let c_sql = CString::new(sql).map_err(|e| SyncError::Protocol(e.to_string()))?;
+        let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
+        unsafe {
+            check(
+                conn.as_ptr(),
+                ffi::sqlite3_prepare_v2(conn.as_ptr(), c_sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            )?;
+        }
+        Ok(PreparedStatement {
+            stmt,
+            db: conn.as_ptr(),
+        })
+    }
+
+    /// Returns `true` if this statement is guaranteed to not change the database.
+    pub fn is_readonly(&self) -> bool {
+        unsafe { ffi::sqlite3_stmt_readonly(self.stmt) != 0 }
+    }
+
+    /// Step the statement execution.
+    pub fn step(&mut self) -> Result<StepResult> {
+        let rc = unsafe { ffi::sqlite3_step(self.stmt) };
+        match rc {
+            ffi::SQLITE_ROW => Ok(StepResult::Row),
+            ffi::SQLITE_DONE => Ok(StepResult::Done),
+            _ => {
+                check(self.db, rc)?;
+                Ok(StepResult::Done)
+            }
+        }
+    }
+
+    /// Reset the prepared statement back to its initial state for re-execution.
+    pub fn reset(&mut self) -> Result<()> {
+        unsafe { check(self.db, ffi::sqlite3_reset(self.stmt)) }
+    }
+
+    /// Reset all parameter bindings back to NULL.
+    pub fn clear_bindings(&mut self) -> Result<()> {
+        unsafe { check(self.db, ffi::sqlite3_clear_bindings(self.stmt)) }
+    }
+
+    /// Look up the 1-based index of a named parameter (e.g., ":id", "@name", "$val", or bare "id").
+    pub fn bind_parameter_index(&self, name: &str) -> Option<i32> {
+        let candidates = [
+            name.to_string(),
+            format!(":{name}"),
+            format!("@{name}"),
+            format!("${name}"),
+        ];
+        for cand in candidates {
+            if let Ok(c_name) = CString::new(cand) {
+                let idx = unsafe { ffi::sqlite3_bind_parameter_index(self.stmt, c_name.as_ptr()) };
+                if idx > 0 {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
+    /// Bind a NULL value to 1-indexed parameter `idx`.
+    pub fn bind_null(&mut self, idx: i32) -> Result<()> {
+        unsafe { check(self.db, ffi::sqlite3_bind_null(self.stmt, idx)) }
+    }
+
+    /// Bind a 64-bit integer value to 1-indexed parameter `idx`.
+    pub fn bind_int64(&mut self, idx: i32, val: i64) -> Result<()> {
+        unsafe { check(self.db, ffi::sqlite3_bind_int64(self.stmt, idx, val)) }
+    }
+
+    /// Bind a 64-bit float value to 1-indexed parameter `idx`.
+    pub fn bind_double(&mut self, idx: i32, val: f64) -> Result<()> {
+        unsafe { check(self.db, ffi::sqlite3_bind_double(self.stmt, idx, val)) }
+    }
+
+    /// Bind a UTF-8 text string to 1-indexed parameter `idx`.
+    pub fn bind_text(&mut self, idx: i32, val: &str) -> Result<()> {
+        unsafe {
+            check(
+                self.db,
+                ffi::sqlite3_bind_text(
+                    self.stmt,
+                    idx,
+                    val.as_ptr() as *const std::os::raw::c_char,
+                    val.len() as i32,
+                    ffi::SQLITE_TRANSIENT(),
+                ),
+            )
+        }
+    }
+
+    /// Bind raw blob bytes to 1-indexed parameter `idx`.
+    pub fn bind_blob(&mut self, idx: i32, val: &[u8]) -> Result<()> {
+        unsafe {
+            check(
+                self.db,
+                ffi::sqlite3_bind_blob(
+                    self.stmt,
+                    idx,
+                    val.as_ptr() as *const std::os::raw::c_void,
+                    val.len() as i32,
+                    ffi::SQLITE_TRANSIENT(),
+                ),
+            )
+        }
+    }
+
+    /// Return the number of columns in the result set.
+    pub fn column_count(&self) -> i32 {
+        unsafe { ffi::sqlite3_column_count(self.stmt) }
+    }
+
+    /// Return the name of 0-indexed column `idx`.
+    pub fn column_name(&self, idx: i32) -> String {
+        unsafe {
+            let ptr = ffi::sqlite3_column_name(self.stmt, idx);
+            if ptr.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    /// Return the declared datatype of 0-indexed column `idx`, if any.
+    pub fn column_decltype(&self, idx: i32) -> Option<String> {
+        unsafe {
+            let ptr = ffi::sqlite3_column_decltype(self.stmt, idx);
+            if ptr.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+            }
+        }
+    }
+
+    /// Return the SQLite storage class of 0-indexed column `idx` for the current row.
+    pub fn column_type(&self, idx: i32) -> ColumnDataType {
+        let code = unsafe { ffi::sqlite3_column_type(self.stmt, idx) };
+        match code {
+            ffi::SQLITE_INTEGER => ColumnDataType::Integer,
+            ffi::SQLITE_FLOAT => ColumnDataType::Float,
+            ffi::SQLITE_TEXT => ColumnDataType::Text,
+            ffi::SQLITE_BLOB => ColumnDataType::Blob,
+            _ => ColumnDataType::Null,
+        }
+    }
+
+    /// Extract the typed value of 0-indexed column `idx` for the current row.
+    pub fn column_value(&self, idx: i32) -> SqlValue {
+        match self.column_type(idx) {
+            ColumnDataType::Null => SqlValue::Null,
+            ColumnDataType::Integer => {
+                let val = unsafe { ffi::sqlite3_column_int64(self.stmt, idx) };
+                SqlValue::Integer(val)
+            }
+            ColumnDataType::Float => {
+                let val = unsafe { ffi::sqlite3_column_double(self.stmt, idx) };
+                SqlValue::Float(val)
+            }
+            ColumnDataType::Text => {
+                let ptr = unsafe { ffi::sqlite3_column_text(self.stmt, idx) };
+                let len = unsafe { ffi::sqlite3_column_bytes(self.stmt, idx) as usize };
+                if ptr.is_null() {
+                    SqlValue::Text(String::new())
+                } else {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    SqlValue::Text(String::from_utf8_lossy(bytes).into_owned())
+                }
+            }
+            ColumnDataType::Blob => {
+                let ptr = unsafe { ffi::sqlite3_column_blob(self.stmt, idx) };
+                let len = unsafe { ffi::sqlite3_column_bytes(self.stmt, idx) as usize };
+                if ptr.is_null() {
+                    SqlValue::Blob(Vec::new())
+                } else {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+                    SqlValue::Blob(bytes.to_vec())
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PreparedStatement {
+    fn drop(&mut self) {
+        if !self.stmt.is_null() {
+            unsafe {
+                ffi::sqlite3_finalize(self.stmt);
+            }
+            self.stmt = ptr::null_mut();
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -505,5 +759,78 @@ mod tests {
 
         // Verify replica has same page count.
         assert_eq!(src.page_count().unwrap(), dst.page_count().unwrap());
+    }
+
+    #[test]
+    fn prepared_statement_crud_and_introspection() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = open_rw(f.path());
+
+        conn.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB, extra TEXT)")
+            .unwrap();
+
+        // Check is_readonly
+        let insert_stmt = conn.prepare("INSERT INTO items (id, name, score, data, extra) VALUES (?, :name, ?, ?, ?)").unwrap();
+        assert!(!insert_stmt.is_readonly());
+
+        let select_stmt = conn.prepare("SELECT id, name, score, data, extra FROM items").unwrap();
+        assert!(select_stmt.is_readonly());
+
+        drop(select_stmt);
+        drop(insert_stmt);
+
+        // Insert with parameters
+        let mut stmt = conn
+            .prepare("INSERT INTO items (id, name, score, data, extra) VALUES (?, :name, ?, ?, ?)")
+            .unwrap();
+
+        let name_idx = stmt.bind_parameter_index("name").unwrap();
+        assert_eq!(name_idx, 2);
+
+        stmt.bind_int64(1, 42).unwrap();
+        stmt.bind_text(2, "apple").unwrap();
+        stmt.bind_double(3, 98.5).unwrap();
+        stmt.bind_blob(4, b"binary_data").unwrap();
+        stmt.bind_null(5).unwrap();
+
+        let step_res = stmt.step().unwrap();
+        assert_eq!(step_res, StepResult::Done);
+        assert_eq!(conn.changes(), 1);
+        assert_eq!(conn.last_insert_rowid(), 42);
+
+        // Query row
+        let mut query = conn
+            .prepare("SELECT id, name, score, data, extra FROM items WHERE id = ?")
+            .unwrap();
+        query.bind_int64(1, 42).unwrap();
+
+        assert_eq!(query.column_count(), 5);
+        assert_eq!(query.column_name(0), "id");
+        assert_eq!(query.column_name(1), "name");
+        assert_eq!(query.column_name(2), "score");
+
+        let step_res = query.step().unwrap();
+        assert_eq!(step_res, StepResult::Row);
+
+        assert_eq!(query.column_type(0), ColumnDataType::Integer);
+        assert_eq!(query.column_value(0), SqlValue::Integer(42));
+
+        assert_eq!(query.column_type(1), ColumnDataType::Text);
+        assert_eq!(query.column_value(1), SqlValue::Text("apple".into()));
+
+        assert_eq!(query.column_type(2), ColumnDataType::Float);
+        if let SqlValue::Float(f) = query.column_value(2) {
+            assert!((f - 98.5).abs() < f64::EPSILON);
+        } else {
+            panic!("expected float");
+        }
+
+        assert_eq!(query.column_type(3), ColumnDataType::Blob);
+        assert_eq!(query.column_value(3), SqlValue::Blob(b"binary_data".to_vec()));
+
+        assert_eq!(query.column_type(4), ColumnDataType::Null);
+        assert_eq!(query.column_value(4), SqlValue::Null);
+
+        assert_eq!(query.step().unwrap(), StepResult::Done);
     }
 }

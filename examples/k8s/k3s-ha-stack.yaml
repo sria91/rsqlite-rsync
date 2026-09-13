@@ -130,6 +130,9 @@ spec:
     - port: 8088
       targetPort: probe-http
       name: probe-http
+    - port: 50051
+      targetPort: grpc
+      name: grpc
   selector:
     app: sqlite-ha
 ---
@@ -144,6 +147,9 @@ spec:
     - port: 8088
       targetPort: probe-http
       name: probe-http
+    - port: 50051
+      targetPort: grpc
+      name: grpc
   selector:
     app: sqlite-ha
 ---
@@ -182,6 +188,8 @@ spec:
             - --ha-freshness-file=/var/run/rsqlite-rsync/freshness.txt
             - --ha-readiness-file=/var/run/rsqlite-rsync/readiness.txt
             - --ha-readiness-http-bind=0.0.0.0:8088
+            - --ha-grpc-bind=0.0.0.0:50051
+            - --ha-data-dir=/var/lib/sqlite
             - --ha-startup-fence-mode=permissive
             - --ha-tick-interval-ms=250
             - --ha-max-freshness-age-secs=10
@@ -198,6 +206,8 @@ spec:
           ports:
             - name: probe-http
               containerPort: 8088
+            - name: grpc
+              containerPort: 50051
           startupProbe:
             httpGet:
               path: /live

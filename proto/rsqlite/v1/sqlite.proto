@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package rsqlite.v1;
+
+// ── Value & Type System ──────────────────────────────────────────────────────
+
+enum ColumnType {
+  COLUMN_TYPE_UNSPECIFIED = 0;
+  COLUMN_TYPE_INTEGER = 1;
+  COLUMN_TYPE_FLOAT = 2;
+  COLUMN_TYPE_TEXT = 3;
+  COLUMN_TYPE_BLOB = 4;
+  COLUMN_TYPE_NULL = 5;
+}
+
+message Value {
+  oneof value {
+    bool null_value = 1;
+    int64 int_value = 2;
+    double float_value = 3;
+    string text_value = 4;
+    bytes blob_value = 5;
+  }
+}
+
+message NamedParameter {
+  string name = 1;   // e.g. ":id", "@name", "$val" or bare "id"
+  Value value = 2;
+}
+
+message Parameters {
+  repeated Value positional = 1;
+  repeated NamedParameter named = 2;
+}
+
+message Statement {
+  string sql = 1;
+  Parameters parameters = 2;
+}
+
+// ── Service Definition ───────────────────────────────────────────────────────
+
+service SqlGateway {
+  // Execute a DML/DDL write statement (INSERT, UPDATE, DELETE, CREATE TABLE, etc.)
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Execute a read query returning all rows in a unary response
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Execute a read query streaming rows in chunks (for large datasets)
+  rpc StreamQuery(QueryRequest) returns (stream QueryChunk);
+
+  // Execute a batch of statements atomically within an optional transaction
+  rpc Batch(BatchRequest) returns (BatchResponse);
+
+  // Introspect node role, lease ownership, writer generation, and database info
+  rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+}
+
+// ── Execute Messages ─────────────────────────────────────────────────────────
+
+message ExecuteRequest {
+  string database = 1;         // Relative DB name, e.g. "app.db"
+  Statement statement = 2;
+}
+
+message ExecuteResponse {
+  uint64 rows_affected = 1;    // sqlite3_changes
+  int64 last_insert_rowid = 2; // sqlite3_last_insert_rowid
+  uint64 execution_time_us = 3;
+  uint64 generation = 4;       // Cluster writer generation when executed
+}
+
+// ── Query Messages ───────────────────────────────────────────────────────────
+
+enum ConsistencyLevel {
+  CONSISTENCY_LEVEL_STRONG = 0;   // Must read from active writer (default)
+  CONSISTENCY_LEVEL_EVENTUAL = 1; // Permitted on local replica
+}
+
+message QueryRequest {
+  string database = 1;
+  Statement statement = 2;
+  ConsistencyLevel consistency = 3;
+  uint32 max_rows = 4;         // 0 = unlimited
+  uint32 chunk_size = 5;       // StreamQuery only; rows per chunk (0 = default)
+}
+
+message ColumnHeader {
+  string name = 1;
+  ColumnType column_type = 2;
+  string declared_type = 3;    // e.g. "INTEGER PRIMARY KEY", "VARCHAR(255)"
+}
+
+message Row {
+  repeated Value values = 1;
+}
+
+message QueryResponse {
+  repeated ColumnHeader columns = 1;
+  repeated Row rows = 2;
+  uint64 total_rows = 3;
+  uint64 execution_time_us = 4;
+  uint64 generation = 5;
+  bool is_replica_read = 6;
+}
+
+message QueryChunk {
+  repeated ColumnHeader columns = 1; // Sent on first chunk
+  repeated Row rows = 2;
+  bool is_last = 3;
+  uint64 total_rows = 4;
+  uint64 execution_time_us = 5;
+}
+
+// ── Batch Messages ───────────────────────────────────────────────────────────
+
+enum BatchTransactionMode {
+  BATCH_TRANSACTION_MODE_NONE = 0;       // Individual autocommit
+  BATCH_TRANSACTION_MODE_DEFERRED = 1;   // BEGIN DEFERRED ... COMMIT
+  BATCH_TRANSACTION_MODE_IMMEDIATE = 2;  // BEGIN IMMEDIATE ... COMMIT
+  BATCH_TRANSACTION_MODE_EXCLUSIVE = 3;  // BEGIN EXCLUSIVE ... COMMIT
+}
+
+message BatchRequest {
+  string database = 1;
+  repeated Statement statements = 2;
+  BatchTransactionMode transaction_mode = 3;
+  bool stop_on_error = 4;
+}
+
+message StatementResult {
+  oneof result {
+    ExecuteResponse execute_result = 1;
+    QueryResponse query_result = 2;
+  }
+  string error = 3;
+}
+
+message BatchResponse {
+  repeated StatementResult results = 1;
+  uint64 total_execution_time_us = 2;
+  uint64 generation = 3;
+  bool committed = 4;
+}
+
+// ── Cluster Status Messages ──────────────────────────────────────────────────
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_WRITER = 1;
+  NODE_ROLE_REPLICA = 2;
+}
+
+message ClusterStatusRequest {}
+
+message DatabaseInfo {
+  string name = 1;
+  uint32 page_size = 2;
+  uint32 page_count = 3;
+  uint64 file_size_bytes = 4;
+  string journal_mode = 5;
+}
+
+message LeaseStatus {
+  bool is_held = 1;
+  string holder_node_id = 2;
+  uint64 generation = 3;
+  uint64 renewed_at_secs = 4;
+  uint64 ttl_secs = 5;
+  bool is_expired = 6;
+}
+
+message ClusterStatusResponse {
+  string node_id = 1;
+  NodeRole role = 2;
+  uint64 local_generation = 3;
+  LeaseStatus lease = 4;
+  string current_leader_id = 5;
+  string current_leader_endpoint = 6;
+  repeated DatabaseInfo databases = 7;
+  uint64 uptime_secs = 8;
+  string version = 9;
+}

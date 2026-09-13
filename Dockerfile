@@ -16,7 +16,8 @@ RUN apk add --no-cache \
     musl-dev \
     pkgconfig \
     make \
-    git
+    git \
+    protobuf-dev
 
 ARG TARGETPLATFORM
 
@@ -32,8 +33,9 @@ RUN xx-cargo --setup-target-triple
 WORKDIR /usr/src/rsqlite-rsync
 
 # Copy manifest files and all source trees referenced by Cargo.toml
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+COPY proto ./proto
 COPY benches ./benches
 COPY tests ./tests
 
