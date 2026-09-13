@@ -148,6 +148,9 @@ impl MockGateway {
             .unwrap_or_else(|| state.default.clone())
     }
 
+    // Mirrors the tonic-generated `SqlGateway` trait methods this backs,
+    // whose `Result<Response<T>, Status>` shape isn't ours to change.
+    #[allow(clippy::result_large_err)]
     async fn apply<T>(
         &self,
         method: Method,
