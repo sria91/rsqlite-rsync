@@ -54,9 +54,11 @@ spec:
   # Headless: this is the StatefulSet's governing service (serviceName
   # below), so per-pod DNS records (e.g. sqlite-ha-0.sqlite-ha...) only get
   # created by CoreDNS when this is unset. That per-pod DNS is what the
-  # client's --kube-service / Lease-based writer discovery depends on
-  # (see rsqlite-rsync-client's KubeLeaseResolver) now that there is no
-  # separate writer-routing Service — see README "SQL Gateway and client".
+  # client's --kube-service / Lease-based writer discovery depends on (see
+  # rsqlite-rsync-client's KubeLeaseResolver) — see README "SQL Gateway and
+  # client". This manifest has no lease-claiming/label-updating sidecars
+  # (see the NOTE above), so there's no writer-routing Service here; see
+  # examples/k8s/k3s-ha-stack.yaml for that pattern if you add one.
   clusterIP: None
   ports:
     - port: 8088

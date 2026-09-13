@@ -454,6 +454,15 @@ discovery). `with_auth_token` is only needed when the target gateway requires
 authentication (the default — see [SQL Gateway and
 client](#sql-gateway-and-client)); omit it to send no `authorization` header.
 
+`--endpoint`/`--endpoints`/`--kube-lease` above work against any deployment,
+independent of which example manifest you used. The
+[`examples/k8s/k3s-ha-stack.yaml`](examples/k8s/k3s-ha-stack.yaml) reference
+deployment specifically also provisions a `sqlite-ha-writer` Service as an
+additional convenience — a label-updater sidecar tags the current writer's
+pod so the Service's selector finds it — but it's a routing hint, not a
+substitute for the mechanisms above: see [docs/k3s-ha-runbook.md](docs/k3s-ha-runbook.md#architecture)
+for why, and note it isn't present in the other example manifests.
+
 ### Security
 
 - **Authentication**: the gRPC SQL Gateway requires a bearer token on every

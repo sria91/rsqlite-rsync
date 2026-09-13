@@ -4,7 +4,7 @@ This runbook provides a concrete k3s deployment pattern for single-writer SQLite
 
 ## Architecture
 
-Each pod in a `StatefulSet` runs three containers:
+Each pod in a `StatefulSet` runs four containers:
 
 - `rsqlite-rsync` HA controller:
   - decides writer vs replica from Kubernetes Lease
@@ -13,21 +13,52 @@ Each pod in a `StatefulSet` runs three containers:
 - lease-updater sidecar:
   - publishes lease ownership and renewals when local role is writer
   - updates `holderIdentity`, `renewTime`, and generation annotation
+  - when local role is *not* writer, watches for the Lease being missing
+    or expired with nobody renewing it, and attempts to claim it —
+    **any pod can win this**, not a designated ordinal. Kubernetes'
+    optimistic concurrency control (a `kubectl replace` carrying the
+    `resourceVersion` last read, or a `kubectl create` when the Lease
+    doesn't exist yet) is what actually arbitrates a race between
+    simultaneous candidates: at most one candidate's write can land for a
+    given vacancy, so the API server — not this sidecar — resolves ties.
+    Winning only makes a pod the Lease's `holderIdentity`; the
+    `rsqlite-rsync` container still independently decides whether to
+    promote based on that pod's own freshness ledger
+    (`validate_promotion` in `src/ha.rs`), so a candidate that wins the
+    Lease race with stale sync data simply stays a replica and the Lease
+    re-expires for another candidate to try
 - replica-sync sidecar contract:
   - when local role is replica, executes a sync command you provide
   - writes freshness ledger after successful sync
+- label-updater sidecar:
+  - patches this pod's own `role=writer`/`role=replica` label from its
+    local `role_state.txt`
 
-There is no Service that routes only to the writer — a readiness-filtered
-Service can't safely do that (see [HTTP Probe
-Endpoints](ha-kubernetes.md#probe-endpoints)) without also stalling
-StatefulSet rollouts. Instead, `sqlite-ha` is a plain headless Service used
-for stable per-pod DNS and general access, and clients find the current
-writer themselves: the gRPC client follows `NOT_LEADER` redirects
-automatically, or discovers it directly via the Kubernetes `Lease`
-(`--kube-lease`/`--kube-service`, see README [SQL Gateway and
-client](../README.md#sql-gateway-and-client)). Within the cluster,
-`role_state.txt` on each pod (`writer:N` or `replica`) is the ground truth
-for which pod currently holds the role.
+`sqlite-ha-writer` is a ClusterIP Service that selects on that `role=writer`
+label, so it routes to whichever pod is currently the writer. **This is a
+routing hint, not a safety mechanism** — write safety is enforced
+independently at the RPC layer (`HaSharedState::is_writer()` re-validates
+the write fence against the lease on every gRPC call), so a stale or wrong
+label just means a client's first hop gets a `NOT_LEADER` response with
+redirect metadata, which the built-in client already follows automatically.
+Zero endpoints are expected and normal during a cold cluster bootstrap
+(before any pod has won the initial election) and briefly during failover
+— a client relying solely on this Service rather than the mechanisms below
+would see connection failures in those windows, same as hitting any
+endpointless Service. This Service exists only in this manifest; the
+`ha-deployment*.yaml` variants have no lease/label-updating sidecars at
+all and rely purely on the mechanisms below.
+
+The portable, always-correct ways to find the writer — used regardless of
+whether `sqlite-ha-writer` happens to have a fresh endpoint — remain:
+the gRPC client follows `NOT_LEADER` redirects automatically, or discovers
+the writer directly via the Kubernetes `Lease` (`--kube-lease`/
+`--kube-service`, see README [SQL Gateway and
+client](../README.md#sql-gateway-and-client)). `sqlite-ha` (separate from
+`sqlite-ha-writer`) is a plain headless Service used for stable per-pod DNS
+and general access. Within the cluster, `role_state.txt` on each pod
+(`writer:N` or `replica`) is the ground truth for which pod currently
+holds the role.
 
 ## Prerequisites
 
@@ -40,10 +71,11 @@ for which pod currently holds the role.
 
 1. Apply with required variables:
    - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
-     — `<writer-host>` is a placeholder: there's no Service that resolves
-     to "whichever pod is currently the writer" (see Architecture above),
-     so resolve it in your real sync command (e.g. by reading the Lease
-     or `role_state.txt` from within the sync sidecar) before substituting
+     — `<writer-host>` is a placeholder: `sqlite-ha-writer` (see
+     Architecture above) only exposes the probe/gRPC ports, not SSH, so it
+     can't resolve this SSH example either — resolve it in your real sync
+     command (e.g. by reading the Lease or `role_state.txt` from within
+     the sync sidecar) before substituting
      it into this variable.
 2. Optional overrides:
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
@@ -55,6 +87,8 @@ for which pod currently holds the role.
 5. Verify which pod is currently the writer:
    - `kubectl exec sqlite-ha-0 -c rsqlite-rsync -- cat /var/run/rsqlite-rsync/role_state.txt`
      (repeat per pod, or grep the audit log — exactly one pod should report `writer:N`)
+   - or `kubectl get pods --show-labels` (exactly one `role=writer`) / `kubectl get endpoints sqlite-ha-writer`
+     — convenience checks, not the ground truth; see Architecture above
 6. Retrieve the gRPC SQL Gateway auth token (the script provisions this automatically — see [Security](../README.md#security) for why it's required):
    - `kubectl get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
    - also printed at the end of `apply-k3s-ha-stack.sh`'s own output
@@ -90,12 +124,25 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 1. Confirm exactly one pod reports `writer:N` in `role_state.txt` (step 5 above).
 2. Delete the current writer pod.
-3. Confirm a different pod's `role_state.txt` reports `writer:N` (a higher `N`
-   than before) — all pods stay Kubernetes-`Ready` throughout via `/healthz`
+3. Confirm some pod's `role_state.txt` reports `writer:N` with a higher `N`
+   than before — all pods stay Kubernetes-`Ready` throughout via `/healthz`
    regardless of role, so pod readiness alone doesn't tell you who the new
-   writer is; check the role explicitly.
+   writer is; check the role explicitly. Any pod can win this (see
+   Architecture above), not just the one that was deleted — but if the
+   deleted pod restarts and rejoins before the Lease actually expires
+   (`LEASE_DURATION_SECONDS`, 15s by default), it may legitimately resume
+   as the still-recorded holder with the *same* generation, since nothing
+   else ever got a real opening to claim it. That's expected, not a bug:
+   to reliably exercise a genuine cross-pod handoff, the writer needs to
+   stay down longer than the lease duration (for example, force-delete it
+   repeatedly, or scale the StatefulSet to 0 and back).
 4. Confirm lease holder and generation update.
 5. Confirm replica pods continue sync loop and freshness writes.
+6. Confirm `kubectl get endpoints sqlite-ha-writer` converges on the new
+   writer's pod IP within roughly one `LABEL_UPDATE_SLEEP_SECONDS` (2s)
+   after step 3 — total time-to-new-endpoint is bound by lease-election
+   timing, not by this step, which only adds the label-updater's poll
+   interval on top.
 
 ## Related Files
 
