@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -15,10 +20,22 @@ jobs:
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
       - name: Build
-        run: cargo build
+        run: cargo build --workspace
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Docs
-        run: cargo doc --no-deps
+        run: cargo doc --workspace --no-deps
+      - name: Test Kubernetes manifest validator
+        run: bash tests/integration/validate_k8s_manifests.sh
+      - name: Setup kubeconform
+        run: |
+          KUBECONFORM_VERSION=0.6.7
+          curl -fsSL -o /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp kubeconform
+          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+      - name: Validate Kubernetes manifests
+        run: ./scripts/validate-k8s-manifests.sh

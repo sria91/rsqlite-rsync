@@ -1,0 +1,19 @@
+[package]
+name = "rsqlite-rsync-proto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"
+description = "Shared protobuf/gRPC wire contract for the rsqlite-rsync SQL Gateway"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sria91/rsqlite-rsync"
+include = ["src/**/*", "build.rs", "proto/**/*.proto", "README.md"]
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"

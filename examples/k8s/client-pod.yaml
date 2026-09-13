@@ -1,0 +1,37 @@
+# Debug/test client pod: an idle pod carrying the rsqlite-rsync binary,
+# deployed into the same namespace as the sqlite-ha StatefulSet so you can
+# `kubectl exec` into it and run `rsqlite-rsync client ...` / `rsqlite-rsync
+# sql ...` against the cluster over its internal headless-service DNS,
+# without needing a port-forward.
+#
+# RSQLITE_ENDPOINTS is pre-set to all three StatefulSet pods (candidate
+# discovery probes each and picks whichever reports itself as writer), so
+# most commands can omit --endpoint/--endpoints entirely. Works against any
+# of the sqlite-ha StatefulSet variants in this directory, since they all
+# share the same pod-naming/headless-service shape.
+#
+# Usage:
+#   kubectl apply -n sqlite-ha -f examples/k8s/client-pod.yaml
+#   kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync client status
+#   kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync sql -d demo.db "SELECT 1"
+#   kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync client repl -d demo.db
+#
+# Teardown:
+#   kubectl delete -n sqlite-ha -f examples/k8s/client-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sqlite-ha-client
+  labels:
+    app: sqlite-ha-client
+spec:
+  containers:
+    - name: rsqlite-rsync-client
+      image: rsqlite-rsync:dev
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c", "sleep infinity"]
+      env:
+        - name: RSQLITE_ENDPOINTS
+          value: "http://sqlite-ha-0.sqlite-ha:50051,http://sqlite-ha-1.sqlite-ha:50051,http://sqlite-ha-2.sqlite-ha:50051"
+      stdin: true
+      tty: true

@@ -19,7 +19,7 @@ where
     {
         return tokio::task::spawn_blocking(move || pool.install(f))
             .await
-            .unwrap();
+            .expect("blocking task should not be cancelled");
     }
     f()
 }

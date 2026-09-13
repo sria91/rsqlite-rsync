@@ -1,0 +1,7 @@
+target/
+.git/
+.gitignore
+.claude/
+.codebase-memory/
+docs/
+examples/

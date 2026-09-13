@@ -27,6 +27,10 @@ pub enum SyncError {
     #[error("Failed to launch remote endpoint: {0}")]
     RemoteLaunch(String),
 
+    /// A network transport (e.g. gRPC channel) failed to connect or serve.
+    #[error("Network error: {0}")]
+    Network(String),
+
     /// ORIGIN and REPLICA have different SQLite page sizes, which prevents
     /// in-place page transfer.
     #[error("Page-size mismatch: origin={origin}, replica={replica}")]
@@ -56,6 +60,17 @@ impl SyncError {
         SyncError::Sqlite {
             code,
             msg: msg.into(),
+        }
+    }
+}
+
+impl From<rsqlite_rsync_client::ClientError> for SyncError {
+    fn from(error: rsqlite_rsync_client::ClientError) -> Self {
+        match error {
+            rsqlite_rsync_client::ClientError::Connect { .. } => {
+                SyncError::Network(error.to_string())
+            }
+            other => SyncError::Protocol(other.to_string()),
         }
     }
 }
