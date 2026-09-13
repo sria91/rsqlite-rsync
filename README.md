@@ -402,8 +402,8 @@ Lease), `--max-retries`, `--timeout`. Output formatting: `--format
 
 For embedding in another Rust service, the client is also published as a
 standalone crate,
-[`rsqlite-rsync-client`](crates/rsqlite-rsync-client), with no SQLite/HA/CLI
-dependencies — just `tonic` and `rsqlite-rsync-proto`:
+[`rsqlite-rsync-client`](crates/rsqlite-rsync-client), with no SQLite, HA, or CLI
+dependencies:
 
 ```rust
 use rsqlite_rsync_client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
