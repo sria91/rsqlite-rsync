@@ -408,11 +408,15 @@ dependencies:
 ```rust
 use rsqlite_rsync_client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
 
-let mut client = SqlGatewayClient::new(ClientConfig::new(
-    DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
-));
-client.execute("app.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)", None).await?;
-let rows = client.query("app.db", "SELECT * FROM t", None, 0, Default::default()).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = SqlGatewayClient::new(ClientConfig::new(
+        DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
+    ));
+    client.execute("app.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)", None).await?;
+    let rows = client.query("app.db", "SELECT * FROM t", None, 0, Default::default()).await?;
+    Ok(())
+}
 ```
 
 It retries on `NOT_LEADER` by following the redirect endpoint, and supports
