@@ -80,7 +80,10 @@ impl SqlGatewayServer {
     // call for no benefit on this non-hot-path.
     #[allow(clippy::result_large_err)]
     fn check_write_access(&self) -> std::result::Result<u64, Status> {
-        let state = self.ha_state.read().unwrap();
+        let state = self
+            .ha_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Self::now_secs();
         if !state.is_writer(now) {
             return Err(Self::not_leader_status(&state));
@@ -93,7 +96,10 @@ impl SqlGatewayServer {
         &self,
         consistency: ConsistencyLevel,
     ) -> std::result::Result<(u64, bool), Status> {
-        let state = self.ha_state.read().unwrap();
+        let state = self
+            .ha_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Self::now_secs();
         let is_writer = state.is_writer(now);
 
@@ -265,7 +271,10 @@ impl SqlGateway for SqlGatewayServer {
     ) -> std::result::Result<Response<ClusterStatusResponse>, Status> {
         let now = Self::now_secs();
         let (node_id, role, local_generation, lease, current_leader_id, current_leader_endpoint) = {
-            let state = self.ha_state.read().unwrap();
+            let state = self
+                .ha_state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let is_writer = state.is_writer(now);
             let role = if is_writer {
                 NodeRole::Writer

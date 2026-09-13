@@ -749,6 +749,14 @@ fn ha_mode_readiness_http_endpoint_reflects_writer_state() {
         "expected readiness endpoint to report 200 while writer is active"
     );
 
+    let healthz_ready_while_writer = wait_until(Duration::from_secs(4), || {
+        read_http_status_code_for_path(&readiness_bind, "/healthz") == Some(200)
+    });
+    assert!(
+        healthz_ready_while_writer,
+        "expected /healthz to report 200 once the loop has ticked, while writer"
+    );
+
     fs::write(&lease_path, "none\n").unwrap();
 
     let became_not_ready = wait_until(Duration::from_secs(4), || {
@@ -757,6 +765,17 @@ fn ha_mode_readiness_http_endpoint_reflects_writer_state() {
     assert!(
         became_not_ready,
         "expected readiness endpoint to report 503 after demotion"
+    );
+
+    // Unlike /ready, /healthz reflects "the loop has ticked at least once",
+    // not writer status — it must stay 200 across the demotion that just
+    // flipped /ready to 503. This is the whole point of the endpoint: a
+    // Kubernetes readinessProbe on /healthz must not depend on which pod
+    // is currently the writer.
+    assert_eq!(
+        read_http_status_code_for_path(&readiness_bind, "/healthz"),
+        Some(200),
+        "expected /healthz to stay 200 after demotion to replica"
     );
 
     assert!(
@@ -822,6 +841,66 @@ fn ha_mode_http_liveness_and_unknown_path_behave_as_expected() {
     assert!(
         child.child_mut().try_wait().unwrap().is_none(),
         "HA process exited unexpectedly during liveness endpoint test"
+    );
+}
+
+#[test]
+fn ha_mode_healthz_endpoint_reflects_initialization() {
+    let temp = tempfile::tempdir().unwrap();
+    let lease_path = temp.path().join("lease.txt");
+    let freshness_path = temp.path().join("freshness.txt");
+    let role_state_path = temp.path().join("role_state.txt");
+    let audit_log_path = temp.path().join("audit.log");
+
+    // A permanent replica (no lease anyone holds) — /healthz must still
+    // reach 200 once the loop has ticked, unlike /ready which never will.
+    fs::write(&lease_path, "none\n").unwrap();
+    fs::write(&freshness_path, "none\n").unwrap();
+
+    let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let readiness_bind = port_listener.local_addr().unwrap().to_string();
+    drop(port_listener);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rsqlite-rsync"));
+    cmd.arg("--ha")
+        .arg("--ha-node-id")
+        .arg("node-a")
+        .arg("--ha-lease-file")
+        .arg(&lease_path)
+        .arg("--ha-freshness-file")
+        .arg(&freshness_path)
+        .arg("--ha-role-state-file")
+        .arg(&role_state_path)
+        .arg("--ha-audit-log-file")
+        .arg(&audit_log_path)
+        .arg("--ha-readiness-http-bind")
+        .arg(&readiness_bind)
+        .arg("--ha-tick-interval-ms")
+        .arg("50")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = ChildGuard::spawn(&mut cmd).expect("failed to start HA mode process");
+
+    let healthz_ok = wait_until(Duration::from_secs(4), || {
+        read_http_status_code_for_path(&readiness_bind, "/healthz") == Some(200)
+    });
+    assert!(
+        healthz_ok,
+        "expected /healthz to report 200 once the reconcile loop has ticked"
+    );
+
+    // A permanent replica never passes /ready, but must stay Kubernetes
+    // "ready" (via /healthz) so a StatefulSet rollout isn't gated on it.
+    assert_eq!(
+        read_http_status_code_for_path(&readiness_bind, "/ready"),
+        Some(503),
+        "expected /ready to stay 503 for a node that never becomes writer"
+    );
+
+    assert!(
+        child.child_mut().try_wait().unwrap().is_none(),
+        "HA process exited unexpectedly during /healthz test"
     );
 }
 

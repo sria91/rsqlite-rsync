@@ -12,6 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rsqlite_rsync::client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
 use rsqlite_rsync::proto::rsqlite::v1::ConsistencyLevel;
 
+/// Fixed token every test node in this file is started with, so tests only
+/// need to exercise the SQL Gateway's actual behavior — not its (mandatory)
+/// authentication — and any client built by these helpers can talk to it.
+const TEST_AUTH_TOKEN: &str = "integration-test-token";
+
 struct ChildGuard {
     child: Child,
 }
@@ -79,7 +84,9 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 fn read_http_status_code(bind_addr: &str, path: &str) -> Option<u16> {
     let mut stream = std::net::TcpStream::connect(bind_addr).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .ok()?;
     stream
         .write_all(
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -136,6 +143,8 @@ impl SingleWriterCluster {
             .arg(&readiness_bind)
             .arg("--ha-grpc-bind")
             .arg(&grpc_bind)
+            .arg("--ha-grpc-auth-token")
+            .arg(TEST_AUTH_TOKEN)
             .arg("--ha-data-dir")
             .arg(&data_dir)
             .arg("--ha-allow-replica-reads")
@@ -166,6 +175,7 @@ impl SingleWriterCluster {
             initial_backoff_ms: 20,
             max_backoff_ms: 200,
             timeout: Duration::from_secs(5),
+            auth_token: Some(TEST_AUTH_TOKEN.to_string()),
         })
     }
 }
@@ -186,11 +196,7 @@ async fn grpc_gateway_execute_query_and_batch_roundtrip() {
     assert!(create.generation >= 1);
 
     let insert = client
-        .execute(
-            "app.db",
-            "INSERT INTO users (name) VALUES ('alice')",
-            None,
-        )
+        .execute("app.db", "INSERT INTO users (name) VALUES ('alice')", None)
         .await
         .expect("insert should succeed on writer");
     assert_eq!(insert.rows_affected, 1);
@@ -264,11 +270,7 @@ async fn grpc_gateway_drop_database_removes_file_and_wal_shm() {
     let mut client = cluster.client();
 
     client
-        .execute(
-            "app.db",
-            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
-            None,
-        )
+        .execute("app.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)", None)
         .await
         .expect("create table should succeed on writer");
     assert!(cluster.data_dir.join("app.db").exists());
@@ -312,7 +314,11 @@ async fn grpc_gateway_streams_query_rows_in_chunks() {
         .unwrap();
     for i in 0..25 {
         client
-            .execute("stream.db", &format!("INSERT INTO t (v) VALUES ({i})"), None)
+            .execute(
+                "stream.db",
+                &format!("INSERT INTO t (v) VALUES ({i})"),
+                None,
+            )
             .await
             .unwrap();
     }
@@ -340,7 +346,10 @@ async fn grpc_gateway_streams_query_rows_in_chunks() {
         }
     }
     assert_eq!(total_rows, 25);
-    assert!(chunk_count >= 3, "expected rows split across multiple chunks, got {chunk_count}");
+    assert!(
+        chunk_count >= 3,
+        "expected rows split across multiple chunks, got {chunk_count}"
+    );
 }
 
 #[test]
@@ -363,6 +372,8 @@ fn grpc_gateway_cli_client_and_sql_shorthand_roundtrip() {
         "sql",
         "--endpoint",
         &cluster.grpc_endpoint,
+        "--token",
+        TEST_AUTH_TOKEN,
         "-d",
         "cli.db",
         "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)",
@@ -373,6 +384,8 @@ fn grpc_gateway_cli_client_and_sql_shorthand_roundtrip() {
         "client",
         "--endpoint",
         &cluster.grpc_endpoint,
+        "--token",
+        TEST_AUTH_TOKEN,
         "exec",
         "-d",
         "cli.db",
@@ -384,6 +397,8 @@ fn grpc_gateway_cli_client_and_sql_shorthand_roundtrip() {
         "client",
         "--endpoint",
         &cluster.grpc_endpoint,
+        "--token",
+        TEST_AUTH_TOKEN,
         "query",
         "-d",
         "cli.db",
@@ -392,18 +407,26 @@ fn grpc_gateway_cli_client_and_sql_shorthand_roundtrip() {
         "json",
     ]);
     assert!(ok, "`client query` failed: {err}");
-    assert!(out.contains("widget"), "expected query output to contain inserted row, got: {out}");
+    assert!(
+        out.contains("widget"),
+        "expected query output to contain inserted row, got: {out}"
+    );
 
     let (ok, out, err) = run(&[
         "client",
         "--endpoint",
         &cluster.grpc_endpoint,
+        "--token",
+        TEST_AUTH_TOKEN,
         "status",
         "--format",
         "json",
     ]);
     assert!(ok, "`client status` failed: {err}");
-    assert!(out.contains("\"role\": \"writer\""), "expected status to report writer role, got: {out}");
+    assert!(
+        out.contains("\"role\": \"writer\""),
+        "expected status to report writer role, got: {out}"
+    );
 }
 
 /// A node that never holds the lease and therefore always stays a replica,
@@ -454,6 +477,8 @@ impl ReplicaOnlyNode {
             .arg(&audit_log_path)
             .arg("--ha-grpc-bind")
             .arg(&grpc_bind)
+            .arg("--ha-grpc-auth-token")
+            .arg(TEST_AUTH_TOKEN)
             .arg("--ha-data-dir")
             .arg(&data_dir)
             .arg("--ha-tick-interval-ms")
@@ -469,7 +494,10 @@ impl ReplicaOnlyNode {
         let listening = wait_until(Duration::from_secs(5), || {
             std::net::TcpStream::connect(&grpc_bind).is_ok()
         });
-        assert!(listening, "replica node's gRPC gateway never started listening");
+        assert!(
+            listening,
+            "replica node's gRPC gateway never started listening"
+        );
         // Give the control loop a couple of ticks to settle into Replica role.
         thread::sleep(Duration::from_millis(150));
 
@@ -492,6 +520,7 @@ impl ReplicaOnlyNode {
             initial_backoff_ms: 10,
             max_backoff_ms: 50,
             timeout: Duration::from_secs(5),
+            auth_token: Some(TEST_AUTH_TOKEN.to_string()),
         })
     }
 }
@@ -535,7 +564,13 @@ async fn grpc_gateway_allows_eventual_reads_on_replica_when_enabled() {
     let mut client = node.client();
 
     let resp = client
-        .query("app.db", "SELECT 1 AS one", None, 0, ConsistencyLevel::Eventual)
+        .query(
+            "app.db",
+            "SELECT 1 AS one",
+            None,
+            0,
+            ConsistencyLevel::Eventual,
+        )
         .await
         .expect("eventual read should be permitted on a replica when enabled");
     assert!(resp.is_replica_read);

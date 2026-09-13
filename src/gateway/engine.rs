@@ -11,9 +11,9 @@ use libsqlite3_sys as ffi;
 use crate::db::{Connection, PreparedStatement, SqlValue, StepResult};
 use crate::error::{Result, SyncError};
 use crate::proto::rsqlite::v1::{
-    BatchResponse, BatchTransactionMode, ColumnHeader, ColumnType, DatabaseInfo,
-    ExecuteResponse, NamedParameter, QueryChunk, QueryResponse, Row, Statement,
-    StatementResult, Value, value::Value as ProtoValueInner,
+    BatchResponse, BatchTransactionMode, ColumnHeader, ColumnType, DatabaseInfo, ExecuteResponse,
+    NamedParameter, QueryChunk, QueryResponse, Row, Statement, StatementResult, Value,
+    value::Value as ProtoValueInner,
 };
 
 /// Thread-safe SQLite database manager for a root data directory.
@@ -88,7 +88,12 @@ impl DatabaseEngine {
     }
 
     /// Execute a write statement (DML/DDL).
-    pub fn execute(&self, db_name: &str, stmt_proto: &Statement, generation: u64) -> Result<ExecuteResponse> {
+    pub fn execute(
+        &self,
+        db_name: &str,
+        stmt_proto: &Statement,
+        generation: u64,
+    ) -> Result<ExecuteResponse> {
         let lock = self.get_db_lock(db_name);
         let _guard = lock.lock().unwrap();
 
@@ -459,18 +464,27 @@ impl DatabaseEngine {
                     continue;
                 }
 
-                if let Ok(conn) = Connection::open(&path, ffi::SQLITE_OPEN_READONLY) {
-                    let page_size = conn.page_size();
-                    let page_count = conn.page_count().unwrap_or(0);
-                    let file_size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                match Connection::open(&path, ffi::SQLITE_OPEN_READONLY) {
+                    Ok(conn) => {
+                        let page_size = conn.page_size();
+                        let page_count = conn.page_count().unwrap_or(0);
+                        let file_size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-                    list.push(DatabaseInfo {
-                        name,
-                        page_size,
-                        page_count,
-                        file_size_bytes,
-                        journal_mode: "wal".into(),
-                    });
+                        list.push(DatabaseInfo {
+                            name,
+                            page_size,
+                            page_count,
+                            file_size_bytes,
+                            journal_mode: "wal".into(),
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            database = %name,
+                            error = %error,
+                            "skipping unreadable database file while listing databases"
+                        );
+                    }
                 }
             }
         }

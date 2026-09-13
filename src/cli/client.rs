@@ -13,7 +13,9 @@ use rustyline::error::ReadlineError;
 use rsqlite_rsync::client::{
     BoxError, ClientConfig, DiscoveryMode, LeaderResolver, SqlGatewayClient,
 };
+use rsqlite_rsync::db::SqlValue;
 use rsqlite_rsync::error::{Result, SyncError};
+use rsqlite_rsync::gateway::engine::proto_value_to_sql;
 use rsqlite_rsync::ha::{KubectlLeaseReader, LeaseReader};
 use rsqlite_rsync::proto::rsqlite::v1::{
     BatchResponse, BatchTransactionMode, ClusterStatusResponse, ConsistencyLevel, ExecuteResponse,
@@ -112,6 +114,12 @@ pub struct ClientConnectionArgs {
     /// Connection and query timeout in seconds.
     #[arg(long, default_value_t = 15)]
     pub timeout: u64,
+
+    /// Bearer token to send as `authorization: Bearer <token>`, when the
+    /// gateway requires authentication (see `--ha-grpc-auth-token` on the
+    /// server).
+    #[arg(long, env = "RSQLITE_TOKEN")]
+    pub token: Option<String>,
 }
 
 /// Resolves the current writer's endpoint from a Kubernetes Lease via
@@ -172,6 +180,7 @@ impl ClientConnectionArgs {
             initial_backoff_ms: 100,
             max_backoff_ms: 2000,
             timeout: Duration::from_secs(self.timeout),
+            auth_token: self.token.clone(),
         }
     }
 }
@@ -520,16 +529,28 @@ async fn handle_metacommand(
         }
         ".schema" => {
             let table = parts.get(1);
-            let sql = if let Some(t) = table {
-                format!(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='{}';",
-                    t.replace('\'', "''")
+            let (sql, params) = if let Some(t) = table {
+                (
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?;".to_string(),
+                    Some(Parameters {
+                        positional: vec![Value {
+                            value: Some(
+                                rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
+                                    (*t).to_string(),
+                                ),
+                            ),
+                        }],
+                        named: vec![],
+                    }),
                 )
             } else {
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;".to_string()
+                (
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;".to_string(),
+                    None,
+                )
             };
             match client
-                .query(current_db, &sql, None, 0, ConsistencyLevel::Strong)
+                .query(current_db, &sql, params, 0, ConsistencyLevel::Strong)
                 .await
             {
                 Ok(resp) => {
@@ -686,12 +707,9 @@ fn print_table(resp: &QueryResponse) {
         let row_cells: Vec<Cell> = row
             .values
             .iter()
-            .map(|v| {
-                if is_null_value(v) {
-                    Cell::new("NULL").fg(Color::DarkGrey)
-                } else {
-                    Cell::new(format_proto_value(v))
-                }
+            .map(|v| match proto_value_to_sql(v) {
+                SqlValue::Null => Cell::new("NULL").fg(Color::DarkGrey),
+                sql_value => Cell::new(format_sql_value(&sql_value)),
             })
             .collect();
         table.add_row(Row::from(row_cells));
@@ -717,26 +735,7 @@ fn print_json(resp: &QueryResponse) {
                 .get(i)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| format!("col_{i}"));
-            let json_val = match &v.value {
-                None | Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(_)) => {
-                    serde_json::Value::Null
-                }
-                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(i)) => {
-                    serde_json::Value::Number((*i).into())
-                }
-                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(f)) => {
-                    serde_json::Number::from_f64(*f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
-                }
-                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(t)) => {
-                    serde_json::Value::String(t.clone())
-                }
-                Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(b)) => {
-                    serde_json::Value::String(format!("x'{}'", hex_encode(b)))
-                }
-            };
-            obj.insert(col_name, json_val);
+            obj.insert(col_name, sql_value_to_json(&proto_value_to_sql(v)));
         }
         rows_json.push(serde_json::Value::Object(obj));
     }
@@ -754,15 +753,16 @@ fn print_delimited(resp: &QueryResponse, delimiter: char) {
         let row_strs: Vec<String> = row
             .values
             .iter()
-            .map(|v| {
-                if is_null_value(v) {
-                    return String::new();
-                }
-                let s = format_proto_value(v);
-                if delimiter == ',' && (s.contains(',') || s.contains('"') || s.contains('\n')) {
-                    format!("\"{}\"", s.replace('"', "\"\""))
-                } else {
-                    s
+            .map(|v| match proto_value_to_sql(v) {
+                SqlValue::Null => String::new(),
+                sql_value => {
+                    let s = format_sql_value(&sql_value);
+                    if delimiter == ',' && (s.contains(',') || s.contains('"') || s.contains('\n'))
+                    {
+                        format!("\"{}\"", s.replace('"', "\"\""))
+                    } else {
+                        s
+                    }
                 }
             })
             .collect();
@@ -877,26 +877,30 @@ fn node_role_str(role: i32) -> &'static str {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn is_null_value(val: &Value) -> bool {
-    matches!(
-        &val.value,
-        None | Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(
-            _
-        ))
-    )
+/// Both [`print_table`]/[`print_delimited`] (via [`format_sql_value`]) and
+/// [`print_json`] (via [`sql_value_to_json`]) convert a wire [`Value`] to
+/// [`SqlValue`] first, so "what are the possible value shapes" is decided in
+/// exactly one place instead of two independently-maintained matches over
+/// the proto type.
+fn format_sql_value(val: &SqlValue) -> String {
+    match val {
+        SqlValue::Null => "NULL".to_string(),
+        SqlValue::Integer(i) => i.to_string(),
+        SqlValue::Float(f) => f.to_string(),
+        SqlValue::Text(t) => t.clone(),
+        SqlValue::Blob(b) => format!("x'{}'", hex_encode(b)),
+    }
 }
 
-fn format_proto_value(val: &Value) -> String {
-    match &val.value {
-        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(_)) | None => {
-            "NULL".to_string()
-        }
-        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(i)) => i.to_string(),
-        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(f)) => f.to_string(),
-        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(t)) => t.clone(),
-        Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(b)) => {
-            format!("x'{}'", hex_encode(b))
-        }
+fn sql_value_to_json(val: &SqlValue) -> serde_json::Value {
+    match val {
+        SqlValue::Null => serde_json::Value::Null,
+        SqlValue::Integer(i) => serde_json::Value::Number((*i).into()),
+        SqlValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        SqlValue::Text(t) => serde_json::Value::String(t.clone()),
+        SqlValue::Blob(b) => serde_json::Value::String(format!("x'{}'", hex_encode(b))),
     }
 }
 

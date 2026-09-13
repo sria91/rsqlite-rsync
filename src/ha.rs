@@ -206,61 +206,42 @@ pub fn serialize_lease_record(lease: &LeaseRecord) -> String {
 
 /// Parse a lease record from key-value text.
 pub fn parse_lease_record(input: &str) -> Result<LeaseRecord, String> {
-    let mut holder_node_id: Option<String> = None;
-    let mut generation: Option<u64> = None;
-    let mut renewed_at_secs: Option<u64> = None;
-    let mut ttl_secs: Option<u64> = None;
+    let map = crate::kv_text::parse_kv_lines(
+        "lease",
+        input,
+        &[
+            "holder_node_id",
+            "generation",
+            "renewed_at_secs",
+            "ttl_secs",
+        ],
+    )?;
 
-    for raw_line in input.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("invalid lease line (expected key=value): {line}"));
-        };
-
-        match key.trim() {
-            "holder_node_id" => holder_node_id = Some(value.trim().to_owned()),
-            "generation" => {
-                generation = Some(
-                    value
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid generation: {}", value.trim()))?,
-                )
-            }
-            "renewed_at_secs" => {
-                renewed_at_secs = Some(
-                    value
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid renewed_at_secs: {}", value.trim()))?,
-                )
-            }
-            "ttl_secs" => {
-                ttl_secs = Some(
-                    value
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid ttl_secs: {}", value.trim()))?,
-                )
-            }
-            other => return Err(format!("unknown lease key: {other}")),
-        }
-    }
-
-    let holder_node_id = holder_node_id.ok_or_else(|| "missing holder_node_id".to_owned())?;
-    if holder_node_id.is_empty() {
-        return Err("holder_node_id must not be empty".to_owned());
-    }
+    let holder_node_id = crate::kv_text::require_non_empty(&map, "holder_node_id")?;
 
     Ok(LeaseRecord {
         holder_node_id,
-        generation: generation.ok_or_else(|| "missing generation".to_owned())?,
-        renewed_at_secs: renewed_at_secs.ok_or_else(|| "missing renewed_at_secs".to_owned())?,
-        ttl_secs: ttl_secs.ok_or_else(|| "missing ttl_secs".to_owned())?,
+        generation: crate::kv_text::require_u64(&map, "generation")?,
+        renewed_at_secs: crate::kv_text::require_u64(&map, "renewed_at_secs")?,
+        ttl_secs: crate::kv_text::require_u64(&map, "ttl_secs")?,
+    })
+}
+
+/// Parse a freshness ledger record from key-value text, using the same
+/// format and conventions as [`parse_lease_record`].
+pub fn parse_freshness_ledger(input: &str) -> Result<FreshnessLedger, String> {
+    let map = crate::kv_text::parse_kv_lines(
+        "freshness",
+        input,
+        &["source_node_id", "source_generation", "synced_at_secs"],
+    )?;
+
+    let source_node_id = crate::kv_text::require_non_empty(&map, "source_node_id")?;
+
+    Ok(FreshnessLedger {
+        source_node_id,
+        source_generation: crate::kv_text::require_u64(&map, "source_generation")?,
+        synced_at_secs: crate::kv_text::require_u64(&map, "synced_at_secs")?,
     })
 }
 
@@ -268,18 +249,13 @@ impl LeaseReader for FileLeaseReader {
     type Error = String;
 
     fn read_lease(&mut self) -> Result<Option<LeaseRecord>, Self::Error> {
-        let text = match std::fs::read_to_string(&self.lease_path) {
-            Ok(t) => t,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("failed reading lease file: {error}")),
-        };
+        let text = crate::kv_text::read_optional_kv_text(&self.lease_path)
+            .map_err(|error| format!("failed reading lease file: {error}"))?;
 
-        let trimmed = text.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-            return Ok(None);
+        match text {
+            Some(text) => parse_lease_record(&text).map(Some),
+            None => Ok(None),
         }
-
-        parse_lease_record(trimmed).map(Some)
     }
 }
 
@@ -548,6 +524,30 @@ impl<X> TracingExecutor<X> {
     }
 }
 
+/// Wraps one inner [`HaActionExecutor`] call with the before/success/error
+/// tracing every method in the impl below needs, so those methods differ
+/// only in the action name, any extra structured fields, and the inner call.
+///
+/// `$fields` (inside `[...]`) is forwarded verbatim into each `tracing::*!`
+/// call, exactly as if written there directly — so it accepts tracing's own
+/// field syntax (bare-name shorthand, `= ?value`, `= %value`, ...). When
+/// non-empty it must end in a trailing comma, e.g. `[generation,]`.
+macro_rules! traced_action {
+    ($self:expr, $action:expr, [$($fields:tt)*], $body:expr) => {{
+        tracing::info!(component = $self.component, action = $action, $($fields)* "execute HA action");
+        match $body {
+            Ok(()) => {
+                tracing::info!(component = $self.component, action = $action, $($fields)* "HA action succeeded");
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(component = $self.component, action = $action, $($fields)* error = %error, "HA action failed");
+                Err(error)
+            }
+        }
+    }};
+}
+
 impl<X> HaActionExecutor for TracingExecutor<X>
 where
     X: HaActionExecutor,
@@ -556,102 +556,41 @@ where
     type Error = X::Error;
 
     fn ensure_replica(&mut self) -> Result<(), Self::Error> {
-        tracing::info!(
-            component = self.component,
-            action = "ensure_replica",
-            "execute HA action"
-        );
-        match self.inner.ensure_replica() {
-            Ok(()) => {
-                tracing::info!(
-                    component = self.component,
-                    action = "ensure_replica",
-                    "HA action succeeded"
-                );
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(component = self.component, action = "ensure_replica", error = %error, "HA action failed");
-                Err(error)
-            }
-        }
+        traced_action!(self, "ensure_replica", [], self.inner.ensure_replica())
     }
 
     fn enable_writer(&mut self, generation: u64) -> Result<(), Self::Error> {
-        tracing::info!(
-            component = self.component,
-            action = "enable_writer",
-            generation,
-            "execute HA action"
-        );
-        match self.inner.enable_writer(generation) {
-            Ok(()) => {
-                tracing::info!(
-                    component = self.component,
-                    action = "enable_writer",
-                    generation,
-                    "HA action succeeded"
-                );
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(component = self.component, action = "enable_writer", generation, error = %error, "HA action failed");
-                Err(error)
-            }
-        }
+        traced_action!(
+            self,
+            "enable_writer",
+            [generation,],
+            self.inner.enable_writer(generation)
+        )
     }
 
     fn disable_writer(&mut self, reason: &DemotionReason) -> Result<(), Self::Error> {
-        tracing::info!(component = self.component, action = "disable_writer", reason = ?reason, "execute HA action");
-        match self.inner.disable_writer(reason) {
-            Ok(()) => {
-                tracing::info!(component = self.component, action = "disable_writer", reason = ?reason, "HA action succeeded");
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(component = self.component, action = "disable_writer", reason = ?reason, error = %error, "HA action failed");
-                Err(error)
-            }
-        }
+        traced_action!(
+            self,
+            "disable_writer",
+            [reason = ?reason,],
+            self.inner.disable_writer(reason)
+        )
     }
 
     fn keep_writer(&mut self) -> Result<(), Self::Error> {
-        tracing::info!(
-            component = self.component,
-            action = "keep_writer",
-            "execute HA action"
-        );
-        match self.inner.keep_writer() {
-            Ok(()) => {
-                tracing::info!(
-                    component = self.component,
-                    action = "keep_writer",
-                    "HA action succeeded"
-                );
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(component = self.component, action = "keep_writer", error = %error, "HA action failed");
-                Err(error)
-            }
-        }
+        traced_action!(self, "keep_writer", [], self.inner.keep_writer())
     }
 
     fn record_promotion_denied(
         &mut self,
         violation: &PromotionViolation,
     ) -> Result<(), Self::Error> {
-        tracing::info!(component = self.component, action = "record_promotion_denied", violation = ?violation, "execute HA action");
-        match self.inner.record_promotion_denied(violation) {
-            Ok(()) => {
-                tracing::info!(component = self.component, action = "record_promotion_denied", violation = ?violation, "HA action succeeded");
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(component = self.component, action = "record_promotion_denied", violation = ?violation, error = %error, "HA action failed");
-                Err(error)
-            }
-        }
+        traced_action!(
+            self,
+            "record_promotion_denied",
+            [violation = ?violation,],
+            self.inner.record_promotion_denied(violation)
+        )
     }
 }
 
@@ -1290,9 +1229,7 @@ mod tests {
         type Error = &'static str;
 
         fn read_lease(&mut self) -> Result<Option<LeaseRecord>, Self::Error> {
-            self.replies
-                .pop_front()
-                .unwrap_or(Err("no lease reply"))
+            self.replies.pop_front().unwrap_or(Err("no lease reply"))
         }
     }
 
@@ -1500,6 +1437,31 @@ mod tests {
                 min_required: 15,
             })
         );
+    }
+
+    #[test]
+    fn parse_freshness_ledger_accepts_valid_input() {
+        let parsed = parse_freshness_ledger(
+            "source_node_id=node-a\nsource_generation=9\nsynced_at_secs=123\n",
+        )
+        .expect("freshness should parse");
+
+        assert_eq!(parsed.source_node_id, "node-a");
+        assert_eq!(parsed.source_generation, 9);
+        assert_eq!(parsed.synced_at_secs, 123);
+    }
+
+    #[test]
+    fn parse_freshness_ledger_rejects_missing_fields() {
+        let err = parse_freshness_ledger("source_node_id=node-a\nsynced_at_secs=123\n")
+            .expect_err("freshness should fail");
+        assert!(err.contains("missing source_generation"));
+    }
+
+    #[test]
+    fn parse_freshness_ledger_rejects_unknown_key() {
+        let err = parse_freshness_ledger("bogus=1\n").expect_err("freshness should fail");
+        assert!(err.contains("unknown freshness key: bogus"));
     }
 
     #[test]

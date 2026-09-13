@@ -18,6 +18,24 @@ use crate::config::ClientConfig;
 use crate::discovery::{discover_leader, normalize_endpoint};
 use crate::error::{is_not_leader_status, ClientError, ClientResult};
 
+/// Wrap `message` in a [`Request`], attaching `authorization: Bearer <token>`
+/// when `auth_token` is set. Kept as a free function (rather than a method
+/// taking `&self`) so it can be called from inside the `move` closures
+/// passed to [`SqlGatewayClient::retry_loop`], which already borrow `self`
+/// mutably for the surrounding call — and reused by
+/// [`crate::discovery::discover_leader`]'s own candidate-probing RPCs, which
+/// otherwise would silently fail (and mis-select) against an
+/// authentication-requiring gateway.
+pub(crate) fn authorized_request<T>(auth_token: &Option<String>, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(token) = auth_token {
+        if let Ok(value) = format!("Bearer {token}").parse() {
+            request.metadata_mut().insert("authorization", value);
+        }
+    }
+    request
+}
+
 /// Client for executing SQL against the rsqlite-rsync HA cluster's gRPC SQL
 /// Gateway, with automatic leader discovery and failover.
 ///
@@ -67,7 +85,7 @@ impl SqlGatewayClient {
 
         let endpoint_str = match &self.current_endpoint {
             Some(ep) => ep.clone(),
-            None => discover_leader(&self.config.discovery).await?,
+            None => discover_leader(&self.config.discovery, &self.config.auth_token).await?,
         };
         let endpoint = Endpoint::from_shared(endpoint_str.clone())
             .map_err(|source| ClientError::InvalidEndpoint {
@@ -100,7 +118,7 @@ impl SqlGatewayClient {
     /// Discover the current active writer endpoint using the configured
     /// [`crate::DiscoveryMode`], without connecting.
     pub async fn discover_leader(&self) -> ClientResult<String> {
-        discover_leader(&self.config.discovery).await
+        discover_leader(&self.config.discovery, &self.config.auth_token).await
     }
 
     /// Execute a write statement (DML/DDL) with transparent failover and
@@ -125,11 +143,13 @@ impl SqlGatewayClient {
             statement: Some(stmt),
         };
 
+        let auth_token = self.config.auth_token.clone();
         self.retry_loop(false, |mut client| {
             let req = req.clone();
+            let auth_token = auth_token.clone();
             async move {
                 client
-                    .execute(Request::new(req))
+                    .execute(authorized_request(&auth_token, req))
                     .await
                     .map(|r| r.into_inner())
             }
@@ -158,11 +178,13 @@ impl SqlGatewayClient {
             consistency: consistency as i32,
         };
 
+        let auth_token = self.config.auth_token.clone();
         self.retry_loop(true, |mut client| {
             let req = req.clone();
+            let auth_token = auth_token.clone();
             async move {
                 client
-                    .query(Request::new(req))
+                    .query(authorized_request(&auth_token, req))
                     .await
                     .map(|r| r.into_inner())
             }
@@ -196,11 +218,13 @@ impl SqlGatewayClient {
             consistency: consistency as i32,
         };
 
+        let auth_token = self.config.auth_token.clone();
         self.retry_loop(true, |mut client| {
             let req = req.clone();
+            let auth_token = auth_token.clone();
             async move {
                 client
-                    .stream_query(Request::new(req))
+                    .stream_query(authorized_request(&auth_token, req))
                     .await
                     .map(|r| r.into_inner())
             }
@@ -226,11 +250,13 @@ impl SqlGatewayClient {
             stop_on_error,
         };
 
+        let auth_token = self.config.auth_token.clone();
         self.retry_loop(false, |mut client| {
             let req = req.clone();
+            let auth_token = auth_token.clone();
             async move {
                 client
-                    .batch(Request::new(req))
+                    .batch(authorized_request(&auth_token, req))
                     .await
                     .map(|r| r.into_inner())
             }
@@ -249,11 +275,13 @@ impl SqlGatewayClient {
             database: database.to_string(),
         };
 
+        let auth_token = self.config.auth_token.clone();
         self.retry_loop(true, |mut client| {
             let req = req.clone();
+            let auth_token = auth_token.clone();
             async move {
                 client
-                    .drop_database(Request::new(req))
+                    .drop_database(authorized_request(&auth_token, req))
                     .await
                     .map(|r| r.into_inner())
             }
@@ -263,11 +291,15 @@ impl SqlGatewayClient {
 
     /// Get cluster status (role, generation, lease, known databases).
     pub async fn get_cluster_status(&mut self) -> ClientResult<ClusterStatusResponse> {
-        self.retry_loop(true, |mut client| async move {
-            client
-                .get_cluster_status(Request::new(ClusterStatusRequest {}))
-                .await
-                .map(|r| r.into_inner())
+        let auth_token = self.config.auth_token.clone();
+        self.retry_loop(true, |mut client| {
+            let auth_token = auth_token.clone();
+            async move {
+                client
+                    .get_cluster_status(authorized_request(&auth_token, ClusterStatusRequest {}))
+                    .await
+                    .map(|r| r.into_inner())
+            }
         })
         .await
     }

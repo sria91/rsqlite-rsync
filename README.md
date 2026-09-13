@@ -38,6 +38,7 @@ The last three forms are covered in
   - [Batch mode](#batch-mode-multiple-databases)
   - [HA control loop mode](#ha-control-loop-mode)
   - [SQL Gateway and client](#sql-gateway-and-client)
+    - [Security](#security)
 - [Protocol](#protocol)
 - [Crate structure](#crate-structure)
 - [Performance tuning](#performance-tuning-optional)
@@ -64,7 +65,9 @@ The last three forms are covered in
   Kubernetes Lease), with readiness probes for lease/promotion state.
 - **SQL Gateway** — optional embedded gRPC server exposing SQL execution
   against the cluster's current writer, with a CLI client and a standalone
-  Rust client crate supporting leader discovery and automatic failover.
+  Rust client crate supporting leader discovery, automatic failover, and
+  bearer-token authentication (required by default; see
+  [Security](#security)).
 - **Pure Rust** — built on [`libsqlite3-sys`](https://crates.io/crates/libsqlite3-sys).
 
 ## Installation
@@ -290,6 +293,14 @@ rsqlite-rsync --ha \
 See [SQL Gateway and client](#sql-gateway-and-client) for how these are used.
 
 - `--ha-grpc-bind` (for example, `0.0.0.0:50051`) — starts the gateway
+- `--ha-grpc-auth-token` (env `RSQLITE_GRPC_AUTH_TOKEN`) — bearer token every
+  gRPC request must present as `authorization: Bearer <token>`. **Required**
+  whenever `--ha-grpc-bind` is set — the gateway executes arbitrary SQL
+  (including `DropDatabase`) for any caller that reaches it, so it refuses to
+  start unauthenticated by accident. Pass `--ha-grpc-insecure-no-auth`
+  instead to explicitly opt out (local development, or a deployment that
+  already authenticates callers via a trusted-network/mTLS boundary in front
+  of the gateway).
 - `--ha-data-dir` — directory of `.db` files the gateway serves (default `.`)
 - `--ha-allow-replica-reads` — permit eventual-consistency reads on replicas
 - `--ha-service-name` (default: `sqlite-ha`) — headless service name used to
@@ -335,7 +346,12 @@ synced_at_secs=1731000099
 - When `--ha-readiness-http-bind` is set, the endpoint returns HTTP `200` with
   `ready` on `/ready` while writer-active and HTTP `503` with `not-ready`
   otherwise. The `/live` endpoint always returns HTTP `200` with `live` while
-  the process is running.
+  the process is running. `/healthz` returns HTTP `200` once the HA
+  reconcile loop has completed at least one tick, regardless of writer or
+  replica outcome — **use `/healthz`, not `/ready`, as the Kubernetes
+  `readinessProbe` target**: since `/ready` only ever passes for the single
+  current writer, gating Pod readiness (and therefore StatefulSet rollout
+  progression) on it stalls any rolling update after the first pod.
 - When `--ha-startup-fence-mode=require-writer`, process startup fails unless
   the first HA tick can promote/confirm writer state.
 - Stop the loop cleanly with `Ctrl-C`.
@@ -360,28 +376,36 @@ reads are only served by the current writer; a non-writer responds with a
 `NOT_LEADER` status carrying the current leader's endpoint so clients can
 redirect.
 
+**Every RPC requires authentication by default** (see `--ha-grpc-auth-token`
+above) — writer fencing controls *when* writes are accepted, not *who* is
+allowed to call the gateway at all.
+
 ```bash
 rsqlite-rsync --ha --ha-node-id node-a \
   --ha-lease-file lease.txt --ha-role-state-file role_state.txt \
   --ha-audit-log-file audit.log \
-  --ha-grpc-bind 0.0.0.0:50051 --ha-data-dir ./data
+  --ha-grpc-bind 0.0.0.0:50051 --ha-grpc-auth-token "$RSQLITE_TOKEN" \
+  --ha-data-dir ./data
 ```
 
 Query it with the built-in `client`/`sql` CLI:
 
 ```bash
-rsqlite-rsync sql --endpoint http://127.0.0.1:50051 -d app.db \
-  "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)"
+rsqlite-rsync sql --endpoint http://127.0.0.1:50051 --token "$RSQLITE_TOKEN" \
+  -d app.db "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)"
 
-rsqlite-rsync client --endpoint http://127.0.0.1:50051 exec -d app.db \
-  "INSERT INTO items (label) VALUES ('widget')"
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 --token "$RSQLITE_TOKEN" \
+  exec -d app.db "INSERT INTO items (label) VALUES ('widget')"
 
-rsqlite-rsync client --endpoint http://127.0.0.1:50051 query -d app.db \
-  "SELECT * FROM items" --format json
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 --token "$RSQLITE_TOKEN" \
+  query -d app.db "SELECT * FROM items" --format json
 
-rsqlite-rsync client --endpoint http://127.0.0.1:50051 status
-rsqlite-rsync client --endpoint http://127.0.0.1:50051 repl -d app.db
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 --token "$RSQLITE_TOKEN" status
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 --token "$RSQLITE_TOKEN" repl -d app.db
 ```
+
+`--token` also reads from `RSQLITE_TOKEN`, so it can be left off the command
+line entirely once that's set in the environment.
 
 `client` subcommands:
 
@@ -397,7 +421,8 @@ rsqlite-rsync client --endpoint http://127.0.0.1:50051 repl -d app.db
 Connection flags (shared by `client` and `sql`): `--endpoint`, `--endpoints`
 (comma-separated candidates, probed for the current writer), `--kube-lease` /
 `--kube-namespace` / `--kube-service` (discover the writer via a Kubernetes
-Lease), `--max-retries`, `--timeout`. Output formatting: `--format
+Lease), `--token` (env `RSQLITE_TOKEN`; required when the gateway enforces
+authentication), `--max-retries`, `--timeout`. Output formatting: `--format
 <table|json|csv|tsv|raw>`.
 
 For embedding in another Rust service, the client is also published as a
@@ -410,9 +435,10 @@ use rsqlite_rsync_client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SqlGatewayClient::new(ClientConfig::new(
-        DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
-    ));
+    let mut client = SqlGatewayClient::new(
+        ClientConfig::new(DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()))
+            .with_auth_token(std::env::var("RSQLITE_TOKEN")?),
+    );
     client.execute("app.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)", None).await?;
     let rows = client.query("app.db", "SELECT * FROM t", None, 0, Default::default()).await?;
     Ok(())
@@ -422,7 +448,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 It retries on `NOT_LEADER` by following the redirect endpoint, and supports
 `DiscoveryMode::Candidates` (probe a fixed endpoint list for the writer) or a
 pluggable `DiscoveryMode::Custom` resolver (used by the CLI's Kubernetes Lease
-discovery).
+discovery). `with_auth_token` is only needed when the target gateway requires
+authentication (the default — see [SQL Gateway and
+client](#sql-gateway-and-client)); omit it to send no `authorization` header.
+
+### Security
+
+- **Authentication**: the gRPC SQL Gateway requires a bearer token on every
+  request unless the operator explicitly opts out with
+  `--ha-grpc-insecure-no-auth`. Writer fencing (which node accepts writes) is
+  a *separate*, correctness-only mechanism — it does not authenticate
+  callers, so auth is not optional by default.
+- **Transport encryption**: the gateway does not terminate TLS itself.
+  `--ha-grpc-bind`/`--endpoint` traffic (including the bearer token) is
+  plaintext on the wire. For anything beyond local development, put the
+  gateway behind a trusted network boundary, a reverse proxy, or a service
+  mesh sidecar that terminates TLS/mTLS in front of it.
 
 ## Protocol
 

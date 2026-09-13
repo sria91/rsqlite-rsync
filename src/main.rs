@@ -28,8 +28,8 @@ use cli::{
 };
 use rsqlite_rsync::endpoint::Endpoint;
 use rsqlite_rsync::error::{Result, SyncError};
-use rsqlite_rsync::gateway::{DatabaseEngine, SqlGatewayServer};
-use rsqlite_rsync::ha::{HaSharedState, NodeRole};
+use rsqlite_rsync::gateway::{AuthConfig, DatabaseEngine, SqlGatewayServer};
+use rsqlite_rsync::ha::{HaSharedState, NodeRole, parse_freshness_ledger};
 use rsqlite_rsync::proto::rsqlite::v1::sql_gateway_server::SqlGatewayServer as TonicSqlGatewayServer;
 use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
 use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
@@ -134,6 +134,14 @@ struct Args {
     #[arg(long)]
     ha: bool,
 
+    // The `requires = "ha"` attribute on every `ha_*` field below only
+    // prevents *standalone* misuse (passing an HA flag without `--ha`).
+    // Whether a given `ha_*` field is itself mandatory once `--ha` is set
+    // varies by flag (some are unconditionally required, some only under a
+    // particular `--ha-lease-source`, many stay optional) — clap's
+    // declarative validators can't express that variation with an
+    // actionable error message, so that check is done in `run_ha_mode`
+    // instead, uniformly for every field that needs it.
     /// Node identity for HA mode.
     #[arg(long, requires = "ha")]
     ha_node_id: Option<String>,
@@ -193,6 +201,23 @@ struct Args {
     /// Optional gRPC server bind address for embedded SQL gateway (for example, `0.0.0.0:50051`).
     #[arg(long, requires = "ha")]
     ha_grpc_bind: Option<String>,
+
+    /// Bearer token required on every gRPC SQL Gateway request (`authorization: Bearer <token>`).
+    ///
+    /// Required whenever `--ha-grpc-bind` is set, unless
+    /// `--ha-grpc-insecure-no-auth` is explicitly passed instead: the
+    /// gateway executes arbitrary SQL (including dropping databases) for
+    /// any caller that reaches it, so it refuses to start unauthenticated
+    /// by accident.
+    #[arg(long, env = "RSQLITE_GRPC_AUTH_TOKEN", requires = "ha")]
+    ha_grpc_auth_token: Option<String>,
+
+    /// Explicitly disable gRPC SQL Gateway authentication.
+    ///
+    /// Only for local development or when the gateway is already behind a
+    /// trusted-network/mTLS boundary that authenticates callers itself.
+    #[arg(long, requires = "ha")]
+    ha_grpc_insecure_no_auth: bool,
 
     /// Data directory holding SQLite databases for the gRPC gateway.
     #[arg(long, requires = "ha")]
@@ -355,10 +380,9 @@ async fn run(args: Args) -> Result<()> {
         return run_ha_mode(args).await;
     }
 
-    let origin = args
-        .origin
-        .as_deref()
-        .ok_or_else(|| SyncError::Protocol("ORIGIN is required unless --ha or a client subcommand is set".into()))?;
+    let origin = args.origin.as_deref().ok_or_else(|| {
+        SyncError::Protocol("ORIGIN is required unless --ha or a client subcommand is set".into())
+    })?;
 
     if args.server_replica {
         return server_replica_mode(Path::new(origin), &SyncTuning::from_env()).await;
@@ -535,87 +559,23 @@ async fn run_batch_mode(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn parse_freshness_ledger(
-    input: &str,
-) -> std::result::Result<rsqlite_rsync::ha::FreshnessLedger, String> {
-    use rsqlite_rsync::ha::FreshnessLedger;
-
-    let mut source_node_id: Option<String> = None;
-    let mut source_generation: Option<u64> = None;
-    let mut synced_at_secs: Option<u64> = None;
-
-    for raw_line in input.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!(
-                "invalid freshness line (expected key=value): {line}"
-            ));
-        };
-
-        match key.trim() {
-            "source_node_id" => source_node_id = Some(value.trim().to_owned()),
-            "source_generation" => {
-                source_generation = Some(
-                    value
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid source_generation: {}", value.trim()))?,
-                )
-            }
-            "synced_at_secs" => {
-                synced_at_secs = Some(
-                    value
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid synced_at_secs: {}", value.trim()))?,
-                )
-            }
-            other => return Err(format!("unknown freshness key: {other}")),
-        }
-    }
-
-    let source_node_id = source_node_id.ok_or_else(|| "missing source_node_id".to_owned())?;
-    if source_node_id.is_empty() {
-        return Err("source_node_id must not be empty".to_owned());
-    }
-
-    Ok(FreshnessLedger {
-        source_node_id,
-        source_generation: source_generation
-            .ok_or_else(|| "missing source_generation".to_owned())?,
-        synced_at_secs: synced_at_secs.ok_or_else(|| "missing synced_at_secs".to_owned())?,
-    })
-}
-
 fn read_freshness_ledger(path: &Path) -> Result<Option<rsqlite_rsync::ha::FreshnessLedger>> {
-    use std::io::ErrorKind;
-
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(SyncError::Protocol(format!(
-                "failed reading freshness file {}: {error}",
-                path.display()
-            )));
-        }
-    };
-
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-        return Ok(None);
-    }
-
-    parse_freshness_ledger(trimmed).map(Some).map_err(|error| {
+    let text = rsqlite_rsync::kv_text::read_optional_kv_text(path).map_err(|error| {
         SyncError::Protocol(format!(
-            "invalid freshness file {}: {error}",
+            "failed reading freshness file {}: {error}",
             path.display()
         ))
-    })
+    })?;
+
+    match text {
+        Some(text) => parse_freshness_ledger(&text).map(Some).map_err(|error| {
+            SyncError::Protocol(format!(
+                "invalid freshness file {}: {error}",
+                path.display()
+            ))
+        }),
+        None => Ok(None),
+    }
 }
 
 fn unix_now_secs() -> Result<u64> {
@@ -689,7 +649,10 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
     fn ensure_replica(&mut self) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::ensure_replica(&mut self.inner)?;
         self.write_readiness(false)?;
-        let mut st = self.ha_state.write().unwrap();
+        let mut st = self
+            .ha_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         st.role = NodeRole::Replica;
         Ok(())
     }
@@ -697,7 +660,10 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
     fn enable_writer(&mut self, generation: u64) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::enable_writer(&mut self.inner, generation)?;
         self.write_readiness(true)?;
-        let mut st = self.ha_state.write().unwrap();
+        let mut st = self
+            .ha_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         st.role = NodeRole::Writer;
         st.generation = generation;
         Ok(())
@@ -709,7 +675,10 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
     ) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::disable_writer(&mut self.inner, reason)?;
         self.write_readiness(false)?;
-        let mut st = self.ha_state.write().unwrap();
+        let mut st = self
+            .ha_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         st.role = NodeRole::Replica;
         Ok(())
     }
@@ -717,7 +686,10 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
     fn keep_writer(&mut self) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::keep_writer(&mut self.inner)?;
         self.write_readiness(true)?;
-        let mut st = self.ha_state.write().unwrap();
+        let mut st = self
+            .ha_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         st.role = NodeRole::Writer;
         Ok(())
     }
@@ -728,7 +700,10 @@ impl rsqlite_rsync::ha::HaActionExecutor for ReadinessAwareExecutor {
     ) -> std::result::Result<(), Self::Error> {
         rsqlite_rsync::ha::HaActionExecutor::record_promotion_denied(&mut self.inner, violation)?;
         self.write_readiness(false)?;
-        let mut st = self.ha_state.write().unwrap();
+        let mut st = self
+            .ha_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         st.role = NodeRole::Replica;
         Ok(())
     }
@@ -750,6 +725,7 @@ impl rsqlite_rsync::ha::LeaseReader for AnyLeaseReader {
 async fn run_readiness_http_server(
     listener: tokio::net::TcpListener,
     readiness: Arc<AtomicBool>,
+    initialized: Arc<AtomicBool>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -796,6 +772,13 @@ async fn run_readiness_http_server(
                         }
                     }
                     "/live" => ("HTTP/1.1 200 OK", "live\n"),
+                    "/healthz" => {
+                        if initialized.load(Ordering::SeqCst) {
+                            ("HTTP/1.1 200 OK", "healthy\n")
+                        } else {
+                            ("HTTP/1.1 503 Service Unavailable", "initializing\n")
+                        }
+                    }
                     _ => ("HTTP/1.1 404 Not Found", "not-found\n"),
                 };
 
@@ -868,6 +851,13 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         }
     };
     let readiness_state = Arc::new(AtomicBool::new(false));
+    // True once the HA reconcile loop has completed at least one tick,
+    // regardless of whether that tick decided writer or replica. Unlike
+    // `readiness_state` (writer-only), this is what a Kubernetes
+    // readinessProbe should gate rollout progression on: a replica pod is
+    // healthy and should be considered "ready" for StatefulSet update
+    // sequencing purposes, even though it will never pass `/ready`.
+    let initialized = Arc::new(AtomicBool::new(false));
     let mut executor = ReadinessAwareExecutor::new(
         TracingExecutor::new(
             FileActionExecutor::new(role_state_file.clone(), audit_log_file.clone()),
@@ -911,6 +901,7 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         Some(tokio::spawn(run_readiness_http_server(
             listener,
             readiness_state,
+            initialized.clone(),
             shutdown_rx,
         )))
     } else {
@@ -918,13 +909,47 @@ async fn run_ha_mode(args: Args) -> Result<()> {
     };
 
     let grpc_server = if let Some(bind_addr) = args.ha_grpc_bind.clone() {
+        let auth_config = match (&args.ha_grpc_auth_token, args.ha_grpc_insecure_no_auth) {
+            (Some(_), true) => {
+                return Err(SyncError::Protocol(
+                    "--ha-grpc-auth-token and --ha-grpc-insecure-no-auth are mutually exclusive"
+                        .into(),
+                ));
+            }
+            (Some(token), false) => {
+                if token.trim().is_empty() {
+                    return Err(SyncError::Protocol(
+                        "--ha-grpc-auth-token must not be empty".into(),
+                    ));
+                }
+                AuthConfig::required(token.clone())
+            }
+            (None, true) => AuthConfig::disabled(),
+            (None, false) => {
+                return Err(SyncError::Protocol(
+                    "--ha-grpc-auth-token (or --ha-grpc-insecure-no-auth to explicitly run \
+                     without authentication) is required when --ha-grpc-bind is set"
+                        .into(),
+                ));
+            }
+        };
+        if auth_config.is_disabled() {
+            tracing::warn!(
+                grpc_bind = %bind_addr,
+                "gRPC SQL Gateway authentication is disabled (--ha-grpc-insecure-no-auth): \
+                 any caller that reaches this port can execute arbitrary SQL"
+            );
+        }
+
         let data_dir = args
             .ha_data_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
         let engine = DatabaseEngine::new(data_dir)?;
         let gateway_server = SqlGatewayServer::new(engine, ha_shared_state.clone());
-        let svc = TonicSqlGatewayServer::new(gateway_server);
+        let svc = TonicSqlGatewayServer::with_interceptor(gateway_server, move |req| {
+            auth_config.check(req)
+        });
         let mut shutdown_rx_grpc = shutdown_tx.subscribe();
 
         let addr: std::net::SocketAddr = bind_addr.parse().map_err(|error| {
@@ -1005,7 +1030,9 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         };
 
         {
-            let mut state = ha_shared_state.write().unwrap();
+            let mut state = ha_shared_state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.lease_record = current_lease.clone();
             if let Some(ref l) = current_lease {
                 state.active_leader_id = Some(l.holder_node_id.clone());
@@ -1044,6 +1071,10 @@ async fn run_ha_mode(args: Args) -> Result<()> {
                 );
             }
         }
+
+        // The loop ran — that's the `/healthz` signal, independent of
+        // whether this tick's outcome was Executed or LeaseReadFailed.
+        initialized.store(true, Ordering::SeqCst);
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -1243,10 +1274,7 @@ mod tests {
         ])
         .expect("sql args should parse");
 
-        assert!(matches!(
-            args.command,
-            Some(CliCommandGroup::Sql { .. })
-        ));
+        assert!(matches!(args.command, Some(CliCommandGroup::Sql { .. })));
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub mod error;
 pub mod gateway;
 pub mod ha;
 pub mod hash;
+pub mod kv_text;
 pub mod protocol;
 pub mod snapshot;
 pub mod transport;
