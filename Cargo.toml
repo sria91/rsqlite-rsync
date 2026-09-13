@@ -37,10 +37,10 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 futures = "0.3"
 serde_yaml = "0.9"
-toml = "0.8"
-tonic = "0.12"
-comfy-table = "7"
-rustyline = "14"
+toml = "1.1"
+tonic = "0.14"
+comfy-table = "8"
+rustyline = "18"
 rsqlite-rsync-proto = { path = "crates/rsqlite-rsync-proto" }
 rsqlite-rsync-client = { path = "crates/rsqlite-rsync-client" }
 
@@ -48,7 +48,7 @@ rsqlite-rsync-client = { path = "crates/rsqlite-rsync-client" }
 tempfile = "3"
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
-which = "6"
+which = "8"
 
 [[bench]]
 name = "sync_bench"
