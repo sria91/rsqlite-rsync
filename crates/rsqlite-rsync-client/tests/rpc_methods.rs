@@ -93,6 +93,39 @@ async fn get_cluster_status_follows_not_leader_redirect() {
 }
 
 #[tokio::test]
+async fn drop_database_follows_not_leader_redirect() {
+    let writer_gw = MockGateway::writer();
+    let writer = MockServer::start(writer_gw.clone()).await;
+
+    let stale_gw = MockGateway::replica().script([Behavior::NotLeader {
+        leader_endpoint: Some(writer.endpoint()),
+    }]);
+    let stale = MockServer::start(stale_gw.clone()).await;
+
+    let mut client = SqlGatewayClient::new(fast_config(DiscoveryMode::Direct(stale.endpoint())));
+    let resp = client.drop_database("app.db").await.unwrap();
+    assert!(resp.existed);
+    assert_eq!(stale_gw.call_count(), 1);
+    assert_eq!(writer_gw.call_count(), 1);
+}
+
+#[tokio::test]
+async fn drop_database_sends_database_name_verbatim() {
+    let gw = MockGateway::writer();
+    let server = MockServer::start(gw.clone()).await;
+    let mut client = SqlGatewayClient::new(fast_config(DiscoveryMode::Direct(server.endpoint())));
+
+    client.drop_database("app.db").await.unwrap();
+
+    match gw.last_request().unwrap() {
+        RequestSnapshot::DropDatabase(req) => {
+            assert_eq!(req.database, "app.db");
+        }
+        other => panic!("expected DropDatabase snapshot, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn execute_sends_database_sql_and_parameters_verbatim() {
     let gw = MockGateway::writer();
     let server = MockServer::start(gw.clone()).await;

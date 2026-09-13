@@ -408,6 +408,35 @@ impl DatabaseEngine {
         })
     }
 
+    /// Delete a database file and its WAL/SHM/journal sidecars.
+    ///
+    /// Returns whether the primary database file existed prior to deletion.
+    pub fn drop_database(&self, db_name: &str) -> Result<bool> {
+        let lock = self.get_db_lock(db_name);
+        let _guard = lock.lock().unwrap();
+
+        let path = self.resolve_db_path(db_name)?;
+        let existed = path.exists();
+
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let sidecar = if suffix.is_empty() {
+                path.clone()
+            } else {
+                let mut name = path.clone().into_os_string();
+                name.push(suffix);
+                PathBuf::from(name)
+            };
+            match fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        self.db_mutexes.lock().unwrap().remove(db_name);
+        Ok(existed)
+    }
+
     /// Introspect all databases in the data directory.
     pub fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
         let mut list = Vec::new();

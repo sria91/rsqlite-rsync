@@ -196,6 +196,20 @@ async fn deadline_exceeded_status_is_retried_then_succeeds_for_reads() {
 }
 
 #[tokio::test]
+async fn drop_database_is_retried_on_unavailable() {
+    // Unlike execute/batch, dropping a database is idempotent — deleting an
+    // already-absent file is a no-op — so it's safe to retry on a transient
+    // Unavailable, unlike ambiguous-outcome writes.
+    let gw = MockGateway::writer().script([Behavior::Fail(Code::Unavailable, "transient")]);
+    let server = MockServer::start(gw.clone()).await;
+    let mut client =
+        SqlGatewayClient::new(fast_config(DiscoveryMode::Direct(server.endpoint()), 5));
+
+    client.drop_database("app.db").await.unwrap();
+    assert_eq!(gw.call_count(), 2);
+}
+
+#[tokio::test]
 async fn write_does_not_retry_on_unavailable() {
     // Writes are not retried on ambiguous-outcome transient errors, only on
     // definitive NOT_LEADER — retrying execute/batch on Unavailable risks

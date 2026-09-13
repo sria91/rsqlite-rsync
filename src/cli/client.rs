@@ -259,6 +259,17 @@ pub enum ClientCommand {
         #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+
+    /// Permanently delete a database file from the cluster's writer.
+    DropDatabase {
+        /// Target database name (e.g. `app.db`).
+        #[arg(short, long)]
+        database: String,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 /// Main entry point for the client CLI.
@@ -330,9 +341,41 @@ pub async fn run_client_command(
         ClientCommand::Repl { database, format } => {
             run_repl(&mut client, database, *format).await?;
         }
+        ClientCommand::DropDatabase { database, yes } => {
+            if !*yes && !confirm_drop_database(database)? {
+                println!("Aborted.");
+                return Ok(());
+            }
+            let resp = client.drop_database(database).await?;
+            if resp.existed {
+                println!(
+                    "Dropped database '{database}' (generation {}).",
+                    resp.generation
+                );
+            } else {
+                println!("Database '{database}' did not exist.");
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Prompt on stdin for confirmation before an irreversible database deletion.
+fn confirm_drop_database(database: &str) -> Result<bool> {
+    use std::io::Write;
+
+    print!("This will permanently delete database '{database}'. Continue? [y/N] ");
+    std::io::stdout()
+        .flush()
+        .map_err(|e| SyncError::Protocol(format!("failed to flush stdout: {e}")))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| SyncError::Protocol(format!("failed to read confirmation: {e}")))?;
+
+    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Shorthand SQL execution entry point.

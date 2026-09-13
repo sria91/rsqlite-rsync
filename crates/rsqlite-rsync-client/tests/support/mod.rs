@@ -22,8 +22,9 @@ use rsqlite_rsync_proto::rsqlite::v1::sql_gateway_server::{
     SqlGateway, SqlGatewayServer as TonicSqlGatewayServer,
 };
 use rsqlite_rsync_proto::rsqlite::v1::{
-    BatchRequest, BatchResponse, ClusterStatusRequest, ClusterStatusResponse, ExecuteRequest,
-    ExecuteResponse, NodeRole, QueryChunk, QueryRequest, QueryResponse,
+    BatchRequest, BatchResponse, ClusterStatusRequest, ClusterStatusResponse, DropDatabaseRequest,
+    DropDatabaseResponse, ExecuteRequest, ExecuteResponse, NodeRole, QueryChunk, QueryRequest,
+    QueryResponse,
 };
 
 /// A scripted response for one mock RPC call.
@@ -53,6 +54,7 @@ pub enum Method {
     StreamQuery,
     Batch,
     GetClusterStatus,
+    DropDatabase,
 }
 
 /// A snapshot of one recorded call's request, for round-trip assertions.
@@ -63,6 +65,7 @@ pub enum RequestSnapshot {
     StreamQuery(QueryRequest),
     Batch(BatchRequest),
     GetClusterStatus,
+    DropDatabase(DropDatabaseRequest),
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +290,22 @@ impl SqlGateway for MockGateway {
                 databases: vec![],
                 uptime_secs: 0,
                 version: "mock".to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn drop_database(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        let req = request.into_inner();
+        self.apply(
+            Method::DropDatabase,
+            RequestSnapshot::DropDatabase(req),
+            || DropDatabaseResponse {
+                existed: true,
+                generation: 1,
             },
         )
         .await

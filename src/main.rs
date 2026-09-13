@@ -1212,6 +1212,27 @@ mod tests {
     }
 
     #[test]
+    fn drop_database_command_parses() {
+        let args = Args::try_parse_from([
+            "rsqlite-rsync",
+            "client",
+            "drop-database",
+            "-d",
+            "app.db",
+            "--yes",
+        ])
+        .expect("drop-database args should parse");
+
+        assert!(matches!(
+            args.command,
+            Some(CliCommandGroup::Client {
+                command: ClientCommand::DropDatabase { yes: true, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn sql_shorthand_parses() {
         let args = Args::try_parse_from([
             "rsqlite-rsync",

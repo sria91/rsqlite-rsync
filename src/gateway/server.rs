@@ -12,8 +12,8 @@ use crate::gateway::engine::DatabaseEngine;
 use crate::ha::HaSharedState;
 use crate::proto::rsqlite::v1::{
     BatchRequest, BatchResponse, BatchTransactionMode, ClusterStatusRequest, ClusterStatusResponse,
-    ConsistencyLevel, ExecuteRequest, ExecuteResponse, LeaseStatus, NodeRole, QueryChunk,
-    QueryRequest, QueryResponse, sql_gateway_server::SqlGateway,
+    ConsistencyLevel, DropDatabaseRequest, DropDatabaseResponse, ExecuteRequest, ExecuteResponse,
+    LeaseStatus, NodeRole, QueryChunk, QueryRequest, QueryResponse, sql_gateway_server::SqlGateway,
 };
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -238,6 +238,25 @@ impl SqlGateway for SqlGatewayServer {
         .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(resp))
+    }
+
+    async fn drop_database(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> std::result::Result<Response<DropDatabaseResponse>, Status> {
+        let generation = self.check_write_access()?;
+        let req = request.into_inner();
+
+        let engine = self.engine.clone();
+        let existed = tokio::task::spawn_blocking(move || engine.drop_database(&req.database))
+            .await
+            .map_err(|e| Status::internal(format!("task join error: {e}")))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(DropDatabaseResponse {
+            existed,
+            generation,
+        }))
     }
 
     async fn get_cluster_status(

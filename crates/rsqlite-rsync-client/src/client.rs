@@ -10,8 +10,8 @@ use rsqlite_rsync_proto::metadata::HEADER_RSQLITE_LEADER_ENDPOINT;
 use rsqlite_rsync_proto::rsqlite::v1::sql_gateway_client::SqlGatewayClient as TonicSqlGatewayClient;
 use rsqlite_rsync_proto::rsqlite::v1::{
     BatchRequest, BatchResponse, BatchTransactionMode, ClusterStatusRequest, ClusterStatusResponse,
-    ConsistencyLevel, ExecuteRequest, ExecuteResponse, Parameters, QueryChunk, QueryRequest,
-    QueryResponse, Statement,
+    ConsistencyLevel, DropDatabaseRequest, DropDatabaseResponse, ExecuteRequest, ExecuteResponse,
+    Parameters, QueryChunk, QueryRequest, QueryResponse, Statement,
 };
 
 use crate::config::ClientConfig;
@@ -231,6 +231,29 @@ impl SqlGatewayClient {
             async move {
                 client
                     .batch(Request::new(req))
+                    .await
+                    .map(|r| r.into_inner())
+            }
+        })
+        .await
+    }
+
+    /// Delete a database file (and its WAL/SHM sidecars) with transparent
+    /// failover and retry.
+    ///
+    /// Deletion is idempotent — dropping an already-absent database just
+    /// reports `existed: false` — so this is safe to retry on a transient
+    /// `Unavailable`/`DeadlineExceeded`, unlike [`Self::execute`].
+    pub async fn drop_database(&mut self, database: &str) -> ClientResult<DropDatabaseResponse> {
+        let req = DropDatabaseRequest {
+            database: database.to_string(),
+        };
+
+        self.retry_loop(true, |mut client| {
+            let req = req.clone();
+            async move {
+                client
+                    .drop_database(Request::new(req))
                     .await
                     .map(|r| r.into_inner())
             }

@@ -55,6 +55,9 @@ service SqlGateway {
 
   // Introspect node role, lease ownership, writer generation, and database info
   rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+
+  // Delete a database file (and its WAL/SHM sidecars) from the data directory
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
 }
 
 // ── Execute Messages ─────────────────────────────────────────────────────────
@@ -181,4 +184,15 @@ message ClusterStatusResponse {
   repeated DatabaseInfo databases = 7;
   uint64 uptime_secs = 8;
   string version = 9;
+}
+
+// ── Drop Database Messages ───────────────────────────────────────────────────
+
+message DropDatabaseRequest {
+  string database = 1;
+}
+
+message DropDatabaseResponse {
+  bool existed = 1;         // False if the database file was already absent
+  uint64 generation = 2;    // Cluster writer generation when executed
 }

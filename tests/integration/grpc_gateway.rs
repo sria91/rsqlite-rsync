@@ -259,6 +259,49 @@ async fn grpc_gateway_execute_query_and_batch_roundtrip() {
 }
 
 #[tokio::test]
+async fn grpc_gateway_drop_database_removes_file_and_wal_shm() {
+    let cluster = SingleWriterCluster::start();
+    let mut client = cluster.client();
+
+    client
+        .execute(
+            "app.db",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            None,
+        )
+        .await
+        .expect("create table should succeed on writer");
+    assert!(cluster.data_dir.join("app.db").exists());
+
+    // Force a WAL/SHM sidecar to exist alongside the primary file.
+    client
+        .execute("app.db", "INSERT INTO t VALUES (1)", None)
+        .await
+        .expect("insert should succeed on writer");
+
+    let resp = client
+        .drop_database("app.db")
+        .await
+        .expect("drop_database should succeed on writer");
+    assert!(resp.existed);
+    assert!(!cluster.data_dir.join("app.db").exists());
+    assert!(!cluster.data_dir.join("app.db-wal").exists());
+    assert!(!cluster.data_dir.join("app.db-shm").exists());
+
+    let status = client
+        .get_cluster_status()
+        .await
+        .expect("cluster status should succeed");
+    assert!(!status.databases.iter().any(|db| db.name == "app.db"));
+
+    let second = client
+        .drop_database("app.db")
+        .await
+        .expect("dropping an already-absent database should not error");
+    assert!(!second.existed);
+}
+
+#[tokio::test]
 async fn grpc_gateway_streams_query_rows_in_chunks() {
     let cluster = SingleWriterCluster::start();
     let mut client = cluster.client();
@@ -474,6 +517,15 @@ async fn grpc_gateway_rejects_writes_and_strong_reads_on_replica() {
     assert!(
         read_err.to_string().contains("FailedPrecondition"),
         "expected FailedPrecondition error, got: {read_err}"
+    );
+
+    let drop_err = client
+        .drop_database("app.db")
+        .await
+        .expect_err("drop_database against a replica-only node must fail");
+    assert!(
+        drop_err.to_string().contains("FailedPrecondition"),
+        "expected FailedPrecondition error, got: {drop_err}"
     );
 }
 
