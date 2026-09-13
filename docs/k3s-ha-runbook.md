@@ -4,7 +4,7 @@ This runbook provides a concrete k3s deployment pattern for single-writer SQLite
 
 ## Architecture
 
-Each pod in a `StatefulSet` runs four containers:
+Each pod in a `StatefulSet` runs five containers:
 
 - `rsqlite-rsync` HA controller:
   - decides writer vs replica from Kubernetes Lease
@@ -28,8 +28,26 @@ Each pod in a `StatefulSet` runs four containers:
     Lease race with stale sync data simply stays a replica and the Lease
     re-expires for another candidate to try
 - replica-sync sidecar contract:
-  - when local role is replica, executes a sync command you provide
+  - when local role is replica, executes `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND`
   - writes freshness ledger after successful sync
+  - **default command** (`default-replica-sync.sh`, used unless you set
+    `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` on `apply-k3s-ha-stack.sh`):
+    resolves the current writer from the Lease, then pulls every `*.db`
+    file it finds there via `rsqlite-rsync`'s own SSH transport (against
+    the sshd sidecar below), no hardcoded database name. This is what
+    makes the reference manifest actually replicate data rather than
+    just role state — override the whole command for a real transport/
+    auth model in production, same as before
+- sshd sidecar:
+  - serves the default replica-sync command above: read-only access to
+    the data dir over SSH on port 2222, key auth only
+  - trust model, appropriate for this reference/test manifest and not
+    meant to carry into production as-is: a single SSH keypair
+    (`sqlite-ha-ssh-keys` Secret) shared by every pod — any pod can SSH
+    into any other — and `StrictHostKeyChecking=no` on the client side,
+    since host keys are regenerated fresh on every pod restart and the
+    pod behind any given writer hostname changes across failovers
+    anyway, so real host-key pinning wouldn't mean anything here
 - label-updater sidecar:
   - patches this pod's own `role=writer`/`role=replica` label from its
     local `role_state.txt`
@@ -65,7 +83,9 @@ holds the role.
 - k3s cluster with a writable node filesystem path for hostPath storage (see [Node Storage](#node-storage) below)
 - image for `rsqlite-rsync` available to cluster
 - RBAC permission for lease updater (`get/list/watch/create/update/patch` on Lease)
-- a sync command for replica pods (for example SSH-based sync, or a sidecar that can reach the writer DB path)
+- a sync command for replica pods — a working SSH-based default is now
+  built into this manifest (see Architecture above), so this is only
+  needed if you want to override it with a real transport/auth model
 
 ## Apply The Stack
 

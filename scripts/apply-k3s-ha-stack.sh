@@ -10,7 +10,10 @@ if [[ ! -f "$template" ]]; then
 fi
 
 : "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/ORG/rsqlite-rsync:TAG)}"
-: "${RSQLITE_RSYNC_REPLICA_SYNC_COMMAND:?Set RSQLITE_RSYNC_REPLICA_SYNC_COMMAND to your replica pull-sync command}"
+# Defaults to the manifest's own SSH-based sync (default-replica-sync.sh,
+# using the sshd sidecar + sqlite-ha-ssh-keys Secret below) if unset. Set
+# this to plug in a real transport/auth model instead.
+RSQLITE_RSYNC_REPLICA_SYNC_COMMAND="${RSQLITE_RSYNC_REPLICA_SYNC_COMMAND:-sh /scripts/default-replica-sync.sh}"
 
 RSQLITE_RSYNC_NAMESPACE="${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}"
 RSQLITE_RSYNC_HOST_DATA_DIR="${RSQLITE_RSYNC_HOST_DATA_DIR:-/var/lib/rsqlite-rsync-ha}"
@@ -62,6 +65,23 @@ fi
 kubectl -n "$RSQLITE_RSYNC_NAMESPACE" create secret generic sqlite-ha-grpc-auth \
   --from-literal=token="$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" \
   --dry-run=client -o yaml | kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f -
+
+# Shared SSH keypair used by default-replica-sync.sh (replica -> writer
+# pull) and the sshd sidecar's authorized_keys -- every pod trusts every
+# other pod in this ServiceAccount, matching the same reference-manifest
+# tradeoff already accepted for the label-updater RBAC grant (see
+# docs/k3s-ha-runbook.md). Generated once and reused on every subsequent
+# apply (created, never overwritten) so already-synced pods don't get
+# locked out by a key rotation underneath them.
+if ! kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret sqlite-ha-ssh-keys >/dev/null 2>&1; then
+  ssh_tmpdir="$(mktemp -d)"
+  trap 'rm -f "$rendered"; rm -rf "$ssh_tmpdir"' EXIT
+  ssh-keygen -t ed25519 -N "" -f "$ssh_tmpdir/id_ed25519" -C sqlite-ha >/dev/null
+  kubectl -n "$RSQLITE_RSYNC_NAMESPACE" create secret generic sqlite-ha-ssh-keys \
+    --from-file=id_ed25519="$ssh_tmpdir/id_ed25519" \
+    --from-file=authorized_keys="$ssh_tmpdir/id_ed25519.pub"
+  rm -rf "$ssh_tmpdir"
+fi
 
 kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f "$rendered"
 

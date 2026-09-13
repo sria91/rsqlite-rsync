@@ -236,6 +236,90 @@ data:
 
       sleep "$label_sleep"
     done
+
+  default-replica-sync.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    # Default value of RSQLITE_RSYNC_REPLICA_SYNC_COMMAND (see
+    # apply-k3s-ha-stack.sh) -- runs inside replica-sync.sh's existing
+    # loop, which only invokes $sync_cmd while local role is not writer.
+    # Discovers the current writer from the Lease (no hardcoded pod), then
+    # pulls every *.db file it can see there over SSH using rsqlite-rsync's
+    # own transport, so this stays correct as --ha-data-dir grows beyond a
+    # single database. Trust model: a single SSH keypair shared by every
+    # pod (sqlite-ha-ssh-keys Secret) and StrictHostKeyChecking=no -- see
+    # docs/k3s-ha-runbook.md. Override this whole command for a real
+    # transport/auth model; this exists to make the reference manifest
+    # actually replicate data out of the box.
+    lease_name="${LEASE_NAME:-sqlite-writer-lease}"
+    data_dir="${DATA_DIR:-/var/lib/sqlite}"
+    ssh_key="${SSH_KEY_PATH:-/etc/rsqlite-ssh/id_ed25519}"
+    ssh_user="${SSH_USER:-rsqlite}"
+    ssh_port="${SSH_PORT:-2222}"
+
+    holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+    if [ -z "$holder" ] || [ "$holder" = "$POD_NAME" ]; then
+      exit 0
+    fi
+
+    writer_host="${holder}.sqlite-ha.${POD_NAMESPACE}.svc.cluster.local"
+
+    remote_dbs="$(ssh -o IdentityFile="$ssh_key" -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$ssh_port" \
+      "${ssh_user}@${writer_host}" "ls ${data_dir}/*.db 2>/dev/null" 2>/dev/null || true)"
+    [ -z "$remote_dbs" ] && exit 0
+
+    for remote_path in $remote_dbs; do
+      name="$(basename "$remote_path")"
+      # Per-file failures don't block the rest -- the loop just retries
+      # every database again next tick (SYNC_INTERVAL_SECONDS).
+      # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
+      # src/transport/ssh.rs), so each one needs the combined -oKey=Value
+      # form rather than a bare Key=Value -- and clap rejects a
+      # hyphen-looking value passed as a separate token unless given as
+      # --flag=value (no space), since it otherwise looks like an
+      # unrecognized flag of its own.
+      rsqlite-rsync \
+        --ssh-opt="-oIdentityFile=${ssh_key}" \
+        --ssh-opt="-oStrictHostKeyChecking=no" \
+        --ssh-opt="-oUserKnownHostsFile=/dev/null" \
+        --ssh-opt="-oPort=${ssh_port}" \
+        --ssh-connect-timeout 5 \
+        "${ssh_user}@${writer_host}:${remote_path}" \
+        "${data_dir}/${name}" || true
+    done
+
+  sshd-entrypoint.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    # Host keys are generated fresh per container start (not baked into
+    # the image, not persisted) -- fine since default-replica-sync.sh
+    # above uses StrictHostKeyChecking=no anyway: the pod behind any given
+    # writer hostname changes across failovers, so real host-key pinning
+    # wouldn't mean anything here regardless.
+    mkdir -p /etc/ssh
+    ssh-keygen -A >/dev/null
+
+    # sshd's StrictModes rejects the Secret-mounted directory itself:
+    # Kubernetes' secret volume plugin creates its mountpoint with wide-open
+    # traversal permissions (so containers running as any UID can read it),
+    # which StrictModes treats as an insecure authorized_keys path
+    # regardless of the file's own mode. Copy it into
+    # /var/lib/rsqlite-ssh-work instead -- a plain directory baked into the
+    # image (Dockerfile), not a Kubernetes volume mount at all, since every
+    # k8s-managed mount tried here (this Secret, an fsGroup-adjusted
+    # emptyDir, even /tmp) ended up failing the same check one way or
+    # another.
+    cp /etc/rsqlite-ssh/authorized_keys /var/lib/rsqlite-ssh-work/authorized_keys
+    chmod 600 /var/lib/rsqlite-ssh-work/authorized_keys
+
+    exec /usr/sbin/sshd -D -e -p "${SSH_PORT:-2222}" \
+      -o "AuthorizedKeysFile=/var/lib/rsqlite-ssh-work/authorized_keys" \
+      -o "PasswordAuthentication no" \
+      -o "PermitRootLogin no" \
+      -o "PidFile=/var/lib/rsqlite-ssh-work/sshd.pid"
 ---
 apiVersion: v1
 kind: Service
@@ -260,6 +344,9 @@ spec:
     - port: 50051
       targetPort: grpc
       name: grpc
+    - port: 2222
+      targetPort: ssh
+      name: ssh
   selector:
     app: sqlite-ha
 ---
@@ -309,6 +396,13 @@ spec:
     spec:
       serviceAccountName: sqlite-ha
       terminationGracePeriodSeconds: 20
+      # Containers in this pod run as different UIDs (this image's own
+      # rsqlite user, UID 10001, vs. bitnami/kubectl's default) but share
+      # the rsqlite-ssh Secret and the data dir -- fsGroup makes both
+      # group-readable/writable by GID 10001 regardless of which UID reads
+      # them, matching the data dir's existing setgid 2775 convention.
+      securityContext:
+        fsGroup: 10001
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -446,7 +540,10 @@ spec:
               mountPath: /scripts
 
         - name: replica-sync
-          image: bitnami/kubectl:latest
+          # Not bitnami/kubectl like the other sidecars: default-replica-sync.sh
+          # needs `ssh` and `rsqlite-rsync` itself, both of which only this
+          # image has (alongside kubectl, which it also ships).
+          image: __RSQLITE_RSYNC_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/scripts/replica-sync.sh"]
           securityContext:
@@ -477,6 +574,38 @@ spec:
               mountPath: /scripts
             - name: data
               mountPath: /var/lib/sqlite
+            - name: ssh-keys
+              mountPath: /etc/rsqlite-ssh
+              readOnly: true
+
+        - name: sshd
+          image: __RSQLITE_RSYNC_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/sshd-entrypoint.sh"]
+          env:
+            - name: SSH_PORT
+              value: "2222"
+          ports:
+            - name: ssh
+              containerPort: 2222
+          volumeMounts:
+            # Not readOnly: SQLite's WAL mode needs to create/update the
+            # -shm and -wal companion files even for what's logically a
+            # read-only open (e.g. after a checkpoint removes them), so a
+            # read-only mount here made every remote open fail with
+            # "unable to open database file". This container only ever
+            # runs whatever rsqlite-rsync's own --server protocol needs
+            # for a source-side sync (reads out the data it's asked for),
+            # so this isn't a new write-safety exposure -- write-safety is
+            # independently enforced at the RPC/lease layer regardless of
+            # filesystem permissions here.
+            - name: data
+              mountPath: /var/lib/sqlite
+            - name: ssh-keys
+              mountPath: /etc/rsqlite-ssh
+              readOnly: true
+            - name: scripts
+              mountPath: /scripts
 
         - name: label-updater
           image: bitnami/kubectl:latest
@@ -509,6 +638,10 @@ spec:
         - name: scripts
           configMap:
             name: sqlite-ha-scripts
+        - name: ssh-keys
+          secret:
+            secretName: sqlite-ha-ssh-keys
+            defaultMode: 0440
         - name: data
           hostPath:
             path: __RSQLITE_RSYNC_HOST_DATA_DIR__

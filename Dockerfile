@@ -51,14 +51,25 @@ RUN apk add --no-cache \
     ca-certificates \
     kubectl \
     openssh-client \
+    openssh-server \
     sqlite \
     tzdata
 
-# Setup non-root service user and directory structure
+# Setup non-root service user and directory structure. /etc/ssh is chowned
+# so the non-root rsqlite user can generate its own host keys and run sshd
+# at container start (examples/k8s/k3s-ha-stack.yaml's sshd sidecar) --
+# no host key is baked into the image, so every deployment gets its own.
+# /var/lib/rsqlite-ssh-work is a plain image-owned directory (not a
+# Kubernetes volume mount) for that same sidecar's authorized_keys copy:
+# sshd's StrictModes rejects the containing directory of any Kubernetes
+# Secret or fsGroup-adjusted emptyDir mount (both end up group/world
+# writable or cross-UID-permissive by construction), so the copy needs a
+# path outside any mount entirely.
 RUN addgroup -S -g 10001 rsqlite && \
-    adduser -S -u 10001 -G rsqlite -h /var/lib/sqlite rsqlite && \
-    mkdir -p /var/lib/sqlite /var/run/rsqlite-rsync /var/log/rsqlite-rsync && \
-    chown -R rsqlite:rsqlite /var/lib/sqlite /var/run/rsqlite-rsync /var/log/rsqlite-rsync
+    adduser -S -u 10001 -G rsqlite -h /var/lib/sqlite -s /bin/sh rsqlite && \
+    mkdir -p /var/lib/sqlite /var/run/rsqlite-rsync /var/log/rsqlite-rsync /var/lib/rsqlite-ssh-work && \
+    chown -R rsqlite:rsqlite /var/lib/sqlite /var/run/rsqlite-rsync /var/log/rsqlite-rsync /etc/ssh /var/lib/rsqlite-ssh-work && \
+    chmod 700 /var/lib/rsqlite-ssh-work
 
 COPY --from=builder /usr/local/bin/rsqlite-rsync /usr/local/bin/rsqlite-rsync
 
