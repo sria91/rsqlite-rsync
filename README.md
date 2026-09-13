@@ -2,27 +2,48 @@
 
 [![CI](https://github.com/sria91/rsqlite-rsync/actions/workflows/ci.yml/badge.svg)](https://github.com/sria91/rsqlite-rsync/actions/workflows/ci.yml)
 
-A bandwidth-efficient SQLite database synchronisation tool written in Rust,
-inspired by the C utility
-[`sqlite3_rsync`](https://www.sqlite.org/rsync.html).
+A bandwidth-efficient SQLite database sync tool written in Rust, inspired by
+the C utility [`sqlite3_rsync`](https://www.sqlite.org/rsync.html). It also
+bundles an HA control loop and a gRPC SQL Gateway for running SQLite as a
+single-writer cluster.
 
 ## Overview
 
 `rsqlite-rsync` makes **REPLICA** a consistent snapshot of **ORIGIN** by
 exchanging cryptographic page hashes and transferring only the pages that
 differ — much like `rsync` does for ordinary files, but with full awareness
-of SQLite transaction boundaries.
+of SQLite transaction boundaries. ORIGIN may remain live while the tool
+runs; REPLICA is treated as exclusive to the sync process (concurrent
+writers to it are not coordinated) and ends up a consistent snapshot of
+ORIGIN as it existed when the command started.
 
 ```
-rsqlite-rsync [OPTIONS] ORIGIN REPLICA
-rsqlite-rsync --ha [HA OPTIONS]
-rsqlite-rsync --batch-manifest PATH [BATCH OPTIONS]
+rsqlite-rsync [OPTIONS] ORIGIN REPLICA            # one-shot local/remote sync
+rsqlite-rsync --batch-manifest PATH [OPTIONS]     # sync many databases at once
+rsqlite-rsync --ha [HA OPTIONS]                   # run as a single-writer cluster node
+rsqlite-rsync client <SUBCOMMAND> [OPTIONS]       # query the cluster via the SQL Gateway
+rsqlite-rsync sql [OPTIONS] -d <DATABASE> "<SQL>" # shorthand for one query/statement
 ```
 
-ORIGIN may remain live while the tool runs. REPLICA should be treated as
-exclusive to the sync process; concurrent writers are not coordinated. When
-run in isolation, REPLICA ends up as a consistent snapshot of ORIGIN as it
-existed when the command started.
+The last three forms are covered in
+[HA control loop mode](#ha-control-loop-mode) and
+[SQL Gateway and client](#sql-gateway-and-client).
+
+## Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Local sync](#local-sync) · [Push to remote](#push-to-remote) · [Pull from remote](#pull-from-remote) · [Options](#options)
+  - [Batch mode](#batch-mode-multiple-databases)
+  - [HA control loop mode](#ha-control-loop-mode)
+  - [SQL Gateway and client](#sql-gateway-and-client)
+- [Protocol](#protocol)
+- [Crate structure](#crate-structure)
+- [Performance tuning](#performance-tuning-optional)
+- [Running tests](#running-tests) · [Running benchmarks](#running-benchmarks)
+- [Differences from `sqlite3_rsync`](#differences-from-sqlite3_rsync)
+- [License](#license)
 
 ## Features
 
@@ -37,12 +58,23 @@ existed when the command started.
 - **Operationally safe** — when REPLICA is not being modified by other
   processes, sync applies origin pages directly and can be retried after a
   failed run.
+- **Batch mode** — sync many origin/replica pairs from one manifest, with
+  per-entry retries, timeouts, and backoff.
+- **HA control loop** — single-writer lease-based orchestration (file or
+  Kubernetes Lease), with readiness probes for lease/promotion state.
+- **SQL Gateway** — optional embedded gRPC server exposing SQL execution
+  against the cluster's current writer, with a CLI client and a standalone
+  Rust client crate supporting leader discovery and automatic failover.
 - **Pure Rust** — built on [`libsqlite3-sys`](https://crates.io/crates/libsqlite3-sys).
 
 ## Installation
 
+Not yet published to crates.io — build from source:
+
 ```bash
-cargo install rsqlite-rsync
+git clone https://github.com/sria91/rsqlite-rsync.git
+cd rsqlite-rsync
+cargo install --path .
 ```
 
 For remote sync, install the binary on both the local and remote machine and
@@ -105,7 +137,7 @@ Example:
 rsqlite-rsync --batch-manifest batch-sync.json --batch-jobs 4
 ```
 
-Batch options:
+#### Flags
 
 - `--batch-manifest PATH` (required for batch mode)
 - `--batch-format <auto|json|yaml|toml>` (default: `auto`)
@@ -116,7 +148,9 @@ Batch options:
 - `--batch-retry-backoff-max-ms MS` (default: `0`, no cap when `0`)
 - `--batch-retry-jitter-pct PCT` (default: `0`, valid range `0..=100`)
 
-Manifest schema (JSON):
+#### Manifest schema
+
+JSON:
 
 ```json
 {
@@ -142,7 +176,7 @@ Manifest schema (JSON):
 }
 ```
 
-Manifest example (YAML):
+YAML:
 
 ```yaml
 version: 1
@@ -160,7 +194,7 @@ syncs:
     retry_jitter_pct: 15
 ```
 
-Manifest example (TOML):
+TOML:
 
 ```toml
 version = 1
@@ -181,7 +215,7 @@ retry_backoff_max_ms = 1000
 retry_jitter_pct = 15
 ```
 
-Batch semantics:
+#### Semantics
 
 - Best-effort: all entries are attempted, even if some fail.
 - Exit code: non-zero when any entry fails.
@@ -192,7 +226,7 @@ Batch semantics:
 - Jitter: optional +/- percentage spread on retry delay via `--batch-retry-jitter-pct`.
 - Overrides: per-entry values (for retries, timeout, backoff, jitter) take precedence over global CLI defaults.
 
-Batch option precedence:
+#### Option precedence
 
 | Setting | Global CLI default | Per-entry manifest key | Effective value |
 |------|------|------|------|
@@ -223,26 +257,23 @@ rsqlite-rsync --ha \
   --ha-max-future-skew-secs 2
 ```
 
-Required HA flags:
+#### Required flags
 
 - `--ha-node-id`
 - `--ha-role-state-file`
 - `--ha-audit-log-file`
 
-Lease source flags:
+#### Lease source flags
 
 - `--ha-lease-source` (`file` or `kubernetes`, default: `file`)
 - For `file`: `--ha-lease-file`
-- For `kubernetes`: `--ha-kube-lease-name`
+- For `kubernetes`: `--ha-kube-lease-name`, plus:
+  - `--ha-kube-namespace` (default: `default`)
+  - `--ha-kube-context`
+  - `--ha-kubeconfig`
+  - `--ha-kubectl-path` (default: `kubectl`)
 
-Optional Kubernetes lease flags:
-
-- `--ha-kube-namespace` (default: `default`)
-- `--ha-kube-context`
-- `--ha-kubeconfig`
-- `--ha-kubectl-path` (default: `kubectl`)
-
-Optional HA flags:
+#### Optional flags
 
 - `--ha-freshness-file`
 - `--ha-readiness-file`
@@ -253,6 +284,20 @@ Optional HA flags:
 - `--ha-max-future-skew-secs`
 - `--ha-continue-on-error`
 - `--ha-startup-fence-mode` (`permissive` or `require-writer`)
+
+#### SQL Gateway flags
+
+See [SQL Gateway and client](#sql-gateway-and-client) for how these are used.
+
+- `--ha-grpc-bind` (for example, `0.0.0.0:50051`) — starts the gateway
+- `--ha-data-dir` — directory of `.db` files the gateway serves (default `.`)
+- `--ha-allow-replica-reads` — permit eventual-consistency reads on replicas
+- `--ha-service-name` (default: `sqlite-ha`) — headless service name used to
+  build the advertised leader endpoint
+- `--ha-grpc-port` (default: `50051`) — gRPC port used in the advertised
+  leader endpoint
+
+#### File formats
 
 Lease file format (`--ha-lease-file`):
 
@@ -282,6 +327,9 @@ synced_at_secs=1731000099
 
 - Use `none` (or an empty file) to represent unknown freshness.
 - Invalid lease or freshness content is treated as an error for that tick.
+
+#### Behavior notes
+
 - When `--ha-readiness-file` is set, readiness is written as `ready` for writer
   mode and `not-ready` otherwise.
 - When `--ha-readiness-http-bind` is set, the endpoint returns HTTP `200` with
@@ -292,7 +340,7 @@ synced_at_secs=1731000099
   the first HA tick can promote/confirm writer state.
 - Stop the loop cleanly with `Ctrl-C`.
 
-Kubernetes deployment references:
+#### Kubernetes deployment references
 
 - [docs/ha-kubernetes.md](docs/ha-kubernetes.md)
 - [docs/k3s-ha-runbook.md](docs/k3s-ha-runbook.md)
@@ -300,6 +348,81 @@ Kubernetes deployment references:
 - [examples/k8s/ha-deployment-readonly.yaml](examples/k8s/ha-deployment-readonly.yaml) (read-only RBAC)
 - [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml) (k3s-oriented StatefulSet + writer Service + lease updater + replica-sync contract)
 - [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) (one-command apply with required image and replica sync command env vars)
+
+### SQL Gateway and client
+
+When `--ha-grpc-bind` is set on an `--ha` node, the process also serves a
+gRPC **SQL Gateway** (`SqlGateway` service: `Execute`, `Query`, `StreamQuery`,
+`Batch`, `DropDatabase`, `GetClusterStatus` — see
+[`crates/rsqlite-rsync-proto`](crates/rsqlite-rsync-proto)) over the
+`--ha-data-dir` directory of SQLite databases. Writes and strong-consistency
+reads are only served by the current writer; a non-writer responds with a
+`NOT_LEADER` status carrying the current leader's endpoint so clients can
+redirect.
+
+```bash
+rsqlite-rsync --ha --ha-node-id node-a \
+  --ha-lease-file lease.txt --ha-role-state-file role_state.txt \
+  --ha-audit-log-file audit.log \
+  --ha-grpc-bind 0.0.0.0:50051 --ha-data-dir ./data
+```
+
+Query it with the built-in `client`/`sql` CLI:
+
+```bash
+rsqlite-rsync sql --endpoint http://127.0.0.1:50051 -d app.db \
+  "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)"
+
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 exec -d app.db \
+  "INSERT INTO items (label) VALUES ('widget')"
+
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 query -d app.db \
+  "SELECT * FROM items" --format json
+
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 status
+rsqlite-rsync client --endpoint http://127.0.0.1:50051 repl -d app.db
+```
+
+`client` subcommands:
+
+| Subcommand | Purpose |
+|------------|---------|
+| `exec` | Run a write statement (INSERT/UPDATE/DELETE/DDL) |
+| `query` | Run a read query and print the results |
+| `batch` | Run multiple statements from `--sql` or `--file`, optionally in one transaction (`--tx-mode`) |
+| `status` | Show cluster status (role, lease, generation, known databases) |
+| `repl` | Interactive SQL shell (`.tables`, `.schema`, `.mode`, `.database`, ...) |
+| `drop-database` | Delete a database file and its WAL/SHM/journal sidecars |
+
+Connection flags (shared by `client` and `sql`): `--endpoint`, `--endpoints`
+(comma-separated candidates, probed for the current writer), `--kube-lease` /
+`--kube-namespace` / `--kube-service` (discover the writer via a Kubernetes
+Lease), `--max-retries`, `--timeout`. Output formatting: `--format
+<table|json|csv|tsv|raw>`.
+
+For embedding in another Rust service, the client is also published as a
+standalone crate,
+[`rsqlite-rsync-client`](crates/rsqlite-rsync-client), with no SQLite, HA, or CLI
+dependencies:
+
+```rust
+use rsqlite_rsync_client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = SqlGatewayClient::new(ClientConfig::new(
+        DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
+    ));
+    client.execute("app.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)", None).await?;
+    let rows = client.query("app.db", "SELECT * FROM t", None, 0, Default::default()).await?;
+    Ok(())
+}
+```
+
+It retries on `NOT_LEADER` by following the redirect endpoint, and supports
+`DiscoveryMode::Candidates` (probe a fixed endpoint list for the writer) or a
+pluggable `DiscoveryMode::Custom` resolver (used by the CLI's Kubernetes Lease
+discovery).
 
 ## Protocol
 
@@ -310,24 +433,39 @@ At a high level:
 
 1. **Handshake** — version and page-size negotiation.
 2. **Coarse pass** — replica sends protocol-version-negotiated hashes of
-  64-page groups (BLAKE3 in v2, SHA-256 in v1); origin
-   identifies changed groups.
-3. **Fine pass** — per-page hashes exchanged for changed groups; only diverging
-   page bytes are transferred.
+   64-page groups (BLAKE3 in v2, SHA-256 in v1); origin identifies changed
+   groups.
+3. **Fine pass** — per-page hashes exchanged for changed groups; only
+   diverging page bytes are transferred.
 4. **Done** — origin signals completion.
 
 Current wire protocol version is `2`.
 
 ## Crate structure
 
+This is a Cargo workspace. The main package (`rsqlite-rsync`, binary +
+`rsqlite_rsync` library) contains:
+
 | Module | Purpose |
 |--------|---------|
 | `db` | Safe FFI wrappers around `libsqlite3-sys` |
+| `endpoint` | Parsing of local vs. `[user@]host:path` endpoints |
 | `hash` | Page and page-group hashing (v2: BLAKE3, v1: SHA-256) |
 | `protocol` | Wire messages, origin and replica state machines |
 | `transport` | Pluggable I/O: in-process (`local`), stdio framing, or SSH subprocess |
 | `snapshot` | Read-consistent snapshot via `BEGIN DEFERRED` |
+| `ha` | Lease-based single-writer control loop (file and Kubernetes lease sources) |
+| `gateway` | Embedded gRPC SQL Gateway (`DatabaseEngine`, `SqlGatewayServer`) |
 | `error` | Unified `SyncError` type |
+| `client` (re-export) | gRPC client with leader discovery/failover, from `rsqlite-rsync-client` |
+| `proto` (re-export) | Generated gRPC types, from `rsqlite-rsync-proto` |
+
+Workspace members:
+
+| Crate | Purpose |
+|-------|---------|
+| [`crates/rsqlite-rsync-proto`](crates/rsqlite-rsync-proto) | Protobuf/tonic-generated `SqlGateway` service types, compiled from `proto/rsqlite/v1/sqlite.proto` |
+| [`crates/rsqlite-rsync-client`](crates/rsqlite-rsync-client) | Standalone async gRPC client for the SQL Gateway, usable without depending on this crate |
 
 ## Performance tuning (optional)
 
@@ -346,11 +484,14 @@ Runtime hashing behavior can be tuned with environment variables:
 cargo test
 ```
 
-Run focused HA suites:
+Run focused suites:
 
 ```bash
 cargo test --bin rsqlite-rsync
 cargo test --test ha_mode
+cargo test --test grpc_gateway
+cargo test --test grpc_failover
+cargo test -p rsqlite-rsync-client
 ```
 
 Run Kubernetes manifest validator tests:
