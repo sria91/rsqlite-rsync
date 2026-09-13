@@ -14,6 +14,11 @@
 # (bump generation, refresh renewed_at_secs) and re-apply; the mounted file
 # updates in each pod within roughly a kubelet sync interval.
 #
+# The gRPC SQL Gateway runs with --ha-grpc-insecure-no-auth (no bearer
+# token) since this is explicitly a local/scratch manifest — do not copy
+# that flag into a real deployment; see ha-deployment.yaml for the
+# Secret-backed --ha-grpc-auth-token pattern to use instead.
+#
 # Usage:
 #   docker build -t rsqlite-rsync:dev .
 #   k3d image import rsqlite-rsync:dev -c <cluster-name>
@@ -79,6 +84,10 @@ spec:
             - --ha-readiness-file=/var/run/rsqlite-rsync/readiness.txt
             - --ha-readiness-http-bind=0.0.0.0:8088
             - --ha-grpc-bind=0.0.0.0:50051
+            # Local/scratch manifest only — see the header comment. Real
+            # deployments must not use this flag; provision
+            # --ha-grpc-auth-token instead (see ha-deployment.yaml).
+            - --ha-grpc-insecure-no-auth
             - --ha-data-dir=/var/lib/sqlite
             - --ha-startup-fence-mode=permissive
             - --ha-tick-interval-ms=250
@@ -102,7 +111,13 @@ spec:
             failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /ready
+              # /healthz ("has the reconcile loop ticked"), not /ready
+              # ("is this node currently the writer") — every replica pod
+              # is permanently /ready==503 by design, and gating Pod
+              # readiness (and therefore StatefulSet rollout progression)
+              # on that would stall the rollout after one pod. See README
+              # "Behavior notes".
+              path: /healthz
               port: probe-http
             periodSeconds: 2
             timeoutSeconds: 1

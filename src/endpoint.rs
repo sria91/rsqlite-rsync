@@ -57,6 +57,7 @@ impl Endpoint {
     }
 
     fn parse_remote_parts(s: &str) -> Option<(String, String)> {
+        // Bracketed IPv6, e.g. `[fe80::1]:/data/db.sqlite`.
         if let Some(end_bracket) = s.find("]:")
             && s.starts_with('[')
         {
@@ -67,23 +68,23 @@ impl Endpoint {
             }
         }
 
-        if s.contains('@')
-            && let Some((host_part, path_part)) = s.split_once(':')
-            && Self::is_remote_candidate(host_part, path_part)
-        {
-            return Some((host_part.to_owned(), path_part.to_owned()));
-        }
-
+        // Bare (unbracketed) IPv6, e.g. `fe80::1:/data/db.sqlite`: the host
+        // itself contains colons, so it has to be split on the *last* colon
+        // rather than the first. Gated on the host actually parsing as an IP
+        // address so this doesn't misfire on an ordinary `host:path` input
+        // whose path happens to contain another colon — those are handled
+        // below by splitting on the first colon instead.
         if let Some(colon) = s.rfind(':') {
             let host_part = &s[..colon];
             let path_part = &s[colon + 1..];
-            if Self::is_remote_candidate(host_part, path_part)
-                && host_part.parse::<std::net::IpAddr>().is_ok()
+            if host_part.parse::<std::net::IpAddr>().is_ok()
+                && Self::is_remote_candidate(host_part, path_part)
             {
                 return Some((host_part.to_owned(), path_part.to_owned()));
             }
         }
 
+        // General case: `[user@]host:path`, split on the first colon.
         if let Some((host_part, path_part)) = s.split_once(':')
             && Self::is_remote_candidate(host_part, path_part)
         {

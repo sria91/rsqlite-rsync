@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tonic::transport::Endpoint;
-use tonic::Request;
 
 use rsqlite_rsync_proto::rsqlite::v1::sql_gateway_client::SqlGatewayClient as TonicSqlGatewayClient;
 use rsqlite_rsync_proto::rsqlite::v1::{ClusterStatusRequest, NodeRole};
@@ -79,7 +78,17 @@ pub(crate) fn normalize_endpoint(ep: &str) -> String {
 }
 
 /// Resolve the current writer endpoint for the given [`DiscoveryMode`].
-pub(crate) async fn discover_leader(mode: &DiscoveryMode) -> ClientResult<String> {
+///
+/// `auth_token` is threaded through so [`DiscoveryMode::Candidates`]' own
+/// `GetClusterStatus` probes authenticate the same way the client's regular
+/// RPCs do (see [`crate::client::authorized_request`]) — otherwise every
+/// probe against an authentication-requiring gateway would fail uniformly,
+/// silently collapsing this into "fall back to the first candidate"
+/// regardless of which one is actually the writer.
+pub(crate) async fn discover_leader(
+    mode: &DiscoveryMode,
+    auth_token: &Option<String>,
+) -> ClientResult<String> {
     match mode {
         DiscoveryMode::Direct(ep) => Ok(normalize_endpoint(ep)),
         DiscoveryMode::Candidates(candidates) => {
@@ -94,7 +103,10 @@ pub(crate) async fn discover_leader(mode: &DiscoveryMode) -> ClientResult<String
                     if let Ok(channel) = probe {
                         let mut probe_client = TonicSqlGatewayClient::new(channel);
                         let resp = probe_client
-                            .get_cluster_status(Request::new(ClusterStatusRequest {}))
+                            .get_cluster_status(crate::client::authorized_request(
+                                auth_token,
+                                ClusterStatusRequest {},
+                            ))
                             .await;
                         if let Ok(resp) = resp {
                             let status = resp.into_inner();

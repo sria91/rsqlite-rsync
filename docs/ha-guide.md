@@ -93,6 +93,18 @@ Optional Kubernetes flags:
 | `--ha-readiness-file <PATH>` | File updated with `ready`/`not-ready` status |
 | `--ha-readiness-http-bind <ADDR>` | HTTP server for probe endpoints (e.g., `0.0.0.0:8088`) |
 
+### SQL Gateway Flags (Optional)
+
+| Flag | Description |
+|------|-------------|
+| `--ha-grpc-bind <ADDR>` | Starts the embedded gRPC SQL Gateway (e.g., `0.0.0.0:50051`) |
+| `--ha-grpc-auth-token <TOKEN>` (env `RSQLITE_GRPC_AUTH_TOKEN`) | Bearer token every gRPC request must present. **Required** whenever `--ha-grpc-bind` is set — the gateway executes arbitrary SQL for any caller that reaches it, so it refuses to start without this (or the opt-out below) |
+| `--ha-grpc-insecure-no-auth` | Explicitly disable gateway authentication — local development only, or when a trusted-network/mTLS boundary already authenticates callers |
+| `--ha-data-dir <PATH>` | Directory of `.db` files the gateway serves |
+| `--ha-allow-replica-reads` | Permit eventual-consistency reads on replica nodes |
+
+See [SQL Gateway and client](../README.md#sql-gateway-and-client) in the README for the client-side `--token`/`RSQLITE_TOKEN` counterpart, and [Security](../README.md#security) for the full rationale.
+
 ## Lease Formats
 
 ### File-Based Lease
@@ -217,13 +229,32 @@ When `--ha-readiness-http-bind` is set (e.g., `0.0.0.0:8088`), the controller ex
 - **200 OK** (`ready`) — Node is active writer
 - **503 Service Unavailable** (`not-ready`) — Node is replica or demoted
 
-Use as Kubernetes readiness probe so only the writer receives traffic.
+This is writer status, not Pod health — every replica node is permanently
+`503` by design. **Do not** use this as the Kubernetes `readinessProbe`:
+since only one pod can ever pass it, gating Pod readiness (and therefore
+StatefulSet rollout progression) on it stalls any rolling update after the
+first pod. Use `/healthz` for that instead. Query `/ready` directly (or use
+`rsqlite-rsync client status`) when you specifically need to know which
+node is the writer.
 
 ### `/live`
 
 - **200 OK** (`live`) — Process is alive
 
 Use as Kubernetes liveness probe.
+
+### `/healthz`
+
+- **200 OK** (`healthy`) — The HA reconcile loop has completed at least one
+  tick, regardless of whether it decided writer or replica
+- **503 Service Unavailable** (`initializing`) — No tick has completed yet
+
+Use as the Kubernetes **readiness** probe: unlike `/ready`, this passes for
+replica nodes too, so Pod readiness (and StatefulSet rollout progression)
+isn't gated on which single pod happens to be the writer. Note this is a
+one-shot latch, not an ongoing heartbeat — once `true` it stays `true` even
+if the loop later wedges, so it's a startup/rollout signal, not liveness
+monitoring for an already-running pod (that's what `/live` is for).
 
 ### Other paths
 
@@ -239,7 +270,10 @@ A typical k3s/k8s deployment includes:
 2. **HA controller** (rsqlite-rsync) in each pod
 3. **Lease updater sidecar** to publish writer identity to Kubernetes Lease
 4. **Replica sync sidecar** to pull from writer when in replica mode
-5. **Service** (ClusterIP) routing only to ready (writer) pods
+5. **Headless Service** for stable pod DNS and general access — clients
+   discover the writer themselves (via `NOT_LEADER`-redirect or Kubernetes
+   Lease lookup), not via Service-level endpoint filtering; see [SQL
+   Gateway and client](../README.md#sql-gateway-and-client)
 
 ### Example Configuration
 
@@ -285,7 +319,7 @@ containers:
         fieldPath: metadata.namespace
   readinessProbe:
     httpGet:
-      path: /ready
+      path: /healthz
       port: 8088
     periodSeconds: 1
   livenessProbe:
@@ -404,9 +438,18 @@ Complete working examples are in the repository:
 
 ```bash
 RSQLITE_RSYNC_IMAGE=your-registry/rsqlite-rsync:latest \
-RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@sqlite-ha-writer:/var/lib/sqlite/app.db /var/lib/sqlite/app.db' \
+RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db' \
 ./scripts/apply-k3s-ha-stack.sh
 ```
+
+`<writer-host>` is a placeholder — there's no Service that resolves to
+"whichever pod is currently the writer" (see [HTTP Probe
+Endpoints](#http-probe-endpoints) above for why a readiness-filtered
+Service can't safely be that either). Resolve it yourself in the real sync
+command, for example by reading the writer's identity from the Kubernetes
+`Lease` and using its per-pod DNS name (`<pod-name>.sqlite-ha`, now that
+`sqlite-ha` is a headless governing Service), or by reading
+`role_state.txt`/the Lease from within the sync sidecar.
 
 Optional environment variables:
 

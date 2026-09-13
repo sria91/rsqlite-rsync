@@ -5,6 +5,10 @@ metadata:
   labels:
     app: sqlite-ha
 ---
+# NOTE: this Role's name predates the label-updater sidecar below — it now
+# also grants pod-label access, not just Lease access. Not renaming it
+# (would ripple into the RoleBinding below) for what's a reference
+# manifest; this comment stands in for the rename.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -19,6 +23,20 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create"]
+  # For label-updater.sh below, which patches this pod's own `role` label
+  # so sqlite-ha-writer's selector can find the current writer.
+  #
+  # No resourceNames: RBAC can't reference $(POD_NAME) dynamically, and
+  # per-pod scoping would require templating this Role per replica
+  # ordinal. Accepted tradeoff: any pod in this ServiceAccount can patch
+  # any other pod's `role` label within the namespace — but the label is a
+  # routing hint, not a safety mechanism (write-fencing is re-validated
+  # per RPC independent of routing; see docs/k3s-ha-runbook.md), so the
+  # blast radius of a mislabeled pod is one extra NOT_LEADER redirect for
+  # a client, not a correctness violation.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -49,9 +67,72 @@ data:
     lease_duration="${LEASE_DURATION_SECONDS:-15}"
     renew_sleep="${LEASE_RENEW_SLEEP_SECONDS:-2}"
     role_file="${ROLE_STATE_FILE:-/var/run/rsqlite-rsync/role_state.txt}"
+    freshness_file="${FRESHNESS_FILE:-/var/run/rsqlite-rsync/freshness.txt}"
 
     current_generation() {
       kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.metadata.annotations.rsqlite-rsync\.dev/generation}' 2>/dev/null || true
+    }
+
+    # Any pod may attempt to claim the lease when it is missing, or expired
+    # with nobody renewing it -- there is no designated claimant ordinal.
+    # Kubernetes' own optimistic concurrency control is what actually
+    # arbitrates a race between simultaneous candidates, not this script:
+    # `kubectl create` only succeeds for whichever candidate's write reaches
+    # the API server first when the lease is missing, and `kubectl replace`
+    # (which sends back the resourceVersion read a moment earlier) is
+    # rejected with a 409 conflict for every candidate but the one that
+    # wins when the lease is expired-but-present. Losing a race is the
+    # expected, frequent, harmless outcome -- the loser just stays a
+    # replica -- which is why kubectl's output is discarded below rather
+    # than treated as an error to react to.
+    #
+    # Winning the claim only makes this pod the Lease's holderIdentity; it
+    # does not make it the writer. The rsqlite-rsync container still only
+    # promotes itself once `validate_promotion` (src/ha.rs) sees a fresh
+    # enough local freshness ledger, so a candidate with stale/broken sync
+    # can win the Lease race and still correctly stay a replica -- the
+    # lease simply re-expires ~lease_duration later and another candidate
+    # gets a turn. The one exception is genuine cluster genesis (the lease
+    # object has never existed), where nothing could possibly have synced
+    # from a prior writer yet; that candidate self-attests freshness at
+    # generation 0 the same way it always has.
+    #
+    # This is a routing/liveness optimization only: write safety is
+    # independently re-validated at the RPC layer on every call
+    # (`HaSharedState::is_writer()` in src/ha.rs), so a lost or even a
+    # mistaken claim never risks correctness -- worst case is one extra
+    # NOT_LEADER redirect for a client. See docs/k3s-ha-runbook.md.
+    try_claim() {
+      now_secs="$(date +%s)"
+      now_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
+      resource_version="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+
+      if [ -z "${resource_version}" ]; then
+        lease_json="$(printf '{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"%s","annotations":{"rsqlite-rsync.dev/generation":"0"}},"spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}}' \
+          "${lease_name}" "${POD_NAME}" "${lease_duration}" "${now_rfc3339}")"
+        if printf '%s' "${lease_json}" | kubectl -n "${POD_NAMESPACE}" create -f - >/dev/null 2>&1; then
+          printf 'source_node_id=%s\nsource_generation=0\nsynced_at_secs=%s\n' \
+            "${POD_NAME}" "${now_secs}" > "${freshness_file}"
+        fi
+        return 0
+      fi
+
+      renew_time="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.renewTime}' 2>/dev/null || true)"
+      existing_duration="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.leaseDurationSeconds}' 2>/dev/null || echo "${lease_duration}")"
+      renewed_at_secs="$(date -u -d "${renew_time}" +%s 2>/dev/null || echo 0)"
+      if [ "$((renewed_at_secs + existing_duration))" -ge "${now_secs}" ]; then
+        return 0
+      fi
+
+      prior_generation="$(current_generation)"
+      case "${prior_generation}" in
+        ''|*[!0-9]*) next_generation=0 ;;
+        *) next_generation=$((prior_generation + 1)) ;;
+      esac
+
+      lease_json="$(printf '{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"%s","namespace":"%s","resourceVersion":"%s","annotations":{"rsqlite-rsync.dev/generation":"%s"}},"spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}}' \
+        "${lease_name}" "${POD_NAMESPACE}" "${resource_version}" "${next_generation}" "${POD_NAME}" "${lease_duration}" "${now_rfc3339}")"
+      printf '%s' "${lease_json}" | kubectl -n "${POD_NAMESPACE}" replace -f - >/dev/null 2>&1 || true
     }
 
     while true; do
@@ -78,6 +159,7 @@ data:
           fi
           ;;
         *)
+          try_claim
           ;;
       esac
       sleep "$renew_sleep"
@@ -119,55 +201,143 @@ data:
       sleep "$sync_sleep"
     done
 
-  lease-bootstrap.sh: |
+  label-updater.sh: |
     #!/usr/bin/env sh
     set -eu
 
-    # Only the ordinal-0 pod attempts genesis/recovery bootstrap, and only
-    # when the lease is missing or already expired with nobody renewing it.
-    # This runs on every restart of pod 0, but is a no-op whenever a live
-    # lease is already held, so it never overrides a real election result.
-    #
-    # The expired case matters because the Lease object is independent of
-    # the StatefulSet: it outlives a `kubectl delete statefulset`, so a
-    # recreated cluster can inherit a stale lease whose last holder is gone.
-    # Nothing else can ever reclaim that lease, since lease-updater.sh only
-    # renews it for a node that is already writer, and no node can become
-    # writer while the lease it would need to hold is expired.
-    case "${POD_NAME}" in
-      *-0) ;;
-      *) exit 0 ;;
-    esac
+    role_file="${ROLE_STATE_FILE:-/var/run/rsqlite-rsync/role_state.txt}"
+    label_sleep="${LABEL_UPDATE_SLEEP_SECONDS:-2}"
+    # Not persisted across restarts by design: a fresh process re-applying
+    # the same label on its first tick is a harmless no-op (kubectl label
+    # --overwrite), not a correctness issue. This only reacts to
+    # role_state.txt changes, not external label drift (e.g. a manual
+    # `kubectl label` edit) — such drift persists until the next real role
+    # transition. That's acceptable because the label is a routing hint,
+    # not a safety mechanism (see docs/k3s-ha-runbook.md).
+    last_applied=""
 
-    lease_name="${LEASE_NAME:-sqlite-writer-lease}"
-    lease_duration="${LEASE_DURATION_SECONDS:-15}"
-    freshness_file="${FRESHNESS_FILE:-/var/run/rsqlite-rsync/freshness.txt}"
-
-    now_secs="$(date +%s)"
-    existing_renew_time="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.renewTime}' 2>/dev/null || true)"
-
-    if [ -n "${existing_renew_time}" ]; then
-      renewed_at_secs="$(date -u -d "${existing_renew_time}" +%s 2>/dev/null || echo 0)"
-      existing_duration="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.leaseDurationSeconds}' 2>/dev/null || echo "${lease_duration}")"
-      if [ "$((renewed_at_secs + existing_duration))" -ge "${now_secs}" ]; then
-        exit 0
+    while true; do
+      role_state=""
+      if [ -f "$role_file" ]; then
+        role_state="$(cat "$role_file" 2>/dev/null || true)"
       fi
+
+      case "$role_state" in
+        writer:*) desired="writer" ;;
+        replica)  desired="replica" ;;
+        *)        desired="" ;;
+      esac
+
+      if [ -n "$desired" ] && [ "$desired" != "$last_applied" ]; then
+        if kubectl -n "${POD_NAMESPACE}" label pod "${POD_NAME}" "role=${desired}" --overwrite >/dev/null; then
+          last_applied="$desired"
+        fi
+      fi
+
+      sleep "$label_sleep"
+    done
+
+  default-replica-sync.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    # Default value of RSQLITE_RSYNC_REPLICA_SYNC_COMMAND (see
+    # apply-k3s-ha-stack.sh) -- runs inside replica-sync.sh's existing
+    # loop, which only invokes $sync_cmd while local role is not writer.
+    # Discovers the current writer from the Lease (no hardcoded pod), then
+    # pulls every *.db file it can see there over SSH using rsqlite-rsync's
+    # own transport, so this stays correct as --ha-data-dir grows beyond a
+    # single database. Trust model: a single SSH keypair shared by every
+    # pod (sqlite-ha-ssh-keys Secret) and StrictHostKeyChecking=no -- see
+    # docs/k3s-ha-runbook.md. Override this whole command for a real
+    # transport/auth model; this exists to make the reference manifest
+    # actually replicate data out of the box.
+    lease_name="${LEASE_NAME:-sqlite-writer-lease}"
+    data_dir="${DATA_DIR:-/var/lib/sqlite}"
+    ssh_key="${SSH_KEY_PATH:-/etc/rsqlite-ssh/id_ed25519}"
+    ssh_user="${SSH_USER:-rsqlite}"
+    ssh_port="${SSH_PORT:-2222}"
+
+    holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+    if [ -z "$holder" ] || [ "$holder" = "$POD_NAME" ]; then
+      exit 0
     fi
 
-    prior_generation="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.metadata.annotations.rsqlite-rsync\.dev/generation}' 2>/dev/null || true)"
-    case "${prior_generation}" in
-      ''|*[!0-9]*) next_generation=0 ;;
-      *) next_generation=$((prior_generation + 1)) ;;
-    esac
+    writer_host="${holder}.sqlite-ha.${POD_NAMESPACE}.svc.cluster.local"
 
-    now_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
+    # The remote `ls` is followed by `; true` so its own exit status (e.g.
+    # nonzero when the glob matches nothing) never becomes the ssh command's
+    # exit status -- that status is reserved for genuine connectivity/auth
+    # failure (ssh's own nonzero, typically 255). Without this, "writer
+    # unreachable" and "writer has no *.db files yet" were indistinguishable
+    # and both looked like a successful, empty sync -- see below.
+    if ! remote_dbs="$(ssh -o IdentityFile="$ssh_key" -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$ssh_port" \
+      "${ssh_user}@${writer_host}" "ls ${data_dir}/*.db 2>/dev/null; true")"; then
+      echo "default-replica-sync: failed to reach ${writer_host} over ssh" >&2
+      exit 1
+    fi
+    [ -z "$remote_dbs" ] && exit 0
 
-    printf '{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"%s","annotations":{"rsqlite-rsync.dev/generation":"%s"}},"spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}}\n' \
-      "${lease_name}" "${next_generation}" "${POD_NAME}" "${lease_duration}" "${now_rfc3339}" \
-      | kubectl -n "${POD_NAMESPACE}" apply -f -
+    # Every file is still attempted even if one fails (a transient failure
+    # on one database shouldn't stall the others), but any failure makes the
+    # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
+    # sync as fresh -- an incomplete sync must not look complete to the
+    # freshness ledger that failover promotion decisions read.
+    sync_failed=0
+    for remote_path in $remote_dbs; do
+      name="$(basename "$remote_path")"
+      # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
+      # src/transport/ssh.rs), so each one needs the combined -oKey=Value
+      # form rather than a bare Key=Value -- and clap rejects a
+      # hyphen-looking value passed as a separate token unless given as
+      # --flag=value (no space), since it otherwise looks like an
+      # unrecognized flag of its own.
+      if ! rsqlite-rsync \
+        --ssh-opt="-oIdentityFile=${ssh_key}" \
+        --ssh-opt="-oStrictHostKeyChecking=no" \
+        --ssh-opt="-oUserKnownHostsFile=/dev/null" \
+        --ssh-opt="-oPort=${ssh_port}" \
+        --ssh-connect-timeout 5 \
+        "${ssh_user}@${writer_host}:${remote_path}" \
+        "${data_dir}/${name}"; then
+        echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
+        sync_failed=1
+      fi
+    done
 
-    printf 'source_node_id=%s\nsource_generation=%s\nsynced_at_secs=%s\n' \
-      "${POD_NAME}" "${next_generation}" "${now_secs}" > "${freshness_file}"
+    exit "$sync_failed"
+
+  sshd-entrypoint.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    # Host keys are generated fresh per container start (not baked into
+    # the image, not persisted) -- fine since default-replica-sync.sh
+    # above uses StrictHostKeyChecking=no anyway: the pod behind any given
+    # writer hostname changes across failovers, so real host-key pinning
+    # wouldn't mean anything here regardless.
+    mkdir -p /etc/ssh
+    ssh-keygen -A >/dev/null
+
+    # sshd's StrictModes rejects the Secret-mounted directory itself:
+    # Kubernetes' secret volume plugin creates its mountpoint with wide-open
+    # traversal permissions (so containers running as any UID can read it),
+    # which StrictModes treats as an insecure authorized_keys path
+    # regardless of the file's own mode. Copy it into
+    # /var/lib/rsqlite-ssh-work instead -- a plain directory baked into the
+    # image (Dockerfile), not a Kubernetes volume mount at all, since every
+    # k8s-managed mount tried here (this Secret, an fsGroup-adjusted
+    # emptyDir, even /tmp) ended up failing the same check one way or
+    # another.
+    cp /etc/rsqlite-ssh/authorized_keys /var/lib/rsqlite-ssh-work/authorized_keys
+    chmod 600 /var/lib/rsqlite-ssh-work/authorized_keys
+
+    exec /usr/sbin/sshd -D -e -p "${SSH_PORT:-2222}" \
+      -o "AuthorizedKeysFile=/var/lib/rsqlite-ssh-work/authorized_keys" \
+      -o "PasswordAuthentication no" \
+      -o "PermitRootLogin no" \
+      -o "PidFile=/var/lib/rsqlite-ssh-work/sshd.pid"
 ---
 apiVersion: v1
 kind: Service
@@ -176,6 +346,15 @@ metadata:
   labels:
     app: sqlite-ha
 spec:
+  # Headless: this is the StatefulSet's governing service (serviceName
+  # below), so per-pod DNS records (e.g. sqlite-ha-0.sqlite-ha...) only get
+  # created by CoreDNS when this is unset. That per-pod DNS is what the
+  # client's --kube-service / Lease-based writer discovery depends on (see
+  # rsqlite-rsync-client's KubeLeaseResolver) — this remains the portable,
+  # always-correct discovery path regardless of cluster/election state.
+  # sqlite-ha-writer below additionally provides convenience routing to
+  # the current writer specifically, via the label-updater sidecar.
+  clusterIP: None
   ports:
     - port: 8088
       targetPort: probe-http
@@ -183,6 +362,9 @@ spec:
     - port: 50051
       targetPort: grpc
       name: grpc
+    - port: 2222
+      targetPort: ssh
+      name: ssh
   selector:
     app: sqlite-ha
 ---
@@ -193,6 +375,14 @@ metadata:
   labels:
     app: sqlite-ha
 spec:
+  # Convenience routing to the current writer via the label-updater
+  # sidecar's `role=writer` label — a hint, not authoritative. Zero or
+  # stale endpoints are possible (during startup/failover, or if this
+  # sidecar's RBAC is misconfigured) and are expected to self-heal via the
+  # gRPC client's NOT_LEADER-redirect, which is the actual correctness
+  # mechanism (see docs/k3s-ha-runbook.md). Not headless — unlike
+  # sqlite-ha above, this wants one stable address resolving to whichever
+  # single pod currently matches, not per-pod DNS.
   ports:
     - port: 8088
       targetPort: probe-http
@@ -202,6 +392,7 @@ spec:
       name: grpc
   selector:
     app: sqlite-ha
+    role: writer
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -223,6 +414,13 @@ spec:
     spec:
       serviceAccountName: sqlite-ha
       terminationGracePeriodSeconds: 20
+      # Containers in this pod run as different UIDs (this image's own
+      # rsqlite user, UID 10001, vs. bitnami/kubectl's default) but share
+      # the rsqlite-ssh Secret and the data dir -- fsGroup makes both
+      # group-readable/writable by GID 10001 regardless of which UID reads
+      # them, matching the data dir's existing setgid 2775 convention.
+      securityContext:
+        fsGroup: 10001
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -252,30 +450,6 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/sqlite
-        - name: lease-bootstrap
-          image: bitnami/kubectl:latest
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "/scripts/lease-bootstrap.sh"]
-          env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            - name: LEASE_NAME
-              value: sqlite-writer-lease
-            - name: LEASE_DURATION_SECONDS
-              value: "15"
-            - name: FRESHNESS_FILE
-              value: /var/run/rsqlite-rsync/freshness.txt
-          volumeMounts:
-            - name: run
-              mountPath: /var/run/rsqlite-rsync
-            - name: scripts
-              mountPath: /scripts
       containers:
         - name: rsqlite-rsync
           image: __RSQLITE_RSYNC_IMAGE__
@@ -306,6 +480,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Read by clap's `env = "RSQLITE_GRPC_AUTH_TOKEN"` on
+            # `--ha-grpc-auth-token` — the gRPC SQL Gateway requires this
+            # (see README "Security") and refuses to start without it.
+            # Provisioned by scripts/apply-k3s-ha-stack.sh.
+            - name: RSQLITE_GRPC_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sqlite-ha-grpc-auth
+                  key: token
           ports:
             - name: probe-http
               containerPort: 8088
@@ -319,7 +502,13 @@ spec:
             failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /ready
+              # /healthz ("has the reconcile loop ticked"), not /ready
+              # ("is this node currently the writer") — every replica pod
+              # is permanently /ready==503 by design, and gating Pod
+              # readiness (and therefore StatefulSet rollout progression)
+              # on that would stall the rollout after one pod. See README
+              # "Behavior notes".
+              path: /healthz
               port: probe-http
             periodSeconds: 2
             timeoutSeconds: 1
@@ -354,6 +543,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: ROLE_STATE_FILE
               value: /var/run/rsqlite-rsync/role_state.txt
+            - name: FRESHNESS_FILE
+              value: /var/run/rsqlite-rsync/freshness.txt
             - name: LEASE_NAME
               value: sqlite-writer-lease
             - name: LEASE_DURATION_SECONDS
@@ -367,7 +558,10 @@ spec:
               mountPath: /scripts
 
         - name: replica-sync
-          image: bitnami/kubectl:latest
+          # Not bitnami/kubectl like the other sidecars: default-replica-sync.sh
+          # needs `ssh` and `rsqlite-rsync` itself, both of which only this
+          # image has (alongside kubectl, which it also ships).
+          image: __RSQLITE_RSYNC_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/scripts/replica-sync.sh"]
           securityContext:
@@ -398,6 +592,62 @@ spec:
               mountPath: /scripts
             - name: data
               mountPath: /var/lib/sqlite
+            - name: ssh-keys
+              mountPath: /etc/rsqlite-ssh
+              readOnly: true
+
+        - name: sshd
+          image: __RSQLITE_RSYNC_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/sshd-entrypoint.sh"]
+          env:
+            - name: SSH_PORT
+              value: "2222"
+          ports:
+            - name: ssh
+              containerPort: 2222
+          volumeMounts:
+            # Not readOnly: SQLite's WAL mode needs to create/update the
+            # -shm and -wal companion files even for what's logically a
+            # read-only open (e.g. after a checkpoint removes them), so a
+            # read-only mount here made every remote open fail with
+            # "unable to open database file". This container only ever
+            # runs whatever rsqlite-rsync's own --server protocol needs
+            # for a source-side sync (reads out the data it's asked for),
+            # so this isn't a new write-safety exposure -- write-safety is
+            # independently enforced at the RPC/lease layer regardless of
+            # filesystem permissions here.
+            - name: data
+              mountPath: /var/lib/sqlite
+            - name: ssh-keys
+              mountPath: /etc/rsqlite-ssh
+              readOnly: true
+            - name: scripts
+              mountPath: /scripts
+
+        - name: label-updater
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/label-updater.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ROLE_STATE_FILE
+              value: /var/run/rsqlite-rsync/role_state.txt
+            - name: LABEL_UPDATE_SLEEP_SECONDS
+              value: "2"
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/rsqlite-rsync
+              readOnly: true
+            - name: scripts
+              mountPath: /scripts
       volumes:
         - name: run
           emptyDir: {}
@@ -406,6 +656,10 @@ spec:
         - name: scripts
           configMap:
             name: sqlite-ha-scripts
+        - name: ssh-keys
+          secret:
+            secretName: sqlite-ha-ssh-keys
+            defaultMode: 0440
         - name: data
           hostPath:
             path: __RSQLITE_RSYNC_HOST_DATA_DIR__

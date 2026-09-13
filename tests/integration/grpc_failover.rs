@@ -12,6 +12,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rsqlite_rsync::client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
 use rsqlite_rsync::proto::rsqlite::v1::ConsistencyLevel;
 
+/// Fixed token both nodes in this file's cluster are started with, since the
+/// gRPC SQL Gateway requires authentication by default.
+const TEST_AUTH_TOKEN: &str = "integration-test-token";
+
 struct ChildGuard {
     child: Child,
 }
@@ -79,7 +83,9 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 fn read_http_status_code(bind_addr: &str, path: &str) -> Option<u16> {
     let mut stream = std::net::TcpStream::connect(bind_addr).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .ok()?;
     stream
         .write_all(
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -148,6 +154,8 @@ impl TwoNodeCluster {
             .arg(&writer_readiness_bind)
             .arg("--ha-grpc-bind")
             .arg(format!("127.0.0.1:{writer_port}"))
+            .arg("--ha-grpc-auth-token")
+            .arg(TEST_AUTH_TOKEN)
             .arg("--ha-grpc-port")
             .arg(writer_port.to_string())
             .arg("--ha-service-name")
@@ -158,8 +166,7 @@ impl TwoNodeCluster {
             .arg("50")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let writer_guard =
-            ChildGuard::spawn(&mut writer_cmd).expect("failed to start writer node");
+        let writer_guard = ChildGuard::spawn(&mut writer_cmd).expect("failed to start writer node");
 
         let became_ready = wait_until(Duration::from_secs(5), || {
             read_http_status_code(&writer_readiness_bind, "/ready") == Some(200)
@@ -184,6 +191,8 @@ impl TwoNodeCluster {
             .arg(&stale_audit_log)
             .arg("--ha-grpc-bind")
             .arg(format!("127.0.0.1:{stale_port}"))
+            .arg("--ha-grpc-auth-token")
+            .arg(TEST_AUTH_TOKEN)
             .arg("--ha-grpc-port")
             .arg(writer_port.to_string())
             .arg("--ha-service-name")
@@ -211,6 +220,7 @@ impl TwoNodeCluster {
                 initial_backoff_ms: 10,
                 max_backoff_ms: 20,
                 timeout: Duration::from_secs(2),
+                auth_token: Some(TEST_AUTH_TOKEN.to_string()),
             });
             if let Ok(status) = probe.get_cluster_status().await
                 && status.current_leader_endpoint == writer_endpoint
@@ -248,6 +258,7 @@ async fn client_fails_over_from_stale_node_to_active_writer() {
         initial_backoff_ms: 20,
         max_backoff_ms: 200,
         timeout: Duration::from_secs(5),
+        auth_token: Some(TEST_AUTH_TOKEN.to_string()),
     });
 
     let resp = client
@@ -274,6 +285,7 @@ async fn client_fails_over_from_stale_node_to_active_writer() {
         initial_backoff_ms: 20,
         max_backoff_ms: 200,
         timeout: Duration::from_secs(5),
+        auth_token: Some(TEST_AUTH_TOKEN.to_string()),
     });
     let query = direct
         .query(
@@ -303,6 +315,7 @@ async fn client_discovers_writer_among_multiple_candidates() {
         initial_backoff_ms: 20,
         max_backoff_ms: 200,
         timeout: Duration::from_secs(5),
+        auth_token: Some(TEST_AUTH_TOKEN.to_string()),
     });
 
     let status = client

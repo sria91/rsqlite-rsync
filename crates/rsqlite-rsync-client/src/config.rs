@@ -20,6 +20,10 @@ pub struct ClientConfig {
     pub max_backoff_ms: u64,
     /// Connect and per-request timeout.
     pub timeout: Duration,
+    /// Bearer token sent as `authorization: Bearer <token>` on every RPC, if
+    /// the gateway requires authentication (see `--ha-grpc-auth-token` on
+    /// the server). `None` sends no `authorization` header at all.
+    pub auth_token: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -30,6 +34,7 @@ impl Default for ClientConfig {
             initial_backoff_ms: 100,
             max_backoff_ms: 2000,
             timeout: Duration::from_secs(15),
+            auth_token: None,
         }
     }
 }
@@ -67,6 +72,12 @@ impl ClientConfig {
         self.timeout = timeout;
         self
     }
+
+    /// Set the bearer token sent on every RPC.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -83,15 +94,18 @@ mod tests {
         assert_eq!(config.initial_backoff_ms, 100);
         assert_eq!(config.max_backoff_ms, 2000);
         assert_eq!(config.timeout, Duration::from_secs(15));
+        assert_eq!(config.auth_token, None);
     }
 
     #[test]
     fn new_and_builder_setters_override_only_requested_fields() {
         let config = ClientConfig::new(DiscoveryMode::Direct("http://x:1".to_string()))
             .with_max_retries(9)
-            .with_timeout(Duration::from_secs(3));
+            .with_timeout(Duration::from_secs(3))
+            .with_auth_token("secret");
         assert_eq!(config.max_retries, 9);
         assert_eq!(config.timeout, Duration::from_secs(3));
+        assert_eq!(config.auth_token.as_deref(), Some("secret"));
         assert_eq!(
             config.initial_backoff_ms, 100,
             "unset fields keep Default's values"

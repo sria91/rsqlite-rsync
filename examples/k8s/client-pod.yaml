@@ -6,9 +6,16 @@
 #
 # RSQLITE_ENDPOINTS is pre-set to all three StatefulSet pods (candidate
 # discovery probes each and picks whichever reports itself as writer), so
-# most commands can omit --endpoint/--endpoints entirely. Works against any
-# of the sqlite-ha StatefulSet variants in this directory, since they all
-# share the same pod-naming/headless-service shape.
+# most commands can omit --endpoint/--endpoints entirely. RSQLITE_TOKEN is
+# pre-set from the same sqlite-ha-grpc-auth Secret the stack provisions
+# (see scripts/apply-k3s-ha-stack.sh), since the gateway now requires
+# authentication on every RPC by default — so commands can omit --token
+# too. When passing --token explicitly instead, it's a connection option
+# and must come before the subcommand name (e.g. `rsqlite-rsync client
+# --token "$TOKEN" status`, not `... status --token "$TOKEN"`). Works
+# against any of the sqlite-ha StatefulSet variants in this directory,
+# since they all share the same pod-naming/headless-service shape and the
+# same auth Secret name.
 #
 # Usage:
 #   kubectl apply -n sqlite-ha -f examples/k8s/client-pod.yaml
@@ -33,5 +40,10 @@ spec:
       env:
         - name: RSQLITE_ENDPOINTS
           value: "http://sqlite-ha-0.sqlite-ha:50051,http://sqlite-ha-1.sqlite-ha:50051,http://sqlite-ha-2.sqlite-ha:50051"
+        - name: RSQLITE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sqlite-ha-grpc-auth
+              key: token
       stdin: true
       tty: true
