@@ -3,6 +3,14 @@
 # likewise be maintained externally (e.g. by whatever replicates data onto
 # each pod) — without it, promotion is denied with MissingFreshness even once
 # a pod correctly holds the Lease.
+#
+# PREREQUISITE: the gRPC SQL Gateway (--ha-grpc-bind below) requires a
+# bearer token by default and refuses to start without one — create the
+# Secret it reads from before applying this manifest:
+#   kubectl create secret generic sqlite-ha-grpc-auth \
+#     --from-literal=token="$(openssl rand -hex 32)" -n <namespace>
+# Retrieve it later with:
+#   kubectl get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}' -n <namespace>
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -109,6 +117,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: RSQLITE_GRPC_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sqlite-ha-grpc-auth
+                  key: token
           ports:
             - name: probe-http
               containerPort: 8088

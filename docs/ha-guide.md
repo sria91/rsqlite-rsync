@@ -93,6 +93,18 @@ Optional Kubernetes flags:
 | `--ha-readiness-file <PATH>` | File updated with `ready`/`not-ready` status |
 | `--ha-readiness-http-bind <ADDR>` | HTTP server for probe endpoints (e.g., `0.0.0.0:8088`) |
 
+### SQL Gateway Flags (Optional)
+
+| Flag | Description |
+|------|-------------|
+| `--ha-grpc-bind <ADDR>` | Starts the embedded gRPC SQL Gateway (e.g., `0.0.0.0:50051`) |
+| `--ha-grpc-auth-token <TOKEN>` (env `RSQLITE_GRPC_AUTH_TOKEN`) | Bearer token every gRPC request must present. **Required** whenever `--ha-grpc-bind` is set — the gateway executes arbitrary SQL for any caller that reaches it, so it refuses to start without this (or the opt-out below) |
+| `--ha-grpc-insecure-no-auth` | Explicitly disable gateway authentication — local development only, or when a trusted-network/mTLS boundary already authenticates callers |
+| `--ha-data-dir <PATH>` | Directory of `.db` files the gateway serves |
+| `--ha-allow-replica-reads` | Permit eventual-consistency reads on replica nodes |
+
+See [SQL Gateway and client](../README.md#sql-gateway-and-client) in the README for the client-side `--token`/`RSQLITE_TOKEN` counterpart, and [Security](../README.md#security) for the full rationale.
+
 ## Lease Formats
 
 ### File-Based Lease

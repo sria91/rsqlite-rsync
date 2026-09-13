@@ -362,7 +362,9 @@ synced_at_secs=1731000099
 - [docs/k3s-ha-runbook.md](docs/k3s-ha-runbook.md)
 - [examples/k8s/ha-deployment.yaml](examples/k8s/ha-deployment.yaml) (lease-manager RBAC)
 - [examples/k8s/ha-deployment-readonly.yaml](examples/k8s/ha-deployment-readonly.yaml) (read-only RBAC)
-- [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml) (k3s-oriented StatefulSet + writer Service + lease updater + replica-sync contract)
+- [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml) (k3s-oriented StatefulSet + lease updater + replica-sync contract)
+- [examples/k8s/local-dev-file-lease.yaml](examples/k8s/local-dev-file-lease.yaml) (single-node local testing, file-based lease, no Kubernetes election required)
+- [examples/k8s/client-pod.yaml](examples/k8s/client-pod.yaml) (debug/test client pod, pre-wired with cluster endpoints and the gRPC auth token)
 - [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) (one-command apply with required image and replica sync command env vars)
 
 ### SQL Gateway and client

@@ -55,6 +55,10 @@ for which pod currently holds the role.
 5. Verify which pod is currently the writer:
    - `kubectl exec sqlite-ha-0 -c rsqlite-rsync -- cat /var/run/rsqlite-rsync/role_state.txt`
      (repeat per pod, or grep the audit log — exactly one pod should report `writer:N`)
+6. Retrieve the gRPC SQL Gateway auth token (the script provisions this automatically — see [Security](../README.md#security) for why it's required):
+   - `kubectl get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
+   - also printed at the end of `apply-k3s-ha-stack.sh`'s own output
+7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) (`kubectl apply -f examples/k8s/client-pod.yaml`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it sqlite-ha-client -- rsqlite-rsync client status` works with no extra flags.
 
 ## Node Storage
 
@@ -86,7 +90,10 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 1. Confirm exactly one pod reports `writer:N` in `role_state.txt` (step 5 above).
 2. Delete the current writer pod.
-3. Confirm another pod becomes ready.
+3. Confirm a different pod's `role_state.txt` reports `writer:N` (a higher `N`
+   than before) — all pods stay Kubernetes-`Ready` throughout via `/healthz`
+   regardless of role, so pod readiness alone doesn't tell you who the new
+   writer is; check the role explicitly.
 4. Confirm lease holder and generation update.
 5. Confirm replica pods continue sync loop and freshness writes.
 
@@ -95,5 +102,7 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 - [docs/ha-kubernetes.md](docs/ha-kubernetes.md)
 - [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml)
 - [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh)
+- [examples/k8s/client-pod.yaml](examples/k8s/client-pod.yaml) — debug/test client pod for querying the cluster
 - [examples/k8s/ha-deployment.yaml](examples/k8s/ha-deployment.yaml)
 - [examples/k8s/ha-deployment-readonly.yaml](examples/k8s/ha-deployment-readonly.yaml)
+- [examples/k8s/local-dev-file-lease.yaml](examples/k8s/local-dev-file-lease.yaml) — single-node local testing without Kubernetes Lease election

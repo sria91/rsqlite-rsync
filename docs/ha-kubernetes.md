@@ -90,6 +90,8 @@ Example manifests:
 - `examples/k8s/ha-deployment.yaml` (lease-manager profile)
 - `examples/k8s/ha-deployment-readonly.yaml` (read-only profile)
 - `examples/k8s/k3s-ha-stack.yaml` (k3s-oriented end-to-end stack with lease updater and replica-sync contract)
+- `examples/k8s/local-dev-file-lease.yaml` (single-node local testing, no Kubernetes Lease election required)
+- `examples/k8s/client-pod.yaml` (debug/test client pod for querying any of the above)
 
 ## Operational Notes
 
@@ -105,6 +107,8 @@ Complete deployment examples are available at:
 - examples/k8s/ha-deployment.yaml
 - examples/k8s/ha-deployment-readonly.yaml
 - examples/k8s/k3s-ha-stack.yaml
+- examples/k8s/local-dev-file-lease.yaml
+- examples/k8s/client-pod.yaml
 
 For a concrete k3s-focused runbook and rollout checklist, see:
 
