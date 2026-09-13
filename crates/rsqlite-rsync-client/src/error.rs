@@ -42,9 +42,11 @@ pub enum ClientError {
         source: Option<BoxError>,
     },
 
-    /// The gRPC call itself returned an error status.
+    /// The gRPC call itself returned an error status. Boxed because
+    /// [`Status`] is 176+ bytes and would otherwise dominate the size of
+    /// every [`ClientResult`], even on the common non-error path.
     #[error("gRPC call failed (code: {:?}): {}", .0.code(), .0.message())]
-    Rpc(#[from] Status),
+    Rpc(#[from] Box<Status>),
 
     /// Retries were exhausted without a successful response.
     #[error("gave up after {attempts} attempt(s): {source}")]
@@ -75,7 +77,7 @@ impl ClientError {
     /// through [`ClientError::RetriesExhausted`], wraps) a gRPC response.
     pub fn status(&self) -> Option<&Status> {
         match self {
-            ClientError::Rpc(status) => Some(status),
+            ClientError::Rpc(status) => Some(status.as_ref()),
             ClientError::RetriesExhausted { source, .. } => source.status(),
             _ => None,
         }
@@ -140,7 +142,7 @@ mod tests {
         // `SyncError`-mapped client error.
         let err = ClientError::RetriesExhausted {
             attempts: 1,
-            source: Box::new(ClientError::Rpc(not_leader_status())),
+            source: Box::new(ClientError::Rpc(Box::new(not_leader_status()))),
         };
         assert!(err.to_string().contains("FailedPrecondition"));
     }
@@ -149,7 +151,7 @@ mod tests {
     fn client_error_accessors_expose_code_and_not_leader_through_wrapper() {
         let err = ClientError::RetriesExhausted {
             attempts: 3,
-            source: Box::new(ClientError::Rpc(not_leader_status())),
+            source: Box::new(ClientError::Rpc(Box::new(not_leader_status()))),
         };
         assert_eq!(err.code(), Some(Code::FailedPrecondition));
         assert!(err.is_not_leader());

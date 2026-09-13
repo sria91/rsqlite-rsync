@@ -292,12 +292,12 @@ impl SqlGatewayClient {
                             && matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded));
 
                     if !should_retry {
-                        return Err(ClientError::Rpc(status));
+                        return Err(ClientError::Rpc(Box::new(status)));
                     }
                     if attempts >= self.config.max_retries {
                         return Err(ClientError::RetriesExhausted {
                             attempts,
-                            source: Box::new(ClientError::Rpc(status)),
+                            source: Box::new(ClientError::Rpc(Box::new(status))),
                         });
                     }
 
