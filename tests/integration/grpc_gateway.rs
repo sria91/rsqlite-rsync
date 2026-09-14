@@ -157,6 +157,7 @@ impl SingleWriterCluster {
 
         let became_ready = wait_until(Duration::from_secs(5), || {
             read_http_status_code(&readiness_bind, "/ready") == Some(200)
+                && std::net::TcpStream::connect(&grpc_bind).is_ok()
         });
         assert!(became_ready, "writer node never became ready");
 

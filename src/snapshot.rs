@@ -156,4 +156,35 @@ mod tests {
         let result = snap.read_page(0);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn snapshot_connection_returns_usable_reference() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = open_rw(f.path());
+        conn.exec("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1)").unwrap();
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        // The returned reference is the same connection the snapshot was
+        // opened on, and remains usable for further reads within it.
+        assert!(std::ptr::eq(snap.connection(), &conn));
+        snap.connection().page_size();
+    }
+
+    #[test]
+    fn snapshot_read_page_beyond_page_count_errors() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = open_rw(f.path());
+        conn.exec("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1)").unwrap();
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        assert!(snap.page_count() > 0);
+
+        // A page number that is 1-indexed but far beyond the snapshot's
+        // actual page count must be rejected as out-of-range rather than
+        // silently returning truncated/garbage bytes.
+        let result = snap.read_page(snap.page_count() + 1000);
+        assert!(result.is_err());
+    }
 }

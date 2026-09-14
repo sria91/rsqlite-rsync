@@ -19,7 +19,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::ptr;
 
-use libsqlite3_sys as ffi;
+pub use libsqlite3_sys as ffi;
 use std::sync::Mutex;
 
 use crate::error::{Result, SyncError};
@@ -845,5 +845,88 @@ mod tests {
         assert_eq!(query.column_value(4), SqlValue::Null);
 
         assert_eq!(query.step().unwrap(), StepResult::Done);
+    }
+
+    #[test]
+    fn db_additional_coverage_tests() {
+        // 1. Connection::open with null byte in path
+        let res1 = Connection::open(Path::new("test\0bad.db"), ffi::SQLITE_OPEN_READONLY);
+        assert!(res1.is_err());
+        let err = match res1 {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(err.to_string().contains("nul byte"));
+
+        // 2. Connection::open on non-existent file in readonly mode
+        let tmpdir = tempfile::tempdir().unwrap();
+        let non_existent = tmpdir.path().join("no_such_subdir/db.sqlite");
+        let res2 = Connection::open(&non_existent, ffi::SQLITE_OPEN_READONLY);
+        assert!(res2.is_err());
+        let err = match res2 {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(matches!(err, SyncError::Sqlite { .. }));
+
+        // 3. Connection write on read-only connection
+        let f = NamedTempFile::new().unwrap();
+        let conn_rw = open_rw(f.path());
+        seed_db(&conn_rw);
+        let ps = conn_rw.page_size() as usize;
+        drop(conn_rw);
+
+        let conn_ro = Connection::open(f.path(), ffi::SQLITE_OPEN_READONLY).unwrap();
+        let err_ro_write = conn_ro.write_page(1, &vec![0u8; ps]).unwrap_err();
+        assert!(err_ro_write.to_string().contains("connection is read-only"));
+
+        // 4. Connection write page with invalid length
+        let conn_rw2 = open_rw(f.path());
+        let err_bad_len = conn_rw2.write_page(1, &[0u8; 10]).unwrap_err();
+        assert!(err_bad_len.to_string().contains("bytes, expected"));
+
+        // 5. wal_checkpoint execution
+        conn_rw2.wal_checkpoint().unwrap();
+
+        // 6. Backup incremental stepping, remaining(), and pagecount()
+        let dst_f = NamedTempFile::new().unwrap();
+        let dst_conn = open_rw(dst_f.path());
+        let bk = Backup::new(&dst_conn, &conn_rw2).unwrap();
+        let is_done = bk.step(1).unwrap();
+        assert!(bk.pagecount() > 0);
+        if !is_done {
+            assert!(bk.remaining() >= 0);
+            let done_final = bk.step(-1).unwrap();
+            assert!(done_final);
+        }
+        bk.finish().unwrap();
+
+        // 7. PreparedStatement reset and clear_bindings
+        let mut stmt = conn_rw2.prepare("SELECT ?").unwrap();
+        stmt.bind_int64(1, 100).unwrap();
+        assert_eq!(stmt.step().unwrap(), StepResult::Row);
+        assert_eq!(stmt.column_value(0), SqlValue::Integer(100));
+        stmt.reset().unwrap();
+        stmt.clear_bindings().unwrap();
+        assert_eq!(stmt.step().unwrap(), StepResult::Row);
+        assert_eq!(stmt.column_value(0), SqlValue::Null);
+
+        // 8. Named parameter lookup variations
+        let stmt_named = conn_rw2.prepare("SELECT :id, @name, $val, ?").unwrap();
+        assert_eq!(stmt_named.bind_parameter_index("id"), Some(1));
+        assert_eq!(stmt_named.bind_parameter_index(":id"), Some(1));
+        assert_eq!(stmt_named.bind_parameter_index("name"), Some(2));
+        assert_eq!(stmt_named.bind_parameter_index("@name"), Some(2));
+        assert_eq!(stmt_named.bind_parameter_index("val"), Some(3));
+        assert_eq!(stmt_named.bind_parameter_index("$val"), Some(3));
+        assert_eq!(stmt_named.bind_parameter_index("nonexistent"), None);
+
+        // 9. Column decltype
+        conn_rw2.exec("CREATE TABLE types_t (i INTEGER, s TEXT, b BLOB)").unwrap();
+        let query_types = conn_rw2.prepare("SELECT i, s, b FROM types_t").unwrap();
+        assert_eq!(query_types.column_decltype(0), Some("INTEGER".to_string()));
+        assert_eq!(query_types.column_decltype(1), Some("TEXT".to_string()));
+        assert_eq!(query_types.column_decltype(2), Some("BLOB".to_string()));
+        assert_eq!(query_types.column_decltype(999), None);
     }
 }

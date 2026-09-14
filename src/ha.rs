@@ -2155,4 +2155,265 @@ mod tests {
 
         assert!(err.contains("invalid spec.renewTime"));
     }
+
+    #[test]
+    fn parse_kubernetes_lease_json_rejects_missing_spec() {
+        let err = parse_kubernetes_lease_json(r#"{"metadata": {"annotations": {}}}"#)
+            .expect_err("missing spec should fail");
+        assert!(err.contains("missing spec"));
+    }
+
+    #[test]
+    fn parse_kubernetes_lease_json_rejects_invalid_generation_value() {
+        let err = parse_kubernetes_lease_json(
+            r#"{
+    "metadata": {
+        "annotations": {
+            "rsqlite-rsync.dev/generation": "not-a-number"
+        }
+    },
+    "spec": {
+        "holderIdentity": "node-a",
+        "leaseDurationSeconds": 15,
+        "renewTime": "2026-01-01T00:00:30Z"
+    }
+}"#,
+        )
+        .expect_err("non-numeric generation should fail");
+
+        assert!(err.contains("invalid metadata.annotations[rsqlite-rsync.dev/generation]"));
+    }
+
+    #[test]
+    fn parse_lease_record_rejects_missing_field() {
+        let err = parse_lease_record("holder_node_id=node-a\ngeneration=1\nttl_secs=10\n")
+            .expect_err("missing renewed_at_secs should fail");
+        assert!(err.contains("renewed_at_secs"));
+    }
+
+    #[test]
+    fn file_lease_reader_exposes_lease_path() {
+        let reader = FileLeaseReader::new("/tmp/some-lease-file");
+        assert_eq!(reader.lease_path(), Path::new("/tmp/some-lease-file"));
+    }
+
+    #[test]
+    fn kubectl_lease_reader_exposes_namespace_and_lease_name() {
+        let reader = KubectlLeaseReader::new("kubectl", "prod", "sqlite-writer-lease");
+        assert_eq!(reader.namespace(), "prod");
+        assert_eq!(reader.lease_name(), "sqlite-writer-lease");
+    }
+
+    #[test]
+    fn kubectl_lease_reader_passes_context_and_kubeconfig_and_parses_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("fake-kubectl.sh");
+        let captured_args_path = dir.path().join("captured-args.txt");
+        let lease_json_path = dir.path().join("lease.json");
+
+        fs::write(
+            &lease_json_path,
+            r#"{
+    "metadata": {"annotations": {"rsqlite-rsync.dev/generation": "7"}},
+    "spec": {
+        "holderIdentity": "node-a",
+        "leaseDurationSeconds": 15,
+        "renewTime": "2026-01-01T00:00:30Z"
+    }
+}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {}\ncat {}\n",
+                captured_args_path.display(),
+                lease_json_path.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+
+        let mut reader =
+            KubectlLeaseReader::new(&script_path, "prod", "sqlite-writer-lease");
+        reader.set_kube_context(Some("my-context".to_owned()));
+        reader.set_kubeconfig(Some(PathBuf::from("/etc/kube/config")));
+
+        let lease = reader
+            .read_lease()
+            .expect("fake kubectl should succeed")
+            .expect("lease should be present");
+        assert_eq!(lease.holder_node_id, "node-a");
+        assert_eq!(lease.generation, 7);
+
+        let captured_args = fs::read_to_string(&captured_args_path).unwrap();
+        assert!(captured_args.contains("--context my-context"));
+        assert!(captured_args.contains("--kubeconfig /etc/kube/config"));
+    }
+
+    #[test]
+    fn file_action_executor_exposes_paths() {
+        let executor = FileActionExecutor::new("/tmp/role-state", "/tmp/audit-log");
+        assert_eq!(executor.role_state_path(), Path::new("/tmp/role-state"));
+        assert_eq!(executor.audit_log_path(), Path::new("/tmp/audit-log"));
+    }
+
+    #[test]
+    fn tracing_executor_exposes_inner_accessors() {
+        let mut executor = TracingExecutor::new(MockExecutor::default(), "test-component");
+        executor.inner_mut().calls.push("marker".to_owned());
+        assert_eq!(executor.inner().calls, vec!["marker".to_owned()]);
+        let inner = executor.into_inner();
+        assert_eq!(inner.calls, vec!["marker".to_owned()]);
+    }
+
+    #[test]
+    fn tracing_executor_delegates_every_action_success_and_failure() {
+        let mut ok_executor = TracingExecutor::new(MockExecutor::default(), "test-component");
+        ok_executor.enable_writer(3).unwrap();
+        ok_executor
+            .disable_writer(&DemotionReason::LeaseMissing)
+            .unwrap();
+        ok_executor.keep_writer().unwrap();
+        ok_executor
+            .record_promotion_denied(&PromotionViolation::MissingFreshness)
+            .unwrap();
+        assert_eq!(
+            ok_executor.inner().calls,
+            vec![
+                "enable_writer:3".to_owned(),
+                "disable_writer:LeaseMissing".to_owned(),
+                "keep_writer".to_owned(),
+                "record_denied:MissingFreshness".to_owned(),
+            ]
+        );
+
+        let mut failing_executor =
+            TracingExecutor::new(MockExecutor::with_fail_on_call(0), "test-component");
+        assert_eq!(
+            failing_executor.enable_writer(1),
+            Err("enable failed")
+        );
+        let mut failing_executor =
+            TracingExecutor::new(MockExecutor::with_fail_on_call(0), "test-component");
+        assert_eq!(
+            failing_executor.disable_writer(&DemotionReason::LeaseMissing),
+            Err("disable failed")
+        );
+        let mut failing_executor =
+            TracingExecutor::new(MockExecutor::with_fail_on_call(0), "test-component");
+        assert_eq!(failing_executor.keep_writer(), Err("keep failed"));
+        let mut failing_executor =
+            TracingExecutor::new(MockExecutor::with_fail_on_call(0), "test-component");
+        assert_eq!(
+            failing_executor.record_promotion_denied(&PromotionViolation::MissingFreshness),
+            Err("record denied failed")
+        );
+    }
+
+    #[test]
+    fn controller_tick_outcome_report_returns_inner_report_for_both_variants() {
+        let mut controller = HaController::new("node-a");
+        controller.update_freshness(freshness(3, 99));
+        controller.set_min_source_generation(3);
+        let mut exec = MockExecutor::default();
+
+        let mut reader = MockLeaseReader::new(vec![Ok(Some(lease("node-a", 3, 99, 10)))]);
+        let executed = controller.tick_with_reader(100, &mut reader, &mut exec);
+        assert!(executed.report().is_success());
+
+        // Become writer, then force a lease-read failure to hit the
+        // `LeaseReadFailed` branch of `report()`.
+        let mut reader = MockLeaseReader::new(vec![Err("lease api unavailable")]);
+        let lease_read_failed = controller.tick_with_reader(101, &mut reader, &mut exec);
+        assert!(lease_read_failed.report().is_success());
+    }
+
+    #[test]
+    fn observe_lease_change_reports_unchanged_for_identical_lease() {
+        let mut runtime = HaRuntime::new("node-a");
+        runtime.update_freshness(freshness(1, 99));
+        let cfg = PromotionConfig::default();
+        let same_lease = lease("node-a", 1, 99, 10);
+
+        let first = runtime.reconcile_with_outcome(100, Some(same_lease.clone()), 1, &cfg);
+        assert_eq!(first.decision, ReconcileDecision::PromoteToWriter { generation: 1 });
+
+        let second = runtime.reconcile_with_outcome(101, Some(same_lease.clone()), 1, &cfg);
+        assert_eq!(second.decision, ReconcileDecision::KeepWriter);
+        assert_eq!(second.lease_observation, LeaseObservation::Unchanged(same_lease));
+    }
+
+    #[test]
+    fn plan_actions_keep_writer_after_promotion_when_lease_still_valid() {
+        let mut runtime = HaRuntime::new("node-a");
+        runtime.update_freshness(freshness(4, 99));
+        let cfg = PromotionConfig::default();
+        let current_lease = lease("node-a", 4, 99, 10);
+
+        let promote_plan = runtime.plan_actions(100, Some(current_lease.clone()), 4, &cfg);
+        assert_eq!(
+            promote_plan.outcome.decision,
+            ReconcileDecision::PromoteToWriter { generation: 4 }
+        );
+
+        let keep_plan = runtime.plan_actions(101, Some(current_lease), 4, &cfg);
+        assert_eq!(keep_plan.outcome.decision, ReconcileDecision::KeepWriter);
+        assert_eq!(keep_plan.actions, vec![HaAction::KeepWriter]);
+    }
+
+    #[test]
+    fn ha_shared_state_is_writer_false_when_role_writer_but_no_lease_record() {
+        let mut state = HaSharedState::new("node-a", false);
+        state.role = NodeRole::Writer;
+        state.lease_record = None;
+        assert!(!state.is_writer(100));
+    }
+
+    #[test]
+    fn ha_runtime_accessors_expose_identity_lease_and_freshness() {
+        let mut runtime = HaRuntime::new("node-a");
+        assert_eq!(runtime.node_id(), "node-a");
+        assert_eq!(runtime.lease(), None);
+        assert_eq!(runtime.freshness(), None);
+
+        runtime.update_freshness(freshness(1, 42));
+        assert_eq!(runtime.freshness(), Some(&freshness(1, 42)));
+
+        let cfg = PromotionConfig::default();
+        runtime.reconcile_with_outcome(100, Some(lease("node-a", 1, 42, 10)), 1, &cfg);
+        assert_eq!(runtime.lease(), Some(&lease("node-a", 1, 42, 10)));
+    }
+
+    #[test]
+    fn execute_controller_plan_reports_failure_for_every_action_kind() {
+        for action in [
+            HaAction::EnableWriter { generation: 1 },
+            HaAction::DisableWriter {
+                reason: DemotionReason::LeaseMissing,
+            },
+            HaAction::KeepWriter,
+            HaAction::RecordPromotionDenied {
+                violation: PromotionViolation::MissingFreshness,
+            },
+        ] {
+            let plan = ControllerPlan {
+                outcome: ReconcileOutcome {
+                    decision: ReconcileDecision::KeepWriter,
+                    lease_observation: LeaseObservation::Missing,
+                    promotion_violation: None,
+                },
+                actions: vec![action.clone()],
+            };
+            let mut exec = MockExecutor::with_fail_on_call(0);
+            let report = execute_controller_plan(plan, &mut exec, true);
+            assert!(!report.is_success(), "expected failure for {action:?}");
+            assert_eq!(report.failures[0].action, action);
+        }
+    }
 }

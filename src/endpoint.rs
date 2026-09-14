@@ -114,72 +114,89 @@ impl Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn parse_local_paths() {
-        match Endpoint::parse("/var/lib/sqlite/db.sqlite") {
-            Endpoint::Local(p) => assert_eq!(p, PathBuf::from("/var/lib/sqlite/db.sqlite")),
-            Endpoint::Remote { .. } => panic!("expected local endpoint"),
-        }
-
-        match Endpoint::parse("relative/path/db.sqlite") {
-            Endpoint::Local(p) => assert_eq!(p, PathBuf::from("relative/path/db.sqlite")),
-            Endpoint::Remote { .. } => panic!("expected local endpoint"),
-        }
-
-        match Endpoint::parse("C:\\data\\test.db") {
-            Endpoint::Local(p) => assert_eq!(p, PathBuf::from("C:\\data\\test.db")),
-            Endpoint::Remote { .. } => panic!("expected local Windows drive path"),
-        }
-
-        match Endpoint::parse("d:/database.db") {
-            Endpoint::Local(p) => assert_eq!(p, PathBuf::from("d:/database.db")),
-            Endpoint::Remote { .. } => panic!("expected local Windows drive path"),
-        }
+        assert!(matches!(
+            Endpoint::parse("/var/lib/sqlite/db.sqlite"),
+            Endpoint::Local(p) if p == Path::new("/var/lib/sqlite/db.sqlite")
+        ));
+        assert!(matches!(
+            Endpoint::parse("relative/path/db.sqlite"),
+            Endpoint::Local(p) if p == Path::new("relative/path/db.sqlite")
+        ));
+        assert!(matches!(
+            Endpoint::parse("C:\\data\\test.db"),
+            Endpoint::Local(p) if p == Path::new("C:\\data\\test.db")
+        ));
+        assert!(matches!(
+            Endpoint::parse("d:/database.db"),
+            Endpoint::Local(p) if p == Path::new("d:/database.db")
+        ));
     }
 
     #[test]
     fn parse_remote_paths() {
-        match Endpoint::parse("user@example.com:/data/origin.db") {
-            Endpoint::Remote { user_host, path } => {
-                assert_eq!(user_host, "user@example.com");
-                assert_eq!(path, "/data/origin.db");
-            }
-            Endpoint::Local(_) => panic!("expected remote endpoint"),
-        }
-
-        match Endpoint::parse("db.internal.net:/var/db/app.db") {
-            Endpoint::Remote { user_host, path } => {
-                assert_eq!(user_host, "db.internal.net");
-                assert_eq!(path, "/var/db/app.db");
-            }
-            Endpoint::Local(_) => panic!("expected remote endpoint"),
-        }
-
-        match Endpoint::parse("localhost:/data/test.db") {
-            Endpoint::Remote { user_host, path } => {
-                assert_eq!(user_host, "localhost");
-                assert_eq!(path, "/data/test.db");
-            }
-            Endpoint::Local(_) => panic!("expected remote endpoint"),
-        }
-
-        match Endpoint::parse("192.168.1.50:/data/test.db") {
-            Endpoint::Remote { user_host, path } => {
-                assert_eq!(user_host, "192.168.1.50");
-                assert_eq!(path, "/data/test.db");
-            }
-            Endpoint::Local(_) => panic!("expected remote endpoint"),
-        }
+        assert!(matches!(
+            Endpoint::parse("user@example.com:/data/origin.db"),
+            Endpoint::Remote { ref user_host, ref path }
+                if user_host == "user@example.com" && path == "/data/origin.db"
+        ));
+        assert!(matches!(
+            Endpoint::parse("db.internal.net:/var/db/app.db"),
+            Endpoint::Remote { ref user_host, ref path }
+                if user_host == "db.internal.net" && path == "/var/db/app.db"
+        ));
+        assert!(matches!(
+            Endpoint::parse("localhost:/data/test.db"),
+            Endpoint::Remote { ref user_host, ref path }
+                if user_host == "localhost" && path == "/data/test.db"
+        ));
+        assert!(matches!(
+            Endpoint::parse("192.168.1.50:/data/test.db"),
+            Endpoint::Remote { ref user_host, ref path }
+                if user_host == "192.168.1.50" && path == "/data/test.db"
+        ));
     }
 
     #[test]
     fn parse_bare_token_colon_treated_as_local() {
         // A token without dot/at/ip/localhost is treated as local
-        match Endpoint::parse("somedir:file.db") {
-            Endpoint::Local(p) => assert_eq!(p, PathBuf::from("somedir:file.db")),
-            Endpoint::Remote { .. } => panic!("expected local endpoint for non-remote token"),
-        }
+        assert!(matches!(
+            Endpoint::parse("somedir:file.db"),
+            Endpoint::Local(p) if p == Path::new("somedir:file.db")
+        ));
+    }
+
+    #[test]
+    fn parse_bracketed_ipv6_with_content_is_remote() {
+        assert!(matches!(
+            Endpoint::parse("[fe80::1]:/data/db.sqlite"),
+            Endpoint::Remote { ref user_host, ref path }
+                if user_host == "fe80::1" && path == "/data/db.sqlite"
+        ));
+    }
+
+    #[test]
+    fn parse_host_starting_with_dot_is_local() {
+        // A leading `.` makes `looks_like_remote_host` bail out early rather
+        // than falling into the dot-based remote heuristic below it.
+        assert!(matches!(
+            Endpoint::parse(".hidden:path"),
+            Endpoint::Local(_)
+        ));
+    }
+
+    #[test]
+    fn parse_bracketed_ipv6_with_empty_host_or_path_falls_through() {
+        // Bracketed IPv6 syntax matched (`]:` present, starts with `[`), but
+        // an empty host or empty path means the bracketed-IPv6 fast path
+        // must NOT fire; parsing falls through to the later branches, which
+        // in these two cases end up treating the whole string as a local
+        // path since nothing else recognizes it as remote either.
+        assert!(matches!(Endpoint::parse("[]:/data/db.sqlite"), Endpoint::Local(_)));
+        assert!(matches!(Endpoint::parse("[fe80::1]:"), Endpoint::Local(_)));
     }
 
     #[test]

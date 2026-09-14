@@ -138,4 +138,47 @@ mod tests {
         let g = hash_group(&[]);
         assert_eq!(g.len(), 32);
     }
+
+    #[test]
+    fn from_protocol_version_maps_known_versions() {
+        assert_eq!(
+            HashAlgorithm::from_protocol_version(1),
+            Some(HashAlgorithm::Sha256V1)
+        );
+        assert_eq!(
+            HashAlgorithm::from_protocol_version(2),
+            Some(HashAlgorithm::Blake3V2)
+        );
+    }
+
+    #[test]
+    fn from_protocol_version_rejects_unknown_versions() {
+        assert_eq!(HashAlgorithm::from_protocol_version(0), None);
+        assert_eq!(HashAlgorithm::from_protocol_version(3), None);
+        assert_eq!(HashAlgorithm::from_protocol_version(u32::MAX), None);
+    }
+
+    #[test]
+    fn hash_page_for_sha256_v1_is_deterministic_and_differs_from_blake3() {
+        let data = [7u8; 128];
+        let sha_h1 = hash_page_for(&data, HashAlgorithm::Sha256V1);
+        let sha_h2 = hash_page_for(&data, HashAlgorithm::Sha256V1);
+        assert_eq!(sha_h1, sha_h2);
+
+        let blake_h = hash_page_for(&data, HashAlgorithm::Blake3V2);
+        assert_ne!(sha_h1, blake_h);
+    }
+
+    #[test]
+    fn hash_group_for_sha256_v1_is_deterministic_and_differs_from_blake3() {
+        let h1 = hash_page_for(&[1u8; 64], HashAlgorithm::Sha256V1);
+        let h2 = hash_page_for(&[2u8; 64], HashAlgorithm::Sha256V1);
+
+        let sha_g1 = hash_group_for(&[h1, h2], HashAlgorithm::Sha256V1);
+        let sha_g2 = hash_group_for(&[h1, h2], HashAlgorithm::Sha256V1);
+        assert_eq!(sha_g1, sha_g2);
+
+        let blake_g = hash_group_for(&[h1, h2], HashAlgorithm::Blake3V2);
+        assert_ne!(sha_g1, blake_g);
+    }
 }

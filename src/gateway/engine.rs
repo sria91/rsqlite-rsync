@@ -481,10 +481,22 @@ impl DatabaseEngine {
                     .to_string_lossy()
                     .to_string();
 
-                match Connection::open(&path, ffi::SQLITE_OPEN_READONLY) {
-                    Ok(conn) => {
+                // `Connection::open` alone doesn't validate the SQLite file
+                // header — `PRAGMA page_size` (read during open) returns the
+                // default page size without touching page 1, so opening a
+                // file containing arbitrary garbage bytes succeeds. The
+                // header is only actually checked once something reads the
+                // schema, e.g. `PRAGMA page_count`. So both `Connection::open`
+                // and `page_count()` must be treated as "is this a real
+                // database" checks for a corrupt/non-database file to be
+                // skipped here rather than silently listed as a bogus
+                // zero-page database.
+                let opened = Connection::open(&path, ffi::SQLITE_OPEN_READONLY)
+                    .and_then(|conn| conn.page_count().map(|page_count| (conn, page_count)));
+
+                match opened {
+                    Ok((conn, page_count)) => {
                         let page_size = conn.page_size();
-                        let page_count = conn.page_count().unwrap_or(0);
                         let file_size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
                         list.push(DatabaseInfo {
@@ -494,6 +506,20 @@ impl DatabaseEngine {
                             file_size_bytes,
                             journal_mode: "wal".into(),
                         });
+                    }
+                    Err(crate::error::SyncError::Sqlite { code, .. })
+                        if code == ffi::SQLITE_BUSY || code == ffi::SQLITE_LOCKED =>
+                    {
+                        tracing::warn!(
+                            database = %rel_name,
+                            sqlite_code = code,
+                            "database temporarily locked while listing — re-add on next tick"
+                        );
+                        // Don't silently omit: propagate so the caller knows
+                        // the listing is incomplete.
+                        return Err(crate::error::SyncError::Busy(format!(
+                            "database '{rel_name}' is temporarily locked (SQLITE code {code})"
+                        )));
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -600,6 +626,7 @@ fn map_decltype_to_proto(decltype: &str) -> ColumnType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::rsqlite::v1::Parameters;
     use tempfile::tempdir;
 
     #[test]
@@ -650,5 +677,509 @@ mod tests {
         let dbs_after = engine.list_databases().unwrap();
         let db_names_after: Vec<&str> = dbs_after.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(db_names_after, vec!["root.db"]);
+    }
+
+    // ── resolve_db_path ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_db_path_rejects_empty_name() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        let err = engine.resolve_db_path("   ").unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_rejects_path_traversal_and_absolute() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        let err = engine.resolve_db_path("../escape.db").unwrap_err();
+        assert!(err.to_string().contains("path traversal not permitted"));
+
+        let err = engine.resolve_db_path("./current.db").unwrap_err();
+        assert!(err.to_string().contains("path traversal not permitted"));
+
+        #[cfg(unix)]
+        {
+            let err = engine.resolve_db_path("/etc/evil.db").unwrap_err();
+            assert!(err.to_string().contains("path traversal not permitted"));
+        }
+    }
+
+    #[test]
+    fn test_resolve_db_path_creates_nested_parent_dirs() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        let resolved = engine.resolve_db_path("a/b/c.db").unwrap();
+        assert_eq!(resolved, dir.path().join("a/b/c.db"));
+        assert!(resolved.parent().unwrap().is_dir());
+    }
+
+    // ── execute / query / bind_parameters ──────────────────────────────────
+
+    #[test]
+    fn test_execute_and_query_with_positional_and_named_parameters() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute(
+                "app.db",
+                &Statement {
+                    sql: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, blob_col BLOB, note TEXT);".to_string(),
+                    parameters: None,
+                },
+                1,
+            )
+            .unwrap();
+
+        // Positional parameters, including a blob and a null.
+        let insert_positional = Statement {
+            sql: "INSERT INTO items (name, price, blob_col, note) VALUES (?, ?, ?, ?);".to_string(),
+            parameters: Some(Parameters {
+                positional: vec![
+                    Value { value: Some(ProtoValueInner::TextValue("widget".to_string())) },
+                    Value { value: Some(ProtoValueInner::FloatValue(9.99)) },
+                    Value { value: Some(ProtoValueInner::BlobValue(vec![1, 2, 3])) },
+                    Value { value: None },
+                ],
+                named: vec![],
+            }),
+        };
+        let resp = engine.execute("app.db", &insert_positional, 7).unwrap();
+        assert_eq!(resp.rows_affected, 1);
+        assert_eq!(resp.last_insert_rowid, 1);
+        assert_eq!(resp.generation, 7);
+
+        // Named parameters, successfully resolved.
+        let insert_named = Statement {
+            sql: "INSERT INTO items (name, price, blob_col, note) VALUES (:name, :price, :blob, :note);".to_string(),
+            parameters: Some(Parameters {
+                positional: vec![],
+                named: vec![
+                    NamedParameter {
+                        name: ":name".to_string(),
+                        value: Some(Value { value: Some(ProtoValueInner::TextValue("gadget".to_string())) }),
+                    },
+                    NamedParameter {
+                        name: ":price".to_string(),
+                        value: Some(Value { value: Some(ProtoValueInner::IntValue(5)) }),
+                    },
+                    NamedParameter {
+                        name: ":blob".to_string(),
+                        value: Some(Value { value: Some(ProtoValueInner::NullValue(true)) }),
+                    },
+                    NamedParameter {
+                        name: ":note".to_string(),
+                        value: Some(Value { value: None }),
+                    },
+                ],
+            }),
+        };
+        engine.execute("app.db", &insert_named, 1).unwrap();
+
+        let query_stmt = Statement {
+            sql: "SELECT id, name, price, blob_col, note FROM items ORDER BY id;".to_string(),
+            parameters: None,
+        };
+        let resp = engine.query("app.db", &query_stmt, 0, 3, true).unwrap();
+        assert_eq!(resp.total_rows, 2);
+        assert!(resp.is_replica_read);
+        assert_eq!(resp.generation, 3);
+        assert_eq!(resp.columns[0].column_type, ColumnType::Integer as i32);
+        assert_eq!(resp.columns[1].column_type, ColumnType::Text as i32);
+        assert_eq!(resp.columns[2].column_type, ColumnType::Float as i32);
+        assert_eq!(resp.columns[3].column_type, ColumnType::Blob as i32);
+
+        // First row: blob_col carries the bound blob, note is NULL (bound as `None`).
+        let first_row = &resp.rows[0];
+        assert!(matches!(first_row.values[3].value, Some(ProtoValueInner::BlobValue(_))));
+        assert!(matches!(first_row.values[4].value, Some(ProtoValueInner::NullValue(_))));
+    }
+
+    #[test]
+    fn test_execute_named_parameter_not_found_errors() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute(
+                "app.db",
+                &Statement { sql: "CREATE TABLE t (id INTEGER, v TEXT);".to_string(), parameters: None },
+                1,
+            )
+            .unwrap();
+
+        let stmt = Statement {
+            sql: "INSERT INTO t (id, v) VALUES (:id, :v);".to_string(),
+            parameters: Some(Parameters {
+                positional: vec![],
+                named: vec![NamedParameter {
+                    name: ":missing".to_string(),
+                    value: Some(Value { value: Some(ProtoValueInner::IntValue(1)) }),
+                }],
+            }),
+        };
+
+        let err = engine.execute("app.db", &stmt, 1).unwrap_err();
+        assert!(err.to_string().contains("not found in prepared statement"));
+    }
+
+    #[test]
+    fn test_query_respects_max_rows_limit() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(), parameters: None }, 1)
+            .unwrap();
+        for _ in 0..5 {
+            engine
+                .execute("app.db", &Statement { sql: "INSERT INTO t DEFAULT VALUES;".to_string(), parameters: None }, 1)
+                .unwrap();
+        }
+
+        let resp = engine
+            .query("app.db", &Statement { sql: "SELECT id FROM t ORDER BY id;".to_string(), parameters: None }, 2, 1, false)
+            .unwrap();
+        assert_eq!(resp.total_rows, 2);
+        assert_eq!(resp.rows.len(), 2);
+    }
+
+    // ── stream_query_chunks ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_stream_query_chunks_splits_into_multiple_chunks() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(), parameters: None }, 1)
+            .unwrap();
+        for _ in 0..5 {
+            engine
+                .execute("app.db", &Statement { sql: "INSERT INTO t DEFAULT VALUES;".to_string(), parameters: None }, 1)
+                .unwrap();
+        }
+
+        let chunks = engine
+            .stream_query_chunks("app.db", &Statement { sql: "SELECT id FROM t ORDER BY id;".to_string(), parameters: None }, 0, 2)
+            .unwrap();
+
+        // 5 rows with chunk_size 2 -> [2, 2, 1] rows across 3 chunks.
+        assert_eq!(chunks.len(), 3);
+        assert!(!chunks[0].columns.is_empty(), "first chunk should carry column headers");
+        assert!(chunks[1].columns.is_empty(), "later chunks should not repeat column headers");
+        assert!(chunks[2].columns.is_empty());
+        assert!(!chunks[0].is_last);
+        assert!(!chunks[1].is_last);
+        assert!(chunks[2].is_last);
+        assert_eq!(chunks[2].rows.len(), 1);
+        assert_eq!(chunks[2].total_rows, 5);
+    }
+
+    #[test]
+    fn test_stream_query_chunks_respects_max_rows() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(), parameters: None }, 1)
+            .unwrap();
+        for _ in 0..10 {
+            engine
+                .execute("app.db", &Statement { sql: "INSERT INTO t DEFAULT VALUES;".to_string(), parameters: None }, 1)
+                .unwrap();
+        }
+
+        // chunk_size is never reached (10), so only the max_rows cutoff (3) governs.
+        let chunks = engine
+            .stream_query_chunks("app.db", &Statement { sql: "SELECT id FROM t ORDER BY id;".to_string(), parameters: None }, 3, 10)
+            .unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_last);
+        assert_eq!(chunks[0].total_rows, 3);
+        assert_eq!(chunks[0].rows.len(), 3);
+        assert!(!chunks[0].columns.is_empty());
+    }
+
+    // ── batch ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_batch_commits_across_transaction_modes() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        for (mode, val) in [
+            (BatchTransactionMode::None, "none"),
+            (BatchTransactionMode::Deferred, "deferred"),
+            (BatchTransactionMode::Immediate, "immediate"),
+            (BatchTransactionMode::Exclusive, "exclusive"),
+        ] {
+            let stmts = vec![Statement { sql: format!("INSERT INTO t (v) VALUES ('{val}');"), parameters: None }];
+            let resp = engine.batch("app.db", &stmts, mode, true, 9).unwrap();
+            assert!(resp.committed, "mode {mode:?} should commit");
+            assert_eq!(resp.results.len(), 1);
+            assert_eq!(resp.generation, 9);
+        }
+
+        let count = engine
+            .query("app.db", &Statement { sql: "SELECT COUNT(*) FROM t;".to_string(), parameters: None }, 0, 1, false)
+            .unwrap();
+        assert_eq!(count.rows[0].values[0].value, Some(ProtoValueInner::IntValue(4)));
+    }
+
+    #[test]
+    fn test_batch_stop_on_error_true_halts_on_prepare_error() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        let stmts = vec![
+            Statement { sql: "NOT VALID SQL".to_string(), parameters: None },
+            Statement { sql: "INSERT INTO t (v) VALUES ('after');".to_string(), parameters: None },
+        ];
+        let resp = engine.batch("app.db", &stmts, BatchTransactionMode::Deferred, true, 1).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert!(!resp.results[0].error.is_empty());
+        assert!(!resp.committed);
+
+        let count = engine
+            .query("app.db", &Statement { sql: "SELECT COUNT(*) FROM t;".to_string(), parameters: None }, 0, 1, false)
+            .unwrap();
+        assert_eq!(count.rows[0].values[0].value, Some(ProtoValueInner::IntValue(0)));
+    }
+
+    #[test]
+    fn test_batch_continues_past_prepare_error_when_stop_on_error_false() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        let stmts = vec![
+            Statement { sql: "INSERT INTO t (v) VALUES ('first');".to_string(), parameters: None },
+            Statement { sql: "NOT VALID SQL".to_string(), parameters: None },
+            Statement { sql: "INSERT INTO t (v) VALUES ('third');".to_string(), parameters: None },
+        ];
+        let resp = engine.batch("app.db", &stmts, BatchTransactionMode::None, false, 1).unwrap();
+        assert_eq!(resp.results.len(), 3);
+        assert!(resp.results[0].error.is_empty());
+        assert!(!resp.results[1].error.is_empty());
+        assert!(resp.results[2].error.is_empty());
+        // BatchTransactionMode::None never opens a transaction, so `committed`
+        // just reflects whether any statement failed.
+        assert!(!resp.committed);
+
+        let count = engine
+            .query("app.db", &Statement { sql: "SELECT COUNT(*) FROM t;".to_string(), parameters: None }, 0, 1, false)
+            .unwrap();
+        assert_eq!(count.rows[0].values[0].value, Some(ProtoValueInner::IntValue(2)));
+    }
+
+    #[test]
+    fn test_batch_bind_error_stop_on_error_variants() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        let bad_bind = Statement {
+            sql: "INSERT INTO t (v) VALUES (:v);".to_string(),
+            parameters: Some(Parameters {
+                positional: vec![],
+                named: vec![NamedParameter {
+                    name: ":missing".to_string(),
+                    value: Some(Value { value: Some(ProtoValueInner::TextValue("x".to_string())) }),
+                }],
+            }),
+        };
+        let stmts = vec![bad_bind, Statement { sql: "INSERT INTO t (v) VALUES ('after');".to_string(), parameters: None }];
+
+        let resp = engine.batch("app.db", &stmts, BatchTransactionMode::Deferred, true, 1).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert!(resp.results[0].error.contains("not found in prepared statement"));
+        assert!(!resp.committed);
+
+        let resp2 = engine.batch("app.db", &stmts, BatchTransactionMode::Deferred, false, 1).unwrap();
+        assert_eq!(resp2.results.len(), 2);
+        assert!(resp2.results[0].error.contains("not found in prepared statement"));
+        assert!(resp2.results[1].error.is_empty());
+    }
+
+    #[test]
+    fn test_batch_write_step_error_stop_on_error_variants() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE);".to_string(), parameters: None }, 1)
+            .unwrap();
+        engine
+            .execute("app.db", &Statement { sql: "INSERT INTO t (v) VALUES ('dup');".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        let stmts = vec![
+            Statement { sql: "INSERT INTO t (v) VALUES ('dup');".to_string(), parameters: None },
+            Statement { sql: "INSERT INTO t (v) VALUES ('unique-2');".to_string(), parameters: None },
+        ];
+
+        let resp = engine.batch("app.db", &stmts, BatchTransactionMode::Immediate, true, 1).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert!(!resp.results[0].error.is_empty());
+        assert!(!resp.committed);
+
+        let resp2 = engine.batch("app.db", &stmts, BatchTransactionMode::Immediate, false, 1).unwrap();
+        assert_eq!(resp2.results.len(), 2);
+        assert!(!resp2.results[0].error.is_empty());
+        assert!(resp2.results[1].error.is_empty());
+    }
+
+    // ── drop_database ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_drop_database_removes_existing_and_tolerates_missing_sidecars() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        let db_path = engine.resolve_db_path("app.db").unwrap();
+        // Only the WAL sidecar is present; -shm and -journal are absent and
+        // must be tolerated (NotFound).
+        fs::write(format!("{}-wal", db_path.display()), b"wal-bytes").unwrap();
+
+        let existed = engine.drop_database("app.db").unwrap();
+        assert!(existed);
+        assert!(!db_path.exists());
+        assert!(!Path::new(&format!("{}-wal", db_path.display())).exists());
+
+        // Dropping again: the primary file is now missing too, so every
+        // removal hits the tolerated NotFound branch.
+        let existed_again = engine.drop_database("app.db").unwrap();
+        assert!(!existed_again);
+    }
+
+    #[test]
+    fn test_drop_database_propagates_non_notfound_errors() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("app.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        let db_path = engine.resolve_db_path("app.db").unwrap();
+        let wal_path = format!("{}-wal", db_path.display());
+        // Replace the WAL sidecar with a directory so `fs::remove_file` fails
+        // with a non-NotFound error, exercising the propagation branch.
+        let _ = fs::remove_file(&wal_path);
+        fs::create_dir(&wal_path).unwrap();
+
+        let result = engine.drop_database("app.db");
+        assert!(result.is_err());
+    }
+
+    // ── list_databases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_databases_returns_empty_when_data_dir_missing() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        fs::remove_dir_all(dir.path()).unwrap();
+
+        let dbs = engine.list_databases().unwrap();
+        assert!(dbs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_list_databases_skips_unreadable_database_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        engine
+            .execute("good.db", &Statement { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(), parameters: None }, 1)
+            .unwrap();
+
+        // A file SQLite cannot open at all (permission denied at the OS
+        // level) is skipped (with a warning) rather than aborting the whole
+        // listing. Merely malformed *content* is not enough to reproduce
+        // this: SQLite's `PRAGMA page_size` (used by `Connection::open`)
+        // defers full header validation past open, so only a hard OS-level
+        // failure reliably reaches the `Err` branch in `collect_databases`.
+        let bad_path = dir.path().join("bad.db");
+        fs::write(&bad_path, b"not a sqlite database").unwrap();
+        fs::set_permissions(&bad_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let dbs = engine.list_databases().unwrap();
+        let names: Vec<&str> = dbs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["good.db"]);
+    }
+
+    // ── value / decltype mapping helpers ─────────────────────────────────────
+
+    #[test]
+    fn test_map_decltype_to_proto_all_branches() {
+        assert_eq!(map_decltype_to_proto("INTEGER"), ColumnType::Integer);
+        assert_eq!(map_decltype_to_proto("VARCHAR(32)"), ColumnType::Text);
+        assert_eq!(map_decltype_to_proto("TEXT"), ColumnType::Text);
+        assert_eq!(map_decltype_to_proto("CLOB"), ColumnType::Text);
+        assert_eq!(map_decltype_to_proto("BLOB"), ColumnType::Blob);
+        assert_eq!(map_decltype_to_proto("REAL"), ColumnType::Float);
+        assert_eq!(map_decltype_to_proto("FLOAT"), ColumnType::Float);
+        assert_eq!(map_decltype_to_proto("DOUBLE"), ColumnType::Float);
+        assert_eq!(map_decltype_to_proto(""), ColumnType::Unspecified);
+    }
+
+    #[test]
+    fn test_sql_value_to_proto_all_variants() {
+        assert_eq!(sql_value_to_proto(SqlValue::Null).value, Some(ProtoValueInner::NullValue(true)));
+        assert_eq!(sql_value_to_proto(SqlValue::Integer(42)).value, Some(ProtoValueInner::IntValue(42)));
+        assert_eq!(sql_value_to_proto(SqlValue::Float(1.5)).value, Some(ProtoValueInner::FloatValue(1.5)));
+        assert_eq!(
+            sql_value_to_proto(SqlValue::Text("hi".to_string())).value,
+            Some(ProtoValueInner::TextValue("hi".to_string()))
+        );
+        assert_eq!(
+            sql_value_to_proto(SqlValue::Blob(vec![1, 2, 3])).value,
+            Some(ProtoValueInner::BlobValue(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn test_proto_value_to_sql_all_variants() {
+        assert_eq!(proto_value_to_sql(&Value { value: None }), SqlValue::Null);
+        assert_eq!(proto_value_to_sql(&Value { value: Some(ProtoValueInner::NullValue(true)) }), SqlValue::Null);
+        assert_eq!(proto_value_to_sql(&Value { value: Some(ProtoValueInner::IntValue(7)) }), SqlValue::Integer(7));
+        assert_eq!(proto_value_to_sql(&Value { value: Some(ProtoValueInner::FloatValue(2.5)) }), SqlValue::Float(2.5));
+        assert_eq!(
+            proto_value_to_sql(&Value { value: Some(ProtoValueInner::TextValue("x".to_string())) }),
+            SqlValue::Text("x".to_string())
+        );
+        assert_eq!(
+            proto_value_to_sql(&Value { value: Some(ProtoValueInner::BlobValue(vec![9, 8])) }),
+            SqlValue::Blob(vec![9, 8])
+        );
     }
 }

@@ -252,11 +252,42 @@ data:
     # docs/k3s-ha-runbook.md. Override this whole command for a real
     # transport/auth model; this exists to make the reference manifest
     # actually replicate data out of the box.
+    role_file="${ROLE_STATE_FILE:-/var/run/rsqlite-rsync/role_state.txt}"
     lease_name="${LEASE_NAME:-sqlite-writer-lease}"
     data_dir="${DATA_DIR:-/var/lib/sqlite}"
     ssh_key="${SSH_KEY_PATH:-/etc/rsqlite-ssh/id_ed25519}"
     ssh_user="${SSH_USER:-rsqlite}"
     ssh_port="${SSH_PORT:-2222}"
+
+    is_writer_or_promoted() {
+      if [ -f "$role_file" ]; then
+        role="$(cat "$role_file" 2>/dev/null || true)"
+        case "$role" in
+          writer:*) return 0 ;;
+        esac
+      fi
+      current_holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+      if [ -n "$current_holder" ] && [ "$current_holder" = "$POD_NAME" ]; then
+        return 0
+      fi
+      return 1
+    }
+
+    is_on_writer() {
+      target_name="$1"
+      if [ -z "$remote_dbs" ]; then
+        return 1
+      fi
+      while IFS= read -r remote_path; do
+        [ -n "$remote_path" ] || continue
+        if [ "$(basename "$remote_path")" = "$target_name" ]; then
+          return 0
+        fi
+      done <<EOF
+$remote_dbs
+EOF
+      return 1
+    }
 
     holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
     if [ -z "$holder" ] || [ "$holder" = "$POD_NAME" ]; then
@@ -277,32 +308,68 @@ data:
       echo "default-replica-sync: failed to reach ${writer_host} over ssh" >&2
       exit 1
     fi
-    [ -z "$remote_dbs" ] && exit 0
-
-    # Every file is still attempted even if one fails (a transient failure
-    # on one database shouldn't stall the others), but any failure makes the
-    # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
-    # sync as fresh -- an incomplete sync must not look complete to the
-    # freshness ledger that failover promotion decisions read.
+    # When the writer has zero databases, remote_dbs is empty -- skip
+    # the sync loop but still run the stale-file cleanup below so that
+    # dropping the last database propagates to replicas too.
     sync_failed=0
-    for remote_path in $remote_dbs; do
-      name="$(basename "$remote_path")"
-      # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
-      # src/transport/ssh.rs), so each one needs the combined -oKey=Value
-      # form rather than a bare Key=Value -- and clap rejects a
-      # hyphen-looking value passed as a separate token unless given as
-      # --flag=value (no space), since it otherwise looks like an
-      # unrecognized flag of its own.
-      if ! rsqlite-rsync \
-        --ssh-opt="-oIdentityFile=${ssh_key}" \
-        --ssh-opt="-oStrictHostKeyChecking=no" \
-        --ssh-opt="-oUserKnownHostsFile=/dev/null" \
-        --ssh-opt="-oPort=${ssh_port}" \
-        --ssh-connect-timeout 5 \
-        "${ssh_user}@${writer_host}:${remote_path}" \
-        "${data_dir}/${name}"; then
-        echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
-        sync_failed=1
+    if [ -n "$remote_dbs" ]; then
+      # Every file is still attempted even if one fails (a transient failure
+      # on one database shouldn't stall the others), but any failure makes the
+      # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
+      # sync as fresh -- an incomplete sync must not look complete to the
+      # freshness ledger that failover promotion decisions read.
+      while IFS= read -r remote_path; do
+        [ -n "$remote_path" ] || continue
+        name="$(basename "$remote_path")"
+        # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
+        # src/transport/ssh.rs), so each one needs the combined -oKey=Value
+        # form rather than a bare Key=Value -- and clap rejects a
+        # hyphen-looking value passed as a separate token unless given as
+        # --flag=value (no space), since it otherwise looks like an
+        # unrecognized flag of its own.
+        if ! rsqlite-rsync \
+          --ssh-opt="-oIdentityFile=${ssh_key}" \
+          --ssh-opt="-oStrictHostKeyChecking=no" \
+          --ssh-opt="-oUserKnownHostsFile=/dev/null" \
+          --ssh-opt="-oPort=${ssh_port}" \
+          --ssh-connect-timeout 5 \
+          "${ssh_user}@${writer_host}:${remote_path}" \
+          "${data_dir}/${name}"; then
+          echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
+          sync_failed=1
+        fi
+      done <<EOF
+$remote_dbs
+EOF
+    fi
+
+    # ── Remove local databases the writer no longer has ──────────────
+    # Build a set of basenames the writer currently serves, then delete
+    # any local .db (+ sidecars) not in that set.  We only reach here
+    # after a successful SSH listing (the `if ! remote_dbs=...` guard
+    # above exits 1 on connectivity failure), so remote_dbs is the
+    # authoritative source of truth -- including the empty-set case
+    # when the writer has dropped all databases.
+    #
+    # Re-check the pod's role before deleting: if this pod was promoted
+    # to writer between the listing above and now, removing databases
+    # would destroy production data.
+    if is_writer_or_promoted; then
+      echo "default-replica-sync: pod is now writer — skipping stale-file cleanup" >&2
+      exit "$sync_failed"
+    fi
+    for local_path in "${data_dir}"/*.db; do
+      [ -e "$local_path" ] || continue          # glob didn't match
+      local_name="$(basename "$local_path")"
+      if ! is_on_writer "$local_name"; then
+        if is_writer_or_promoted; then
+          echo "default-replica-sync: pod is now writer — aborting stale-file cleanup" >&2
+          exit "$sync_failed"
+        fi
+        for suffix in "" "-wal" "-shm" "-journal"; do
+          rm -f "${data_dir}/${local_name}${suffix}"
+        done
+        echo "default-replica-sync: removed stale ${local_name} (no longer on writer)" >&2
       fi
     done
 
