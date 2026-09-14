@@ -353,21 +353,21 @@ containers:
 2. Other pods operate as replicas, continuously syncing from the writer
 3. Clients route traffic to the writer via leader discovery, Kubernetes Lease lookup, or automatic `NOT_LEADER` redirection
 
-### When Writer Pod Dies
+### When Writer Dies or Fails
 
 1. Lease expires (no renewal from dead writer)
-2. Another pod detects lease availability
-3. That pod checks its freshness ledger against configured thresholds
+2. Another node detects lease availability
+3. That node checks its freshness ledger against configured thresholds
 4. If fresh enough, promotes to writer (`writer:N`)
 5. HTTP `/ready` endpoint transitions to 200 OK and RPC write fence permits writes
-6. Node starts renewing lease (via sidecar)
+6. Node starts renewing lease (via lease-updater sidecar in Kubernetes mode, or external lease manager in file mode)
 
 ### When Network Partitions Writer
 
-1. Writer can't renew lease (loss of Kubernetes API or storage access)
-2. Lease expires from perspective of other pods
+1. Writer can't renew lease (loss of Kubernetes API in k8s mode, or storage/network partition in file mode)
+2. Lease expires from perspective of other nodes
 3. Writer demotes itself after TTL expires (fail-safe fencing)
-4. Another healthy pod promotes to writer
+4. Another healthy node promotes to writer
 5. Old writer rejoins, sees newer generation, and transitions to replica
 
 ### Promotion Denied Cases

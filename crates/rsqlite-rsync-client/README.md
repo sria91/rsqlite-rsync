@@ -4,7 +4,7 @@ Async gRPC client for the [rsqlite-rsync](https://github.com/sria91/rsqlite-rsyn
 HA SQL Gateway, with leader discovery, bearer authentication, and transparent failover.
 
 This crate is deliberately lean: it depends only on `tonic`, a slim `tokio`,
-and the generated wire types in `rsqlite-rsync-proto` — **no SQLite C FFI, no HA
+`async-trait`, `thiserror`, and the generated wire types in `rsqlite-rsync-proto` — **no SQLite C FFI, no HA
 controller, no CLI dependencies** — so any Rust service can add it as a
 lightweight dependency to interact with an rsqlite-rsync HA cluster.
 
@@ -14,8 +14,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsqlite-rsync-client = { path = "crates/rsqlite-rsync-client" } # or from crates.io / git
+rsqlite-rsync-client = { path = "crates/rsqlite-rsync-client" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1" # required if implementing a custom LeaderResolver
 ```
 
 ## Quickstart
@@ -170,7 +171,7 @@ while let Some(chunk) = stream.message().await? {
 ```
 
 ### 4. Transactional Batches (`batch`)
-Executes multiple statements within a single atomic transaction.
+Executes multiple statements with an optional transaction. Statements are executed atomically within a single transaction when using `Deferred`, `Immediate`, or `Exclusive` mode. Selecting `BatchTransactionMode::None` executes statements individually in autocommit mode without a transaction.
 
 ```rust
 use rsqlite_rsync_client::proto::{BatchTransactionMode, Statement};
@@ -184,7 +185,7 @@ let batch_res = client
     .batch(
         "app.db",
         stmts,
-        BatchTransactionMode::Immediate, // Deferred, Immediate, Exclusive, or None
+        BatchTransactionMode::Immediate, // Deferred, Immediate, Exclusive, or None (autocommit)
         true,                            // stop_on_error
     )
     .await?;
@@ -194,7 +195,7 @@ let batch_res = client
 ```rust
 // Inspect cluster role, lease holder, and active generation
 let status = client.get_cluster_status().await?;
-println!("Current role: {:?}, generation: {}", status.role(), status.generation);
+println!("Current role: {:?}, generation: {}", status.role(), status.local_generation);
 
 // Drop database and associated WAL/SHM sidecars
 let drop_res = client.drop_database("temp.db").await?;
@@ -204,5 +205,6 @@ println!("Database dropped: {}", drop_res.existed);
 ## Failover and Retry Semantics
 
 - **Writes (`execute`, `batch`)**: Automatically retried **only** on a definitive `NOT_LEADER` response (following the leader redirect metadata). Ambiguous network failures (`Unavailable`, `DeadlineExceeded`) are **not** retried blindly, preventing duplicate executions of non-idempotent statements.
-- **Reads (`query`, `get_cluster_status`, `drop_database`)**: Safe and idempotent; automatically retried across transient network drops, deadline timeouts, and leader transitions.
+- **Reads (`query`, `get_cluster_status`)**: Safe and idempotent; automatically retried across transient network drops, deadline timeouts, and leader transitions.
+- **Database management (`drop_database`)**: Deletes the database file and its associated WAL/SHM sidecars. Treated as idempotent (an absent database returns `existed: false`). Automatically retried across transient network drops (`Unavailable`, `DeadlineExceeded`) and leader transitions (`NOT_LEADER`).
 - **Streams (`stream_query`)**: The initial call establishing the stream is retried. Once streaming begins, mid-stream disconnections are surfaced directly to the caller.
