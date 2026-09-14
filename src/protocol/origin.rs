@@ -187,6 +187,7 @@ pub async fn run_with_tuning(
             );
             (version, page_size, page_count)
         }
+        Message::Error { message } => return Err(crate::error::SyncError::Protocol(message)),
         other => {
             return Err(
                 protocol_violation(transport, format!("expected Hello, got {other:?}")).await,
@@ -241,6 +242,7 @@ pub async fn run_with_tuning(
             first_group,
             hashes,
         } => (first_group, hashes),
+        Message::Error { message } => return Err(crate::error::SyncError::Protocol(message)),
         other => {
             return Err(protocol_violation(
                 transport,
@@ -372,6 +374,7 @@ pub async fn run_with_tuning(
                 )
                 .await);
             }
+            Message::Error { message } => return Err(crate::error::SyncError::Protocol(message)),
             other => {
                 return Err(protocol_violation(
                     transport,
@@ -473,6 +476,7 @@ pub async fn run_with_tuning(
                     };
                 }
             }
+            Message::Error { message } => return Err(crate::error::SyncError::Protocol(message)),
             other => {
                 return Err(protocol_violation(
                     transport,
@@ -1029,7 +1033,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fine_pass_rejects_unexpected_message() {
+    async fn handshake_propagates_replica_error_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 2);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let mut transport = MockTransport::new(vec![Message::Error {
+            message: "replica error during handshake".into(),
+        }]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message == "replica error during handshake"
+        ));
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_propagates_replica_error_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 8);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 8,
+            },
+            Message::Error {
+                message: "replica failed during coarse pass".into(),
+            },
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message == "replica failed during coarse pass"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fine_pass_propagates_replica_error_message() {
         let file = NamedTempFile::new().unwrap();
         let conn = open_rw(file.path());
         seed_to_page_count(&conn, 8);
@@ -1049,6 +1100,74 @@ mod tests {
             },
             Message::Error {
                 message: "replica gave up".into(),
+            },
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message == "replica gave up"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fine_pass_ack_propagates_replica_error_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 8);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 0,
+            },
+            Message::GroupHashes {
+                first_group: 0,
+                hashes: vec![[1u8; 32]],
+            },
+            Message::PageHashes {
+                page_nos: vec![].into(),
+                hashes: vec![].into(),
+            },
+            Message::Error {
+                message: "replica failed writing page".into(),
+            },
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message == "replica failed writing page"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fine_pass_rejects_unexpected_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 8);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 8,
+            },
+            Message::GroupHashes {
+                first_group: 0,
+                hashes: vec![[1u8; 32]],
+            },
+            Message::GroupsNeedFine {
+                group_indices: vec![0],
             },
         ]);
 

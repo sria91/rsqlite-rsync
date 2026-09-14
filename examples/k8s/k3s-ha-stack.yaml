@@ -252,11 +252,42 @@ data:
     # docs/k3s-ha-runbook.md. Override this whole command for a real
     # transport/auth model; this exists to make the reference manifest
     # actually replicate data out of the box.
+    role_file="${ROLE_STATE_FILE:-/var/run/rsqlite-rsync/role_state.txt}"
     lease_name="${LEASE_NAME:-sqlite-writer-lease}"
     data_dir="${DATA_DIR:-/var/lib/sqlite}"
     ssh_key="${SSH_KEY_PATH:-/etc/rsqlite-ssh/id_ed25519}"
     ssh_user="${SSH_USER:-rsqlite}"
     ssh_port="${SSH_PORT:-2222}"
+
+    is_writer_or_promoted() {
+      if [ -f "$role_file" ]; then
+        role="$(cat "$role_file" 2>/dev/null || true)"
+        case "$role" in
+          writer:*) return 0 ;;
+        esac
+      fi
+      current_holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+      if [ -n "$current_holder" ] && [ "$current_holder" = "$POD_NAME" ]; then
+        return 0
+      fi
+      return 1
+    }
+
+    is_on_writer() {
+      target_name="$1"
+      if [ -z "$remote_dbs" ]; then
+        return 1
+      fi
+      while IFS= read -r remote_path; do
+        [ -n "$remote_path" ] || continue
+        if [ "$(basename "$remote_path")" = "$target_name" ]; then
+          return 0
+        fi
+      done <<EOF
+$remote_dbs
+EOF
+      return 1
+    }
 
     holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
     if [ -z "$holder" ] || [ "$holder" = "$POD_NAME" ]; then
@@ -287,7 +318,7 @@ data:
       # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
       # sync as fresh -- an incomplete sync must not look complete to the
       # freshness ledger that failover promotion decisions read.
-      echo "$remote_dbs" | while IFS= read -r remote_path; do
+      while IFS= read -r remote_path; do
         [ -n "$remote_path" ] || continue
         name="$(basename "$remote_path")"
         # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
@@ -307,7 +338,9 @@ data:
           echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
           sync_failed=1
         fi
-      done
+      done <<EOF
+$remote_dbs
+EOF
     fi
 
     # ── Remove local databases the writer no longer has ──────────────
@@ -321,22 +354,18 @@ data:
     # Re-check the pod's role before deleting: if this pod was promoted
     # to writer between the listing above and now, removing databases
     # would destroy production data.
-    if [ -f /data/role_state.txt ] && grep -q "WRITER" /data/role_state.txt; then
+    if is_writer_or_promoted; then
       echo "default-replica-sync: pod is now writer — skipping stale-file cleanup" >&2
       exit "$sync_failed"
     fi
     for local_path in "${data_dir}"/*.db; do
       [ -e "$local_path" ] || continue          # glob didn't match
       local_name="$(basename "$local_path")"
-      found=0
-      echo "$remote_dbs" | while IFS= read -r remote_path; do
-        [ -n "$remote_path" ] || continue
-        if [ "$(basename "$remote_path")" = "$local_name" ]; then
-          found=1
-          break
+      if ! is_on_writer "$local_name"; then
+        if is_writer_or_promoted; then
+          echo "default-replica-sync: pod is now writer — aborting stale-file cleanup" >&2
+          exit "$sync_failed"
         fi
-      done
-      if [ "$found" = "0" ]; then
         for suffix in "" "-wal" "-shm" "-journal"; do
           rm -f "${data_dir}/${local_name}${suffix}"
         done
