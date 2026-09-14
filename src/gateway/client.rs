@@ -174,8 +174,7 @@ impl Client {
                 let engine = engine.clone();
                 let databases = tokio::task::spawn_blocking(move || engine.list_databases())
                     .await
-                    .map_err(|e| SyncError::Protocol(format!("task join error: {e}")))?
-                    .unwrap_or_default();
+                    .map_err(|e| SyncError::Protocol(format!("task join error: {e}")))??;
                 Ok(ClusterStatusResponse {
                     node_id: "standalone-edge".to_string(),
                     role: NodeRole::Writer as i32,

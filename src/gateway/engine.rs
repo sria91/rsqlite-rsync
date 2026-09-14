@@ -62,8 +62,9 @@ impl DatabaseEngine {
     }
 
     fn get_db_lock(&self, db_name: &str) -> Arc<Mutex<()>> {
+        let trimmed = db_name.trim();
         let mut map = self.db_mutexes.lock().unwrap();
-        map.entry(db_name.to_string())
+        map.entry(trimmed.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
@@ -438,31 +439,47 @@ impl DatabaseEngine {
             }
         }
 
-        self.db_mutexes.lock().unwrap().remove(db_name);
+        self.db_mutexes.lock().unwrap().remove(db_name.trim());
         Ok(existed)
     }
 
-    /// Introspect all databases in the data directory.
+    /// Introspect all databases in the data directory recursively.
     pub fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
         let mut list = Vec::new();
         if !self.data_dir.exists() {
             return Ok(list);
         }
 
-        for entry in fs::read_dir(&self.data_dir)? {
+        self.collect_databases(&self.data_dir, &mut list)?;
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(list)
+    }
+
+    fn collect_databases(&self, dir: &Path, list: &mut Vec<DatabaseInfo>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() {
-                let name = path
+            if path.is_dir() {
+                self.collect_databases(&path, list)?;
+            } else if path.is_file() {
+                let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_string();
+                    .unwrap_or_default();
 
                 // Exclude journal/WAL files
-                if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
+                if file_name.ends_with("-wal")
+                    || file_name.ends_with("-shm")
+                    || file_name.ends_with("-journal")
+                {
                     continue;
                 }
+
+                let rel_name = path
+                    .strip_prefix(&self.data_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
 
                 match Connection::open(&path, ffi::SQLITE_OPEN_READONLY) {
                     Ok(conn) => {
@@ -471,7 +488,7 @@ impl DatabaseEngine {
                         let file_size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
                         list.push(DatabaseInfo {
-                            name,
+                            name: rel_name,
                             page_size,
                             page_count,
                             file_size_bytes,
@@ -480,7 +497,7 @@ impl DatabaseEngine {
                     }
                     Err(error) => {
                         tracing::warn!(
-                            database = %name,
+                            database = %rel_name,
                             error = %error,
                             "skipping unreadable database file while listing databases"
                         );
@@ -488,8 +505,7 @@ impl DatabaseEngine {
                 }
             }
         }
-
-        Ok(list)
+        Ok(())
     }
 }
 
@@ -578,5 +594,61 @@ fn map_decltype_to_proto(decltype: &str) -> ColumnType {
         ColumnType::Float
     } else {
         ColumnType::Unspecified
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_lock_normalization() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        let lock1 = engine.get_db_lock("test.db");
+        let lock2 = engine.get_db_lock("  test.db  \n");
+        assert!(Arc::ptr_eq(&lock1, &lock2));
+    }
+
+    #[test]
+    fn test_recursive_list_and_drop_databases() {
+        let dir = tempdir().unwrap();
+        let engine = DatabaseEngine::new(dir.path()).unwrap();
+
+        // Create root database
+        engine
+            .execute(
+                "root.db",
+                &Statement {
+                    sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(),
+                    parameters: None,
+                },
+                1,
+            )
+            .unwrap();
+
+        // Create nested database
+        engine
+            .execute(
+                "tenants/tenant1.db",
+                &Statement {
+                    sql: "CREATE TABLE t (id INTEGER PRIMARY KEY);".to_string(),
+                    parameters: None,
+                },
+                1,
+            )
+            .unwrap();
+
+        let dbs = engine.list_databases().unwrap();
+        let db_names: Vec<&str> = dbs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(db_names, vec!["root.db", "tenants/tenant1.db"]);
+
+        // Drop nested database with whitespace in name
+        assert!(engine.drop_database("  tenants/tenant1.db  ").unwrap());
+        let dbs_after = engine.list_databases().unwrap();
+        let db_names_after: Vec<&str> = dbs_after.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(db_names_after, vec!["root.db"]);
     }
 }

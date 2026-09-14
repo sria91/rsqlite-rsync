@@ -200,16 +200,16 @@ impl ClientConnectionArgs {
                 config: self.to_client_config(),
             }),
             CliRuntimeMode::Auto => {
-                if let Some(ref data_dir) = self.data_dir {
-                    Ok(ClientTarget::Local {
-                        data_dir: data_dir.clone(),
-                    })
-                } else if self.endpoint.is_some()
+                if self.endpoint.is_some()
                     || !self.endpoints.is_empty()
                     || self.kube_lease.is_some()
                 {
                     Ok(ClientTarget::Remote {
                         config: self.to_client_config(),
+                    })
+                } else if let Some(ref data_dir) = self.data_dir {
+                    Ok(ClientTarget::Local {
+                        data_dir: data_dir.clone(),
                     })
                 } else if let Ok(dir) = std::env::var("RSQLITE_DATA_DIR") {
                     if !dir.trim().is_empty()
@@ -1161,6 +1161,14 @@ mod tests {
         assert!(
             matches!(target, ClientTarget::Local { data_dir } if data_dir == Path::new("/var/data"))
         );
+
+        // Auto Mode with both endpoint and data_dir -> Remote takes precedence
+        let mut args_auto_both = default_test_args();
+        args_auto_both.mode = CliRuntimeMode::Auto;
+        args_auto_both.endpoint = Some("http://127.0.0.1:50051".to_string());
+        args_auto_both.data_dir = Some(PathBuf::from("/var/data"));
+        let target = args_auto_both.to_client_target().unwrap();
+        assert!(matches!(target, ClientTarget::Remote { .. }));
 
         // Explicit Cluster Mode with endpoint -> Remote
         let mut args_cluster = default_test_args();

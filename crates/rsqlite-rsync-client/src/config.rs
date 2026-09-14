@@ -31,7 +31,7 @@ pub enum RuntimeMode {
     /// Connect to a remote cluster SQL Gateway over gRPC.
     Cluster,
     /// Direct, in-process SQLite execution against a local data directory.
-    Standalone,
+    Local,
     /// Auto-detect based on provided options and environment variables.
     Auto,
 }
