@@ -428,25 +428,14 @@ Lease), `--token` (env `RSQLITE_TOKEN`; required when the gateway enforces
 authentication), `--max-retries`, `--timeout`. Output formatting: `--format
 <table|json|csv|tsv|raw>`.
 
-For embedding in another Rust service, the client is also published as a
-standalone crate,
-[`rsqlite-rsync-client`](crates/rsqlite-rsync-client), with no SQLite, HA, or CLI
-dependencies:
-
-```rust
-use rsqlite_rsync_client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SqlGatewayClient::new(
-        ClientConfig::new(DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()))
-            .with_auth_token(std::env::var("RSQLITE_TOKEN")?),
-    );
-    client.execute("app.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)", None).await?;
-    let rows = client.query("app.db", "SELECT * FROM t", None, 0, Default::default()).await?;
-    Ok(())
-}
-```
+`--endpoint`/`--endpoints`/`--kube-lease` work against any deployment,
+independent of which example manifest you used. The
+[`examples/k8s/k3s-ha-stack.yaml`](examples/k8s/k3s-ha-stack.yaml) reference
+deployment specifically also provisions a `sqlite-ha-writer` Service as an
+additional convenience — a label-updater sidecar tags the current writer's
+pod so the Service's selector finds it — but it's a routing hint, not a
+substitute for the mechanisms above: see [docs/k3s-ha-runbook.md](docs/k3s-ha-runbook.md#architecture)
+for why, and note it isn't present in the other example manifests.
 
 #### Standalone Edge vs. HA Cluster Execution
 
@@ -487,21 +476,36 @@ Mode resolution is evaluated dynamically at **runtime** without compile-time fea
      - If `--endpoint`, `--endpoints`, `--kube-lease`, `RSQLITE_ENDPOINT`, or `RSQLITE_ENDPOINTS` is specified, it selects **cluster mode**.
      - Otherwise falls back to default cluster discovery (`http://127.0.0.1:50051`).
 
-It retries on `NOT_LEADER` by following the redirect endpoint, and supports
-`DiscoveryMode::Candidates` (probe a fixed endpoint list for the writer) or a
-pluggable `DiscoveryMode::Custom` resolver (used by the CLI's Kubernetes Lease
-discovery). `with_auth_token` is only needed when the target gateway requires
+#### Rust Client Library (`rsqlite-rsync-client`)
+
+For embedding in another Rust service, the client is published as a
+standalone crate,
+[`rsqlite-rsync-client`](crates/rsqlite-rsync-client), with no SQLite C FFI, HA controller, or CLI
+dependencies:
+
+```rust
+use rsqlite_rsync_client::{ClientConfig, DiscoveryMode, SqlGatewayClient};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = SqlGatewayClient::new(
+        ClientConfig::new(DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()))
+            .with_auth_token(std::env::var("RSQLITE_TOKEN")?),
+    );
+    client.execute("app.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)", None).await?;
+    let rows = client.query("app.db", "SELECT * FROM t", None, 0, Default::default()).await?;
+    Ok(())
+}
+```
+
+The client automatically retries on `NOT_LEADER` by following the redirect endpoint returned in the response metadata. It supports multiple leader resolution strategies:
+- `DiscoveryMode::Direct("http://host:port")` — connects directly to a known endpoint.
+- `DiscoveryMode::Candidates(vec!["http://node-1:50051", ...])` — probes candidate endpoints to find the active writer.
+- `DiscoveryMode::Custom(Arc<dyn LeaderResolver>)` — pluggable resolver hook (used by the CLI for Kubernetes Lease discovery).
+
+`with_auth_token` is only needed when the target gateway requires
 authentication (the default — see [SQL Gateway and
 client](#sql-gateway-and-client)); omit it to send no `authorization` header.
-
-`--endpoint`/`--endpoints`/`--kube-lease` above work against any deployment,
-independent of which example manifest you used. The
-[`examples/k8s/k3s-ha-stack.yaml`](examples/k8s/k3s-ha-stack.yaml) reference
-deployment specifically also provisions a `sqlite-ha-writer` Service as an
-additional convenience — a label-updater sidecar tags the current writer's
-pod so the Service's selector finds it — but it's a routing hint, not a
-substitute for the mechanisms above: see [docs/k3s-ha-runbook.md](docs/k3s-ha-runbook.md#architecture)
-for why, and note it isn't present in the other example manifests.
 
 ### Security
 
