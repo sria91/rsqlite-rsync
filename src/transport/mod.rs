@@ -74,7 +74,7 @@ pub trait Transport: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::messages::{encode, Message, PROTOCOL_VERSION};
+    use crate::protocol::messages::{Message, PROTOCOL_VERSION, encode};
 
     #[test]
     fn framed_message_round_trip() {

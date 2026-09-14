@@ -137,5 +137,10 @@ fn bench_incremental_sync(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hashing, bench_local_sync, bench_incremental_sync);
+criterion_group!(
+    benches,
+    bench_hashing,
+    bench_local_sync,
+    bench_incremental_sync
+);
 criterion_main!(benches);

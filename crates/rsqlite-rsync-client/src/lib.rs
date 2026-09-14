@@ -47,7 +47,7 @@ mod discovery;
 mod error;
 
 pub use client::SqlGatewayClient;
-pub use config::ClientConfig;
+pub use config::{ClientConfig, ClientTarget, RuntimeMode};
 pub use discovery::{DiscoveryMode, LeaderResolver};
 pub use error::{BoxError, ClientError, ClientResult};
 

@@ -93,7 +93,10 @@ fn batch_mode_is_best_effort_and_returns_non_zero_on_partial_failure() {
         "expected non-zero on partial failure"
     );
 
-    assert_eq!(fs::read(&origin_ok).unwrap(), fs::read(&replica_ok).unwrap());
+    assert_eq!(
+        fs::read(&origin_ok).unwrap(),
+        fs::read(&replica_ok).unwrap()
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("batch summary: total=2, succeeded=1, failed=1"));
@@ -126,7 +129,10 @@ fn batch_mode_rejects_remote_to_remote_entry_and_continues() {
         !output.status.success(),
         "expected non-zero due to one invalid entry"
     );
-    assert_eq!(fs::read(&origin_ok).unwrap(), fs::read(&replica_ok).unwrap());
+    assert_eq!(
+        fs::read(&origin_ok).unwrap(),
+        fs::read(&replica_ok).unwrap()
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("batch failed [invalid]"));

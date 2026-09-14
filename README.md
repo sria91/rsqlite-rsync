@@ -39,6 +39,7 @@ The last three forms are covered in
   - [HA control loop mode](#ha-control-loop-mode)
   - [SQL Gateway and client](#sql-gateway-and-client)
     - [Security](#security)
+    - [Standalone Edge vs. HA Cluster Execution](#standalone-edge-vs-ha-cluster-execution)
 - [Protocol](#protocol)
 - [Crate structure](#crate-structure)
 - [Performance tuning](#performance-tuning-optional)
@@ -446,6 +447,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+#### Standalone Edge vs. HA Cluster Execution
+
+The exact same binary and Docker container image can run in both **HA Cluster mode** (with gRPC SQL Gateway, Kubernetes Lease election, and rsync replication) and **Standalone Edge mode** (IoT devices, kiosks, embedded appliances) with **zero background daemons, zero open network ports, and no rsync replication**.
+
+Mode resolution is evaluated dynamically at **runtime** without compile-time feature gating:
+
+1. **Standalone Edge Mode (In-Process SQLite Engine)**:
+   - Provide `-D <PATH>` (or `--data-dir <PATH>`, or `RSQLITE_DATA_DIR=<PATH>`), or `--mode local`.
+   - Executes SQL statements and queries directly against local SQLite database files in-process using WAL journal mode, busy timeouts, path traversal safety, and serialized write locks.
+   - Fully supports all CLI subcommands (`exec`, `query`, `batch`, `status`, `drop-database`, `repl`) and table/json/csv formatting.
+
+   ```bash
+   # Execute DDL/DML directly on local database file without any server process
+   rsqlite-rsync sql -D /var/lib/sqlite -d app.db "CREATE TABLE sensors (id INT, temp REAL)"
+
+   # Run interactive REPL directly against local database directory
+   rsqlite-rsync client -D /var/lib/sqlite repl -d app.db
+
+   # Inspect local databases via cluster status emulation
+   rsqlite-rsync client -D /var/lib/sqlite status
+   ```
+
+2. **HA Cluster Mode (Remote gRPC SQL Gateway)**:
+   - Provide `--endpoint`, `--endpoints`, `--kube-lease`, or `--mode cluster`.
+   - Communicates over gRPC with automatic active-writer discovery, bearer authentication, and failover retries.
+
+   ```bash
+   # Query the active cluster writer over gRPC
+   rsqlite-rsync client --endpoint http://10.0.0.1:50051 --token "$RSQLITE_TOKEN" query -d app.db "SELECT * FROM sensors"
+   ```
+
+3. **Auto-Detection Hierarchy**:
+   - `--mode local` forces standalone local execution.
+   - `--mode cluster` forces remote gRPC client execution.
+   - If `--mode auto` (default):
+     - If `--data-dir` / `-D` or `RSQLITE_DATA_DIR` is specified (without remote endpoint flags), it selects **local standalone mode**.
+     - If `--endpoint`, `--endpoints`, `--kube-lease`, `RSQLITE_ENDPOINT`, or `RSQLITE_ENDPOINTS` is specified, it selects **cluster mode**.
+     - Otherwise falls back to default cluster discovery (`http://127.0.0.1:50051`).
 
 It retries on `NOT_LEADER` by following the redirect endpoint, and supports
 `DiscoveryMode::Candidates` (probe a fixed endpoint list for the writer) or a

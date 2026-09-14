@@ -24,8 +24,8 @@ use comfy_table::{Cell, ContentArrangement, Row, Table};
 
 use rsqlite_rsync::client::{BoxError, ClientConfig, ClientError, DiscoveryMode, SqlGatewayClient};
 use rsqlite_rsync::proto::rsqlite::v1::{
-    statement_result, value, BatchTransactionMode, ConsistencyLevel, DatabaseInfo, NamedParameter,
-    NodeRole, Parameters, QueryResponse, Statement, StatementResult, Value,
+    BatchTransactionMode, ConsistencyLevel, DatabaseInfo, NamedParameter, NodeRole, Parameters,
+    QueryResponse, Statement, StatementResult, Value, statement_result, value,
 };
 
 // ── Self-contained server bootstrap (mirrors tests/integration/grpc_gateway.rs) ──
@@ -50,9 +50,7 @@ fn write_lease(path: &Path, node_id: &str) {
     let now = now_secs();
     std::fs::write(
         path,
-        format!(
-            "holder_node_id={node_id}\ngeneration=1\nrenewed_at_secs={now}\nttl_secs=86400\n"
-        ),
+        format!("holder_node_id={node_id}\ngeneration=1\nrenewed_at_secs={now}\nttl_secs=86400\n"),
     )
     .expect("failed to write lease file");
 }
@@ -90,7 +88,9 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 fn http_status_code(bind_addr: &str, path: &str) -> Option<u16> {
     let mut stream = std::net::TcpStream::connect(bind_addr).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .ok()?;
     stream
         .write_all(
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -244,7 +244,11 @@ fn print_rows(resp: &QueryResponse) {
     table.set_header(header);
 
     for row in &resp.rows {
-        let cells: Vec<Cell> = row.values.iter().map(|v| Cell::new(format_value(v))).collect();
+        let cells: Vec<Cell> = row
+            .values
+            .iter()
+            .map(|v| Cell::new(format_value(v)))
+            .collect();
         table.add_row(Row::from(cells));
     }
 
@@ -386,7 +390,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     for i in 0..25 {
         client
-            .execute("demo.db", &format!("INSERT INTO nums (v) VALUES ({i})"), None)
+            .execute(
+                "demo.db",
+                &format!("INSERT INTO nums (v) VALUES ({i})"),
+                None,
+            )
             .await?;
     }
     let mut stream = client
@@ -436,7 +444,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 9. batch(): failure path -----------------------------------------
-    section(9, "batch() — failure path (bad statement mid-batch, stop_on_error=true)");
+    section(
+        9,
+        "batch() — failure path (bad statement mid-batch, stop_on_error=true)",
+    );
     let batch_err = client
         .batch(
             "demo.db",
@@ -504,9 +515,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 13. Alternate discovery modes --------------------------------------
     section(13, "Alternate discovery modes");
-    let mut candidates_client = SqlGatewayClient::new(ClientConfig::new(
-        DiscoveryMode::Candidates(vec![endpoint.clone()]),
-    ));
+    let mut candidates_client =
+        SqlGatewayClient::new(ClientConfig::new(DiscoveryMode::Candidates(vec![
+            endpoint.clone(),
+        ])));
     let status = candidates_client.get_cluster_status().await?;
     println!(
         "DiscoveryMode::Candidates([...]) resolved to writer node_id={}",

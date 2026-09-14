@@ -26,6 +26,24 @@ pub struct ClientConfig {
     pub auth_token: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeMode {
+    /// Connect to a remote cluster SQL Gateway over gRPC.
+    Cluster,
+    /// Direct, in-process SQLite execution against a local data directory.
+    Local,
+    /// Auto-detect based on provided options and environment variables.
+    Auto,
+}
+
+#[derive(Debug, Clone)]
+pub enum ClientTarget {
+    /// Remote gRPC cluster target with leader discovery and auth.
+    Remote { config: ClientConfig },
+    /// Local standalone target rooted at `data_dir`.
+    Local { data_dir: std::path::PathBuf },
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
