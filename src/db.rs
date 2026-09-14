@@ -474,7 +474,13 @@ impl PreparedStatement {
         unsafe {
             check(
                 conn.as_ptr(),
-                ffi::sqlite3_prepare_v2(conn.as_ptr(), c_sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                ffi::sqlite3_prepare_v2(
+                    conn.as_ptr(),
+                    c_sql.as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
             )?;
         }
         Ok(PreparedStatement {
@@ -770,10 +776,14 @@ mod tests {
             .unwrap();
 
         // Check is_readonly
-        let insert_stmt = conn.prepare("INSERT INTO items (id, name, score, data, extra) VALUES (?, :name, ?, ?, ?)").unwrap();
+        let insert_stmt = conn
+            .prepare("INSERT INTO items (id, name, score, data, extra) VALUES (?, :name, ?, ?, ?)")
+            .unwrap();
         assert!(!insert_stmt.is_readonly());
 
-        let select_stmt = conn.prepare("SELECT id, name, score, data, extra FROM items").unwrap();
+        let select_stmt = conn
+            .prepare("SELECT id, name, score, data, extra FROM items")
+            .unwrap();
         assert!(select_stmt.is_readonly());
 
         drop(select_stmt);
@@ -826,7 +836,10 @@ mod tests {
         }
 
         assert_eq!(query.column_type(3), ColumnDataType::Blob);
-        assert_eq!(query.column_value(3), SqlValue::Blob(b"binary_data".to_vec()));
+        assert_eq!(
+            query.column_value(3),
+            SqlValue::Blob(b"binary_data".to_vec())
+        );
 
         assert_eq!(query.column_type(4), ColumnDataType::Null);
         assert_eq!(query.column_value(4), SqlValue::Null);

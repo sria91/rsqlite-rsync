@@ -10,8 +10,8 @@
 //! - Passwordless SSH to localhost configured (e.g., via authorized_keys)
 //! - rsqlite-rsync binary in PATH
 
-use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
 use rsqlite_rsync::transport::Transport;
+use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
 
 fn should_skip_ssh_tests() -> bool {
     std::env::var("SKIP_SSH_TESTS").is_ok() || which::which("ssh").is_err()
@@ -50,7 +50,10 @@ async fn ssh_localhost_basic_connection() {
         }
         Err(e) => {
             // Expected if localhost SSH is not configured
-            eprintln!("SSH to localhost failed (expected if not configured): {}", e);
+            eprintln!(
+                "SSH to localhost failed (expected if not configured): {}",
+                e
+            );
         }
     }
 }

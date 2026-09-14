@@ -10,17 +10,28 @@ use comfy_table::{Cell, Color, ContentArrangement, Row, Table};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use rsqlite_rsync::client::{
-    BoxError, ClientConfig, DiscoveryMode, LeaderResolver, SqlGatewayClient,
-};
+use rsqlite_rsync::client::{BoxError, ClientConfig, ClientTarget, DiscoveryMode, LeaderResolver};
 use rsqlite_rsync::db::SqlValue;
 use rsqlite_rsync::error::{Result, SyncError};
+use rsqlite_rsync::gateway::Client;
 use rsqlite_rsync::gateway::engine::proto_value_to_sql;
 use rsqlite_rsync::ha::{KubectlLeaseReader, LeaseReader};
 use rsqlite_rsync::proto::rsqlite::v1::{
     BatchResponse, BatchTransactionMode, ClusterStatusResponse, ConsistencyLevel, ExecuteResponse,
     NamedParameter, NodeRole, Parameters, QueryResponse, Statement, Value,
 };
+
+/// Target execution mode for the client CLI.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
+pub enum CliRuntimeMode {
+    /// Auto-detect based on provided arguments and environment variables.
+    #[default]
+    Auto,
+    /// Direct in-process SQLite execution on local storage.
+    Local,
+    /// Connect to remote HA SQL Gateway over gRPC.
+    Cluster,
+}
 
 /// Output formats supported by the client CLI.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -71,6 +82,14 @@ impl From<CliConsistency> for ConsistencyLevel {
 /// Shared connection and discovery options for the client CLI.
 #[derive(ClapArgs, Debug, Clone)]
 pub struct ClientConnectionArgs {
+    /// Execution mode: auto, local (standalone edge), or cluster (remote HA gateway).
+    #[arg(long, env = "RSQLITE_MODE", value_enum, default_value_t = CliRuntimeMode::Auto)]
+    pub mode: CliRuntimeMode,
+
+    /// Local data directory for standalone in-process SQLite execution.
+    #[arg(long, short = 'D', env = "RSQLITE_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+
     /// Direct gRPC endpoint URL (e.g., `http://127.0.0.1:50051`).
     #[arg(long, env = "RSQLITE_ENDPOINT")]
     pub endpoint: Option<String>,
@@ -153,6 +172,74 @@ impl LeaderResolver for KubeLeaseResolver {
 }
 
 impl ClientConnectionArgs {
+    /// Resolve the target client execution mode (local in-process or remote gRPC).
+    pub fn to_client_target(&self) -> Result<ClientTarget> {
+        match self.mode {
+            CliRuntimeMode::Local => {
+                if let Some(ref data_dir) = self.data_dir {
+                    Ok(ClientTarget::Local {
+                        data_dir: data_dir.clone(),
+                    })
+                } else if let Ok(dir) = std::env::var("RSQLITE_DATA_DIR") {
+                    if !dir.trim().is_empty() {
+                        Ok(ClientTarget::Local {
+                            data_dir: PathBuf::from(dir.trim()),
+                        })
+                    } else {
+                        Err(SyncError::Protocol(
+                            "local mode requires a data directory via --data-dir (-D) or RSQLITE_DATA_DIR".into(),
+                        ))
+                    }
+                } else {
+                    Err(SyncError::Protocol(
+                        "local mode requires a data directory via --data-dir (-D) or RSQLITE_DATA_DIR".into(),
+                    ))
+                }
+            }
+            CliRuntimeMode::Cluster => Ok(ClientTarget::Remote {
+                config: self.to_client_config(),
+            }),
+            CliRuntimeMode::Auto => {
+                if let Some(ref data_dir) = self.data_dir {
+                    Ok(ClientTarget::Local {
+                        data_dir: data_dir.clone(),
+                    })
+                } else if self.endpoint.is_some()
+                    || !self.endpoints.is_empty()
+                    || self.kube_lease.is_some()
+                {
+                    Ok(ClientTarget::Remote {
+                        config: self.to_client_config(),
+                    })
+                } else if let Ok(dir) = std::env::var("RSQLITE_DATA_DIR") {
+                    if !dir.trim().is_empty()
+                        && std::env::var("RSQLITE_ENDPOINT").is_err()
+                        && std::env::var("RSQLITE_ENDPOINTS").is_err()
+                        && std::env::var("RSQLITE_KUBE_LEASE").is_err()
+                    {
+                        Ok(ClientTarget::Local {
+                            data_dir: PathBuf::from(dir.trim()),
+                        })
+                    } else {
+                        Ok(ClientTarget::Remote {
+                            config: self.to_client_config(),
+                        })
+                    }
+                } else {
+                    Ok(ClientTarget::Remote {
+                        config: self.to_client_config(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Construct a unified client instance based on the resolved target.
+    pub fn to_client(&self) -> Result<Client> {
+        let target = self.to_client_target()?;
+        Client::new(target)
+    }
+
     /// Build client configuration from CLI arguments.
     pub fn to_client_config(&self) -> ClientConfig {
         let discovery = if let Some(ref ep) = self.endpoint {
@@ -286,8 +373,7 @@ pub async fn run_client_command(
     conn_args: &ClientConnectionArgs,
     cmd: &ClientCommand,
 ) -> Result<()> {
-    let config = conn_args.to_client_config();
-    let mut client = SqlGatewayClient::new(config);
+    let mut client = conn_args.to_client()?;
 
     match cmd {
         ClientCommand::Exec {
@@ -394,8 +480,7 @@ pub async fn run_sql_shorthand(
     sql: &str,
     format: OutputFormat,
 ) -> Result<()> {
-    let config = conn_args.to_client_config();
-    let mut client = SqlGatewayClient::new(config);
+    let mut client = conn_args.to_client()?;
 
     if is_query_sql(sql) {
         let resp = client
@@ -415,7 +500,7 @@ pub async fn run_sql_shorthand(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_repl(
-    client: &mut SqlGatewayClient,
+    client: &mut Client,
     initial_db: &str,
     initial_format: OutputFormat,
 ) -> Result<()> {
@@ -494,7 +579,7 @@ async fn run_repl(
 }
 
 async fn handle_metacommand(
-    client: &mut SqlGatewayClient,
+    client: &mut Client,
     cmd: &str,
     current_db: &mut String,
     current_format: &mut OutputFormat,
@@ -1025,4 +1110,80 @@ fn is_query_sql(sql: &str) -> bool {
         || s.starts_with("PRAGMA")
         || s.starts_with("EXPLAIN")
         || s.starts_with("WITH")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn default_test_args() -> ClientConnectionArgs {
+        ClientConnectionArgs {
+            mode: CliRuntimeMode::Auto,
+            data_dir: None,
+            endpoint: None,
+            endpoints: vec![],
+            kube_lease: None,
+            kube_namespace: "default".to_string(),
+            kube_service: "sqlite-ha".to_string(),
+            kube_context: None,
+            kubeconfig: None,
+            kubectl_path: PathBuf::from("kubectl"),
+            grpc_port: 50051,
+            max_retries: 5,
+            timeout: 15,
+            token: None,
+        }
+    }
+
+    #[test]
+    fn test_client_target_resolution_modes() {
+        // Explicit Local Mode with data_dir
+        let mut args = default_test_args();
+        args.mode = CliRuntimeMode::Local;
+        args.data_dir = Some(PathBuf::from("/tmp/edge-data"));
+        let target = args.to_client_target().unwrap();
+        assert!(
+            matches!(target, ClientTarget::Local { data_dir } if data_dir == Path::new("/tmp/edge-data"))
+        );
+
+        // Explicit Local Mode without data_dir should fail
+        let mut args_no_dir = default_test_args();
+        args_no_dir.mode = CliRuntimeMode::Local;
+        args_no_dir.data_dir = None;
+        assert!(args_no_dir.to_client_target().is_err());
+
+        // Auto Mode with data_dir -> Local
+        let mut args_auto_local = default_test_args();
+        args_auto_local.mode = CliRuntimeMode::Auto;
+        args_auto_local.data_dir = Some(PathBuf::from("/var/data"));
+        let target = args_auto_local.to_client_target().unwrap();
+        assert!(
+            matches!(target, ClientTarget::Local { data_dir } if data_dir == Path::new("/var/data"))
+        );
+
+        // Explicit Cluster Mode with endpoint -> Remote
+        let mut args_cluster = default_test_args();
+        args_cluster.mode = CliRuntimeMode::Cluster;
+        args_cluster.endpoint = Some("http://10.0.0.1:50051".to_string());
+        args_cluster.token = Some("secret".to_string());
+        args_cluster.timeout = 10;
+        args_cluster.max_retries = 3;
+        let target = args_cluster.to_client_target().unwrap();
+        match target {
+            ClientTarget::Remote { config } => {
+                assert!(
+                    matches!(config.discovery, DiscoveryMode::Direct(ref ep) if ep == "http://10.0.0.1:50051")
+                );
+                assert_eq!(config.auth_token.as_deref(), Some("secret"));
+                assert_eq!(config.max_retries, 3);
+            }
+            ClientTarget::Local { .. } => panic!("expected Remote target"),
+        }
+
+        // Auto Mode with defaults -> Remote (default direct discovery)
+        let args_default = default_test_args();
+        let target = args_default.to_client_target().unwrap();
+        assert!(matches!(target, ClientTarget::Remote { .. }));
+    }
 }

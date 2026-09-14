@@ -193,7 +193,8 @@ pub(crate) fn load_manifest(path: &Path, format: ManifestFormat) -> Result<Vec<B
             )));
         }
         if let (Some(base), Some(max)) = (entry.retry_backoff_ms, entry.retry_backoff_max_ms)
-            && max > 0 && base > max
+            && max > 0
+            && base > max
         {
             return Err(SyncError::Protocol(format!(
                 "batch manifest {} entry {} retry_backoff_max_ms must be >= retry_backoff_ms",
