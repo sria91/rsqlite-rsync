@@ -246,4 +246,19 @@ mod tests {
         let result = decode(&buf);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn decode_malformed_payload_errors() {
+        // A length prefix that correctly announces the payload size, but
+        // whose payload bytes are not valid bincode for any `Message`
+        // variant. This exercises the deserialisation failure path
+        // (distinct from the truncated-prefix/truncated-payload/oversized
+        // checks above, which all fail before deserialisation is attempted).
+        let payload = vec![0xFFu8; 16];
+        let mut buf = (payload.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&payload);
+
+        let err = decode(&buf).unwrap_err();
+        assert!(matches!(err, crate::error::SyncError::Codec(_)));
+    }
 }

@@ -913,6 +913,340 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_rejects_unexpected_first_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 2);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let mut transport = MockTransport::new(vec![Message::Done]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected Hello")
+        ));
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_serial_path_flags_group_beyond_origin_page_count() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 8);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        let group0_hash =
+            origin_group_hash_for_pages(snap.all_bytes(), page_size as usize, 1..=8, HashAlgorithm::Blake3V2);
+
+        // Use the default (non-tuning) entry point so the small page count
+        // stays under the default parallel threshold and exercises the
+        // *serial* coarse-pass fallback closure instead of the rayon one.
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 8,
+            },
+            Message::GroupHashes {
+                first_group: 0,
+                // Group 0 matches; group 1 doesn't exist on the origin at
+                // all (only 8 pages / 1 group), so it must still be flagged.
+                hashes: vec![group0_hash, [3u8; 32]],
+            },
+            Message::PageHashes {
+                page_nos: vec![].into(),
+                hashes: vec![].into(),
+            },
+            Message::PagesAck { page_nos: vec![] },
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        assert!(matches!(
+            &transport.sent[1],
+            Message::GroupsNeedFine { group_indices } if group_indices == &vec![1]
+        ));
+
+        snap.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_page_size_mismatch() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 2);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let origin_page_size = snap.page_size();
+        let mismatched_page_size = origin_page_size + 4096;
+
+        let mut transport = MockTransport::new(vec![Message::Hello {
+            version: PROTOCOL_VERSION,
+            page_size: mismatched_page_size,
+            page_count: 2,
+        }]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::PageSizeMismatch { origin, replica })
+                if origin == origin_page_size && replica == mismatched_page_size
+        ));
+        assert!(matches!(
+            transport.sent.first(),
+            Some(Message::Error { message }) if message.contains("page size mismatch")
+        ));
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_rejects_unexpected_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 8);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 8,
+            },
+            Message::Done,
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected GroupHashes")
+        ));
+    }
+
+    #[tokio::test]
+    async fn fine_pass_rejects_unexpected_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 8);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 8,
+            },
+            Message::GroupHashes {
+                first_group: 0,
+                hashes: vec![[1u8; 32]],
+            },
+            Message::Error {
+                message: "replica gave up".into(),
+            },
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected PageHashes")
+        ));
+    }
+
+    #[tokio::test]
+    async fn fine_pass_rejects_unexpected_ack_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 8);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 0,
+            },
+            Message::GroupHashes {
+                first_group: 0,
+                hashes: vec![[1u8; 32]],
+            },
+            Message::PageHashes {
+                page_nos: vec![].into(),
+                hashes: vec![].into(),
+            },
+            Message::Done,
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected PagesAck")
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_exhausted_returns_protocol_error() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 2);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let mut transport = MockTransport::new(vec![Message::Hello {
+            version: PROTOCOL_VERSION,
+            page_size: snap.page_size(),
+            page_count: 2,
+        }]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("mock transport exhausted input")
+        ));
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_parallel_path_covers_diff_match_and_missing_groups() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 70);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        // Group 1 (pages 65..=70) is computed to match the origin exactly, so
+        // it should be excluded from `need_fine` by the parallel comparison.
+        let group1_hash = origin_group_hash_for_pages(
+            snap.all_bytes(),
+            page_size as usize,
+            65..=70,
+            HashAlgorithm::Blake3V2,
+        );
+
+        // Group 0 (pages 1..=64) is deliberately wrong, so it should differ.
+        // Group 2 doesn't exist on the origin (only 70 pages / 2 groups
+        // exist), so it should be flagged regardless of its hash value.
+        let tuning = SyncTuning {
+            max_hash_threads: None,
+            parallel_min_pages: 1,
+            hash_chunk_groups: 16,
+        };
+
+        let group0_pages: Vec<u32> = (1..=64).collect();
+        let group0_hashes: Vec<PageHash> = group0_pages
+            .iter()
+            .map(|page_no| hash_page(&snap.read_page(*page_no).unwrap()))
+            .collect();
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 70,
+            },
+            Message::GroupHashes {
+                first_group: 0,
+                hashes: vec![[9u8; 32], group1_hash, [7u8; 32]],
+            },
+            // Fine pass for group 0: hashes match, so no pages differ.
+            Message::PageHashes {
+                page_nos: group0_pages.into(),
+                hashes: group0_hashes.into(),
+            },
+            Message::PagesAck { page_nos: vec![] },
+            // Fine pass for group 2: it doesn't exist on the replica either.
+            Message::PageHashes {
+                page_nos: vec![].into(),
+                hashes: vec![].into(),
+            },
+            Message::PagesAck { page_nos: vec![] },
+        ]);
+
+        let result = run_with_tuning(&snap, &mut transport, &tuning).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        assert!(matches!(
+            &transport.sent[1],
+            Message::GroupsNeedFine { group_indices } if group_indices == &vec![0, 2]
+        ));
+        assert!(matches!(transport.sent.last(), Some(Message::Done)));
+
+        snap.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_adds_origin_only_groups() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        seed_to_page_count(&conn, 70);
+
+        let snap = Snapshot::begin(&conn).unwrap();
+        let page_size = snap.page_size();
+
+        // The replica only reports a hash for group 0; the origin has an
+        // extra group (group 1, pages 65..=70) that the replica never
+        // mentioned at all, which must still be queued for the fine pass.
+        let group0_hash = origin_group_hash_for_pages(
+            snap.all_bytes(),
+            page_size as usize,
+            1..=64,
+            HashAlgorithm::Blake3V2,
+        );
+
+        let group1_pages: Vec<u32> = (65..=70).collect();
+        let mut group1_hashes: Vec<PageHash> = group1_pages
+            .iter()
+            .map(|page_no| hash_page(&snap.read_page(*page_no).unwrap()))
+            .collect();
+        // Deliberately corrupt page 65's reported hash so the origin detects
+        // an actual content difference and queues that page for transfer
+        // (exercises `changed_page_for`'s "differs" branch).
+        group1_hashes[0] = [0xABu8; 32];
+
+        let mut transport = MockTransport::new(vec![
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count: 70,
+            },
+            Message::GroupHashes {
+                first_group: 0,
+                hashes: vec![group0_hash],
+            },
+            Message::PageHashes {
+                page_nos: group1_pages.into(),
+                hashes: group1_hashes.into(),
+            },
+            Message::PagesAck { page_nos: vec![65] },
+        ]);
+
+        let result = run(&snap, &mut transport).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        assert!(transport.sent.iter().any(|m| matches!(
+            m,
+            Message::SendPages { pages } if pages.len() == 1 && pages[0].page_no == 65
+        )));
+
+        assert!(matches!(
+            &transport.sent[1],
+            Message::GroupsNeedFine { group_indices } if group_indices == &vec![1]
+        ));
+
+        snap.commit().unwrap();
+    }
+
+    #[tokio::test]
     async fn handshake_rejects_zero_protocol_version() {
         let file = NamedTempFile::new().unwrap();
         let conn = open_rw(file.path());

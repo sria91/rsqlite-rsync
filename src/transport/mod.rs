@@ -109,4 +109,52 @@ mod tests {
         let err = try_take_framed_message(&mut buf).unwrap_err();
         assert!(matches!(err, SyncError::Codec(_)));
     }
+
+    struct DummyTransport;
+    #[async_trait::async_trait]
+    impl Transport for DummyTransport {
+        async fn send(&mut self, _msg: &Message) -> Result<()> {
+            Ok(())
+        }
+        async fn recv(&mut self) -> Result<Message> {
+            Ok(Message::Done)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_transport_close() {
+        let mut transport = DummyTransport;
+        assert!(transport.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dummy_transport_send_and_recv() {
+        let mut transport = DummyTransport;
+        assert!(transport.send(&Message::Done).await.is_ok());
+        assert_eq!(transport.recv().await.unwrap(), Message::Done);
+    }
+
+    #[test]
+    fn framed_message_handles_multiple_pipelined_frames() {
+        // Two complete frames arriving back-to-back in the same buffer (as
+        // can happen when the underlying transport delivers a batch of
+        // writes together) must be taken off one at a time in order,
+        // leaving the rest of the buffer intact between calls.
+        let msg1 = Message::Done;
+        let msg2 = Message::Hello {
+            version: PROTOCOL_VERSION,
+            page_size: 4096,
+            page_count: 7,
+        };
+        let mut buf = encode(&msg1).unwrap();
+        buf.extend_from_slice(&encode(&msg2).unwrap());
+
+        let first = try_take_framed_message(&mut buf).unwrap();
+        assert_eq!(first, Some(msg1));
+        assert_eq!(buf.len(), encode(&msg2).unwrap().len());
+
+        let second = try_take_framed_message(&mut buf).unwrap();
+        assert_eq!(second, Some(msg2));
+        assert!(buf.is_empty());
+    }
 }

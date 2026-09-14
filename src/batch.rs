@@ -6,7 +6,7 @@ use tracing::info;
 
 use rsqlite_rsync::endpoint::Endpoint;
 use rsqlite_rsync::error::{Result, SyncError};
-use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
+use rsqlite_rsync::transport::ssh::SshConnectOptions;
 use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -431,12 +431,6 @@ async fn run_one_inner(
     let origin_ep = Endpoint::parse(&spec.origin);
     let replica_ep = Endpoint::parse(&spec.replica);
 
-    if origin_ep.is_remote() && replica_ep.is_remote() {
-        return Err(SyncError::Protocol(
-            "at least one of ORIGIN or REPLICA must be local".into(),
-        ));
-    }
-
     match (origin_ep, replica_ep) {
         (Endpoint::Local(o), Endpoint::Local(r)) => {
             info!(origin = %o.display(), replica = %r.display(), dry_run, "batch local sync");
@@ -452,21 +446,13 @@ async fn run_one_inner(
                 return Ok(());
             }
 
-            let ssh_options = SshConnectOptions {
-                auth_mode: match options.ssh_options.auth_mode {
-                    SshAuthMode::Interactive => SshAuthMode::Interactive,
-                    SshAuthMode::NonInteractive => SshAuthMode::NonInteractive,
-                },
-                connect_timeout_secs: options.ssh_options.connect_timeout_secs,
-            };
-
             push_sync_with_tuning(
                 &o,
                 &user_host,
                 &path,
                 &options.exe,
                 &options.ssh_opts,
-                &ssh_options,
+                &options.ssh_options,
                 &options.tuning,
             )
             .await?;
@@ -477,26 +463,22 @@ async fn run_one_inner(
                 return Ok(());
             }
 
-            let ssh_options = SshConnectOptions {
-                auth_mode: match options.ssh_options.auth_mode {
-                    SshAuthMode::Interactive => SshAuthMode::Interactive,
-                    SshAuthMode::NonInteractive => SshAuthMode::NonInteractive,
-                },
-                connect_timeout_secs: options.ssh_options.connect_timeout_secs,
-            };
-
             pull_sync_with_tuning(
                 &user_host,
                 &path,
                 &r,
                 &options.exe,
                 &options.ssh_opts,
-                &ssh_options,
+                &options.ssh_options,
                 &options.tuning,
             )
             .await?;
         }
-        _ => unreachable!(),
+        (Endpoint::Remote { .. }, Endpoint::Remote { .. }) => {
+            return Err(SyncError::Protocol(
+                "at least one of ORIGIN or REPLICA must be local".into(),
+            ));
+        }
     }
 
     Ok(())
@@ -522,8 +504,426 @@ async fn dry_run_local(origin: &Path, replica: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::retry_delay_for_attempt_core;
-    use std::time::Duration;
+    use super::*;
+    use libsqlite3_sys as ffi;
+    use rsqlite_rsync::db::Connection;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    fn write_manifest(dir: &Path, filename: &str, contents: &str) -> PathBuf {
+        let path = dir.join(filename);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Create a small on-disk SQLite database for use with `dry_run_local`
+    /// and real (non-dry-run) local sync tests. `page_size`, when given, is
+    /// set via `PRAGMA page_size` before the first table is created (SQLite
+    /// only honours the pragma on an otherwise-empty database).
+    fn seed_db(path: &Path, page_size: Option<u32>) {
+        let conn = Connection::open(
+            path,
+            ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+        )
+        .expect("create db");
+        if let Some(size) = page_size {
+            conn.exec(&format!("PRAGMA page_size={size}")).unwrap();
+        }
+        conn.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, data TEXT)")
+            .unwrap();
+        conn.exec("INSERT INTO items VALUES (1, 'value')").unwrap();
+    }
+
+    fn default_runtime_options() -> BatchRuntimeOptions {
+        BatchRuntimeOptions {
+            jobs: 1,
+            default_dry_run: false,
+            default_retries: 0,
+            default_timeout: None,
+            retry_backoff_base: None,
+            retry_backoff_max: None,
+            retry_jitter_pct: 0,
+            exe: "rsqlite-rsync".to_string(),
+            ssh_opts: Vec::new(),
+            ssh_options: SshConnectOptions::default(),
+            tuning: SyncTuning::default(),
+        }
+    }
+
+    fn spec(origin: &str, replica: &str, dry_run: bool) -> BatchSyncSpec {
+        BatchSyncSpec {
+            name: None,
+            origin: origin.to_string(),
+            replica: replica.to_string(),
+            dry_run: Some(dry_run),
+            retries: Some(0),
+            timeout_secs: None,
+            retry_backoff_ms: None,
+            retry_backoff_max_ms: None,
+            retry_jitter_pct: None,
+        }
+    }
+
+    // -- BatchSyncSpec::identifier ------------------------------------
+
+    #[test]
+    fn identifier_falls_back_to_origin_arrow_replica_when_unnamed() {
+        let unnamed = spec("origin.db", "replica.db", false);
+        assert_eq!(unnamed.identifier(), "origin.db -> replica.db");
+
+        let mut named = spec("origin.db", "replica.db", false);
+        named.name = Some("custom-name".to_string());
+        assert_eq!(named.identifier(), "custom-name");
+    }
+
+    // -- load_manifest: I/O and explicit format selection --------------
+
+    #[test]
+    fn load_manifest_missing_file_reports_read_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+
+        let err = load_manifest(&path, ManifestFormat::Json).unwrap_err();
+        assert!(err.to_string().contains("failed reading batch manifest"));
+    }
+
+    #[test]
+    fn load_manifest_explicit_json_format_parses() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "manifest.dat",
+            r#"{"syncs": [{"origin": "a", "replica": "b"}]}"#,
+        );
+
+        let specs = load_manifest(&path, ManifestFormat::Json).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].origin, "a");
+        assert_eq!(specs[0].replica, "b");
+    }
+
+    #[test]
+    fn load_manifest_explicit_yaml_format_parses() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "manifest.dat",
+            "syncs:\n  - origin: a\n    replica: b\n",
+        );
+
+        let specs = load_manifest(&path, ManifestFormat::Yaml).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].origin, "a");
+        assert_eq!(specs[0].replica, "b");
+    }
+
+    #[test]
+    fn load_manifest_explicit_toml_format_parses() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "manifest.dat",
+            "[[syncs]]\norigin = \"a\"\nreplica = \"b\"\n",
+        );
+
+        let specs = load_manifest(&path, ManifestFormat::Toml).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].origin, "a");
+        assert_eq!(specs[0].replica, "b");
+    }
+
+    #[test]
+    fn load_manifest_explicit_yaml_format_reports_parse_error() {
+        let dir = tempdir().unwrap();
+        // Valid YAML syntax, but the wrong shape (missing required `syncs`).
+        let path = write_manifest(dir.path(), "manifest.dat", "foo: bar\n");
+
+        let err = load_manifest(&path, ManifestFormat::Yaml).unwrap_err();
+        assert!(err.to_string().contains("as yaml"));
+    }
+
+    #[test]
+    fn load_manifest_explicit_toml_format_reports_parse_error() {
+        let dir = tempdir().unwrap();
+        // Not valid TOML syntax at all (colon instead of `=`).
+        let path = write_manifest(dir.path(), "manifest.dat", "foo: bar\n");
+
+        let err = load_manifest(&path, ManifestFormat::Toml).unwrap_err();
+        assert!(err.to_string().contains("as toml"));
+    }
+
+    // -- load_manifest: Auto format-detection fallback chain -----------
+
+    #[test]
+    fn load_manifest_auto_detects_json_without_recognized_extension() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "manifest",
+            r#"{"syncs": [{"origin": "a", "replica": "b"}]}"#,
+        );
+
+        let specs = load_manifest(&path, ManifestFormat::Auto).unwrap();
+        assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn load_manifest_auto_falls_back_to_yaml_without_recognized_extension() {
+        let dir = tempdir().unwrap();
+        // Not valid JSON (unquoted keys, no braces), valid YAML.
+        let path = write_manifest(
+            dir.path(),
+            "manifest",
+            "syncs:\n  - origin: a\n    replica: b\n",
+        );
+
+        let specs = load_manifest(&path, ManifestFormat::Auto).unwrap();
+        assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn load_manifest_auto_falls_back_to_toml_without_recognized_extension() {
+        let dir = tempdir().unwrap();
+        // Not valid JSON, and not the right shape for YAML either, but
+        // valid TOML.
+        let path = write_manifest(
+            dir.path(),
+            "manifest",
+            "[[syncs]]\norigin = \"a\"\nreplica = \"b\"\n",
+        );
+
+        let specs = load_manifest(&path, ManifestFormat::Auto).unwrap();
+        assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn load_manifest_auto_reports_all_format_errors_when_none_match() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(dir.path(), "manifest", "@@@ not valid {{{ anything");
+
+        let err = load_manifest(&path, ManifestFormat::Auto).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("json error"));
+        assert!(message.contains("yaml error"));
+        assert!(message.contains("toml error"));
+    }
+
+    // -- load_manifest: entry validation --------------------------------
+
+    #[test]
+    fn load_manifest_rejects_empty_syncs_list() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(dir.path(), "manifest.json", r#"{"syncs": []}"#);
+
+        let err = load_manifest(&path, ManifestFormat::Json).unwrap_err();
+        assert!(err.to_string().contains("no sync entries"));
+    }
+
+    #[test]
+    fn load_manifest_rejects_blank_origin() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "manifest.json",
+            r#"{"syncs": [{"origin": "   ", "replica": "b"}]}"#,
+        );
+
+        let err = load_manifest(&path, ManifestFormat::Json).unwrap_err();
+        assert!(err.to_string().contains("empty origin"));
+    }
+
+    #[test]
+    fn load_manifest_rejects_blank_replica() {
+        let dir = tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "manifest.json",
+            r#"{"syncs": [{"origin": "a", "replica": ""}]}"#,
+        );
+
+        let err = load_manifest(&path, ManifestFormat::Json).unwrap_err();
+        assert!(err.to_string().contains("empty replica"));
+    }
+
+    // -- run_batch_sync: scheduling --------------------------------------
+
+    #[tokio::test]
+    async fn run_batch_sync_handles_more_job_slots_than_entries() {
+        let dir = tempdir().unwrap();
+        let origin_a = dir.path().join("origin_a.db");
+        let origin_b = dir.path().join("origin_b.db");
+        seed_db(&origin_a, None);
+        seed_db(&origin_b, None);
+        let replica_a = dir.path().join("replica_a.db");
+        let replica_b = dir.path().join("replica_b.db");
+
+        let specs = vec![
+            spec(origin_a.to_str().unwrap(), replica_a.to_str().unwrap(), true),
+            spec(origin_b.to_str().unwrap(), replica_b.to_str().unwrap(), true),
+        ];
+        let mut options = default_runtime_options();
+        // More job slots than pending entries exercises the "no more work
+        // to schedule" branch of the initial fill loop.
+        options.jobs = 5;
+
+        let report = run_batch_sync(specs, options).await;
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.succeeded, 2);
+        assert_eq!(report.failed, 0);
+        assert!(!report.any_failed());
+    }
+
+    // -- run_one: per-entry timeout handling -----------------------------
+
+    #[tokio::test]
+    async fn run_one_succeeds_within_a_generous_timeout() {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        seed_db(&origin, None);
+        let replica = dir.path().join("replica.db");
+
+        let item_spec = spec(origin.to_str().unwrap(), replica.to_str().unwrap(), true);
+        let mut options = default_runtime_options();
+        options.default_timeout = Some(Duration::from_secs(30));
+
+        let result = run_one(0, item_spec, options).await;
+        assert!(result.is_success(), "expected success: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn run_one_reports_timeout_error_when_attempt_exceeds_deadline() {
+        // Use a real, openable origin so the attempt gets past the
+        // (synchronous, non-yielding) local file open and actually reaches
+        // the ssh subprocess spawn for the remote replica. Spawning and
+        // awaiting a real process always yields to the async runtime at
+        // least once, which makes the near-zero timeout below deterministic
+        // — unlike a purely synchronous failure (e.g. a missing local
+        // file), which resolves within a single, un-suspended poll and
+        // would never trip the timeout regardless of its duration.
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        seed_db(&origin, None);
+
+        let item_spec = spec(origin.to_str().unwrap(), "localhost:/tmp/replica.db", false);
+        let mut options = default_runtime_options();
+        options.default_timeout = Some(Duration::from_nanos(1));
+        options.ssh_options.connect_timeout_secs = 2;
+
+        let result = run_one(0, item_spec, options).await;
+
+        assert!(!result.is_success());
+        let error = result.error.unwrap();
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+    }
+
+    // -- run_one_inner: local/remote endpoint combinations ---------------
+
+    #[tokio::test]
+    async fn run_one_inner_local_dry_run_uses_dry_run_local() {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        seed_db(&origin, None);
+        let replica = dir.path().join("replica.db");
+
+        let item_spec = spec(origin.to_str().unwrap(), replica.to_str().unwrap(), true);
+        let options = default_runtime_options();
+
+        run_one_inner(&item_spec, true, &options).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_one_inner_push_dry_run_returns_immediately() {
+        let item_spec = spec("/tmp/origin.db", "example.com:/remote/replica.db", true);
+        let options = default_runtime_options();
+
+        run_one_inner(&item_spec, true, &options).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_one_inner_pull_dry_run_returns_immediately() {
+        let item_spec = spec("example.com:/remote/origin.db", "/tmp/replica.db", true);
+        let options = default_runtime_options();
+
+        run_one_inner(&item_spec, true, &options).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_one_inner_push_attempts_real_ssh_connection() {
+        // Best-effort, like the existing SSH integration tests: there is no
+        // guarantee localhost SSH is configured for passwordless access in
+        // this environment, so either outcome is acceptable. What matters
+        // for coverage is that the push code path (ssh_options construction
+        // and the call into push_sync_with_tuning) actually runs, bounded
+        // by a short connect timeout so the test can't hang.
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        seed_db(&origin, None);
+
+        let item_spec = spec(origin.to_str().unwrap(), "localhost:/tmp/rsqlite-rsync-batch-test-replica.db", false);
+        let mut options = default_runtime_options();
+        options.ssh_options.connect_timeout_secs = 2;
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_one_inner(&item_spec, false, &options),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_one_inner_pull_attempts_real_ssh_connection() {
+        let dir = tempdir().unwrap();
+        let replica = dir.path().join("replica.db");
+
+        let item_spec = spec("localhost:/tmp/rsqlite-rsync-batch-test-origin.db", replica.to_str().unwrap(), false);
+        let mut options = default_runtime_options();
+        options.ssh_options.connect_timeout_secs = 2;
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_one_inner(&item_spec, false, &options),
+        )
+        .await;
+    }
+
+    // -- dry_run_local ----------------------------------------------------
+
+    #[tokio::test]
+    async fn dry_run_local_ok_when_replica_missing() {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        seed_db(&origin, None);
+        let replica = dir.path().join("replica.db");
+
+        dry_run_local(&origin, &replica).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dry_run_local_ok_when_page_sizes_match() {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        let replica = dir.path().join("replica.db");
+        seed_db(&origin, Some(4096));
+        seed_db(&replica, Some(4096));
+
+        dry_run_local(&origin, &replica).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dry_run_local_errors_on_page_size_mismatch() {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        let replica = dir.path().join("replica.db");
+        seed_db(&origin, Some(4096));
+        seed_db(&replica, Some(8192));
+
+        let err = dry_run_local(&origin, &replica).await.unwrap_err();
+        assert!(matches!(err, SyncError::PageSizeMismatch { .. }));
+    }
+
+    // -- retry_delay_for_attempt_core: edge cases ------------------------
 
     #[test]
     fn retry_delay_grows_exponentially_without_jitter() {
@@ -564,5 +964,126 @@ mod tests {
 
         assert!(low >= expected_min && low <= expected_max);
         assert!(high >= expected_min && high <= expected_max);
+    }
+
+    #[test]
+    fn retry_delay_zero_base_yields_no_delay() {
+        let delay = retry_delay_for_attempt_core(Duration::from_millis(0), None, 0, 1, 0);
+        assert!(delay.is_none());
+    }
+
+    #[test]
+    fn retry_delay_zero_jitter_span_skips_jitter_adjustment() {
+        // base=1ms, jitter_pct=1% => jitter_span rounds down to 0, so the
+        // nested jitter-adjustment block is entered but its body is skipped.
+        let delay = retry_delay_for_attempt_core(Duration::from_millis(1), None, 1, 1, 0).unwrap();
+        assert_eq!(delay, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn load_manifest_explicit_json_error_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let err = load_manifest(&path, ManifestFormat::Json).unwrap_err();
+        assert!(matches!(err, SyncError::Protocol(_)));
+    }
+
+    #[test]
+    fn load_manifest_auto_format_extensions() {
+        let dir = tempdir().unwrap();
+        let yaml_path = dir.path().join("manifest.yaml");
+        std::fs::write(&yaml_path, "syncs:\n  - origin: a.db\n    replica: b.db\n").unwrap();
+        let m_yaml = load_manifest(&yaml_path, ManifestFormat::Auto).unwrap();
+        assert_eq!(m_yaml.len(), 1);
+
+        let yml_path = dir.path().join("manifest.yml");
+        std::fs::write(&yml_path, "syncs:\n  - origin: a.db\n    replica: b.db\n").unwrap();
+        let m_yml = load_manifest(&yml_path, ManifestFormat::Auto).unwrap();
+        assert_eq!(m_yml.len(), 1);
+
+        let toml_path = dir.path().join("manifest.toml");
+        std::fs::write(&toml_path, "[[syncs]]\norigin = \"a.db\"\nreplica = \"b.db\"\n").unwrap();
+        let m_toml = load_manifest(&toml_path, ManifestFormat::Auto).unwrap();
+        assert_eq!(m_toml.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_one_fallback_backoff_max() {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        let replica = dir.path().join("replica.db");
+        seed_db(&origin, Some(4096));
+
+        let spec_item = BatchSyncSpec {
+            name: None,
+            origin: origin.to_str().unwrap().to_string(),
+            replica: replica.to_str().unwrap().to_string(),
+            dry_run: Some(false),
+            retries: Some(1),
+            timeout_secs: None,
+            retry_backoff_ms: Some(1),
+            retry_backoff_max_ms: None,
+            retry_jitter_pct: None,
+        };
+
+        let mut opts = default_runtime_options();
+        opts.retry_backoff_max = Some(Duration::from_millis(10));
+
+        let res = run_one(0, spec_item, opts).await;
+        assert!(res.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_run_one_inner_dry_run_modes() {
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.db");
+        let replica = dir.path().join("replica.db");
+        seed_db(&origin, Some(4096));
+        seed_db(&replica, Some(4096));
+
+        let opts = default_runtime_options();
+
+        // 1. Local-to-local dry run with existing replica
+        let spec_local = BatchSyncSpec {
+            name: None,
+            origin: origin.to_str().unwrap().to_string(),
+            replica: replica.to_str().unwrap().to_string(),
+            dry_run: Some(true),
+            retries: None,
+            timeout_secs: None,
+            retry_backoff_ms: None,
+            retry_backoff_max_ms: None,
+            retry_jitter_pct: None,
+        };
+        assert!(run_one_inner(&spec_local, true, &opts).await.is_ok());
+
+        // 2. Push dry run
+        let spec_push = BatchSyncSpec {
+            name: None,
+            origin: origin.to_str().unwrap().to_string(),
+            replica: "user@host:/remote/path.db".to_string(),
+            dry_run: Some(true),
+            retries: None,
+            timeout_secs: None,
+            retry_backoff_ms: None,
+            retry_backoff_max_ms: None,
+            retry_jitter_pct: None,
+        };
+        assert!(run_one_inner(&spec_push, true, &opts).await.is_ok());
+
+        // 3. Pull dry run
+        let spec_pull = BatchSyncSpec {
+            name: None,
+            origin: "user@host:/remote/path.db".to_string(),
+            replica: replica.to_str().unwrap().to_string(),
+            dry_run: Some(true),
+            retries: None,
+            timeout_secs: None,
+            retry_backoff_ms: None,
+            retry_backoff_max_ms: None,
+            retry_jitter_pct: None,
+        };
+        assert!(run_one_inner(&spec_pull, true, &opts).await.is_ok());
     }
 }

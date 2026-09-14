@@ -285,6 +285,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+    use crate::protocol::messages::PageData;
 
     struct MockTransport {
         recv_queue: VecDeque<Message>,
@@ -358,6 +359,238 @@ mod tests {
             result,
             Err(crate::error::SyncError::Protocol(message))
                 if message.contains("invalid negotiated protocol version")
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_propagates_origin_error_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+
+        let mut transport = MockTransport::new(vec![Message::Error {
+            message: "origin exploded".into(),
+        }]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message)) if message == "origin exploded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_unexpected_ack_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+
+        let mut transport = MockTransport::new(vec![Message::Done]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected HelloAck")
+        ));
+        assert!(matches!(
+            transport.sent.last(),
+            Some(Message::Error { message }) if message.contains("expected HelloAck")
+        ));
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_uses_parallel_hashing_when_tuned() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'hello')").unwrap();
+
+        let page_size = conn.page_size();
+        let page_count = conn.page_count().unwrap();
+
+        let tuning = SyncTuning {
+            max_hash_threads: None,
+            parallel_min_pages: 1,
+            hash_chunk_groups: 16,
+        };
+
+        let mut transport = MockTransport::new(vec![
+            Message::HelloAck {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count,
+            },
+            Message::GroupsNeedFine {
+                group_indices: vec![],
+            },
+            Message::Done,
+        ]);
+
+        let result = run_with_tuning(&conn, &mut transport, &tuning).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_rejects_unexpected_groups_need_fine_message() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+
+        let mut transport = MockTransport::new(vec![
+            Message::HelloAck {
+                version: PROTOCOL_VERSION,
+                page_size: conn.page_size(),
+                page_count: 0,
+            },
+            Message::Done,
+        ]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected GroupsNeedFine")
+        ));
+    }
+
+    #[tokio::test]
+    async fn coarse_pass_rejects_missing_done_after_empty_need_fine() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+
+        let mut transport = MockTransport::new(vec![
+            Message::HelloAck {
+                version: PROTOCOL_VERSION,
+                page_size: conn.page_size(),
+                page_count: 0,
+            },
+            Message::GroupsNeedFine {
+                group_indices: vec![],
+            },
+            Message::Error {
+                message: "no done for you".into(),
+            },
+        ]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected Done after empty GroupsNeedFine")
+        ));
+    }
+
+    #[tokio::test]
+    async fn fine_pass_handles_early_done_from_origin() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+
+        let mut transport = MockTransport::new(vec![
+            Message::HelloAck {
+                version: PROTOCOL_VERSION,
+                page_size: conn.page_size(),
+                page_count: 0,
+            },
+            Message::GroupsNeedFine {
+                group_indices: vec![0],
+            },
+            Message::Done,
+        ]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            !transport
+                .sent
+                .iter()
+                .any(|m| matches!(m, Message::PagesAck { .. })),
+            "no PagesAck should be sent when origin ends early with Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn fine_pass_rejects_unexpected_message_instead_of_sendpages_or_done() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+
+        let mut transport = MockTransport::new(vec![
+            Message::HelloAck {
+                version: PROTOCOL_VERSION,
+                page_size: conn.page_size(),
+                page_count: 0,
+            },
+            Message::GroupsNeedFine {
+                group_indices: vec![0],
+            },
+            Message::Error {
+                message: "boom".into(),
+            },
+        ]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected SendPages or Done")
+        ));
+    }
+
+    #[tokio::test]
+    async fn fine_pass_rejects_missing_final_done() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+        // Give the replica at least one real page so group 0's fine-pass
+        // request actually walks the `first_page..=last_page` loop instead
+        // of sending an empty PageHashes.
+        conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'hello')").unwrap();
+        let page_size = conn.page_size();
+        let page_count = conn.page_count().unwrap();
+
+        let mut transport = MockTransport::new(vec![
+            Message::HelloAck {
+                version: PROTOCOL_VERSION,
+                page_size,
+                page_count,
+            },
+            Message::GroupsNeedFine {
+                group_indices: vec![0],
+            },
+            Message::SendPages {
+                pages: vec![PageData {
+                    page_no: 1,
+                    data: vec![0u8; page_size as usize],
+                }],
+            },
+            Message::Error {
+                message: "no final done".into(),
+            },
+        ]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("expected Done after fine pass")
+        ));
+        assert!(matches!(
+            transport.sent.iter().find(|m| matches!(m, Message::PagesAck { .. })),
+            Some(Message::PagesAck { page_nos }) if page_nos == &vec![1]
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_exhausted_returns_protocol_error() {
+        let file = NamedTempFile::new().unwrap();
+        let conn = open_rw(file.path());
+
+        let mut transport = MockTransport::new(vec![]);
+
+        let result = run(&conn, &mut transport).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::SyncError::Protocol(message))
+                if message.contains("mock transport exhausted input")
         ));
     }
 }

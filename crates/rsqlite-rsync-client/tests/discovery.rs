@@ -38,6 +38,20 @@ async fn candidates_picks_writer_not_first_candidate() {
 }
 
 #[tokio::test]
+async fn candidates_skips_candidate_with_failing_status_rpc() {
+    let failing = MockServer::start(
+        MockGateway::replica().default_behavior(support::Behavior::Fail(tonic::Code::Unavailable, "error"))
+    ).await;
+    let writer = MockServer::start(MockGateway::writer()).await;
+    let client = SqlGatewayClient::new(ClientConfig::new(DiscoveryMode::Candidates(vec![
+        failing.endpoint(),
+        writer.endpoint(),
+    ])));
+    let endpoint = client.discover_leader().await.unwrap();
+    assert_eq!(endpoint, writer.endpoint());
+}
+
+#[tokio::test]
 async fn candidates_skips_unreachable_candidate() {
     let writer = MockServer::start(MockGateway::writer()).await;
     let client = SqlGatewayClient::new(ClientConfig::new(DiscoveryMode::Candidates(vec![

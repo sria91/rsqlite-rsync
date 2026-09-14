@@ -41,3 +41,70 @@ pub(crate) async fn compute_with_parallelism<T: Send + 'static>(
         serial_fn()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_with_configured_pool_custom_threads() {
+        let tuning = SyncTuning {
+            max_hash_threads: Some(2),
+            parallel_min_pages: 10,
+            hash_chunk_groups: 16,
+        };
+        let res = with_configured_pool(&tuning, || 42).await;
+        assert_eq!(res, 42);
+    }
+
+    #[tokio::test]
+    async fn test_with_configured_pool_fallback_when_none_or_zero() {
+        let tuning_none = SyncTuning {
+            max_hash_threads: None,
+            parallel_min_pages: 10,
+            hash_chunk_groups: 16,
+        };
+        let res1 = with_configured_pool(&tuning_none, || 100).await;
+        assert_eq!(res1, 100);
+
+        let tuning_zero = SyncTuning {
+            max_hash_threads: Some(0),
+            parallel_min_pages: 10,
+            hash_chunk_groups: 16,
+        };
+        let res2 = with_configured_pool(&tuning_zero, || 200).await;
+        assert_eq!(res2, 200);
+    }
+
+    // Named (rather than inline) so that whichever call below actually
+    // invokes a given one, its body is exercised at least once: passing a
+    // fresh `|| vec![...]` closure literal at each call site would leave
+    // whichever slot isn't taken (parallel_fn on the serial branch, or vice
+    // versa) permanently unexecuted, since a closure argument that is never
+    // called never runs its body.
+    fn parallel_result() -> Vec<i32> {
+        vec![1, 2, 3]
+    }
+
+    fn serial_result() -> Vec<i32> {
+        vec![9, 9, 9]
+    }
+
+    #[tokio::test]
+    async fn test_compute_with_parallelism_branches() {
+        let tuning = SyncTuning {
+            max_hash_threads: Some(2),
+            parallel_min_pages: 100,
+            hash_chunk_groups: 16,
+        };
+
+        // Parallel branch: item_count >= 100
+        let res_par =
+            compute_with_parallelism(&tuning, 150, parallel_result, serial_result).await;
+        assert_eq!(res_par, vec![1, 2, 3]);
+
+        // Serial branch: item_count < 100
+        let res_ser = compute_with_parallelism(&tuning, 50, parallel_result, serial_result).await;
+        assert_eq!(res_ser, vec![9, 9, 9]);
+    }
+}

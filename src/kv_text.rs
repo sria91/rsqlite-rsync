@@ -148,4 +148,14 @@ mod tests {
             Some("a=1".to_string())
         );
     }
+
+    #[test]
+    fn read_optional_kv_text_propagates_non_not_found_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Reading a directory as if it were a file produces an I/O error
+        // that is NOT `ErrorKind::NotFound`, and must be propagated as-is
+        // rather than treated as "no record".
+        let err = read_optional_kv_text(tmp.path()).unwrap_err();
+        assert_ne!(err.kind(), ErrorKind::NotFound);
+    }
 }

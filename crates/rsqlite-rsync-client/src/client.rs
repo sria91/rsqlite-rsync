@@ -357,22 +357,33 @@ impl SqlGatewayClient {
                     }
 
                     // Check if the server suggested a new leader endpoint.
-                    if let Some(leader_ep) = status.metadata().get(HEADER_RSQLITE_LEADER_ENDPOINT) {
-                        if let Ok(ep_str) = leader_ep.to_str() {
-                            if !ep_str.is_empty() {
-                                self.current_endpoint = Some(normalize_endpoint(ep_str));
-                                self.tonic_client = None;
-                            }
-                        }
-                    } else {
-                        // Reset connection to force rediscovery on next attempt.
-                        self.reset_connection();
-                    }
+                    self.process_leader_header(&status);
 
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     backoff_ms = next_backoff(backoff_ms, self.config.max_backoff_ms);
                 }
             }
+        }
+    }
+
+    /// Process the `HEADER_RSQLITE_LEADER_ENDPOINT` header from a gRPC status.
+    ///
+    /// If the header is present and contains a non-empty endpoint, update the
+    /// current endpoint and reset the tonic client to force rediscovery.
+    /// If the header is not present, reset the connection to force rediscovery.
+    fn process_leader_header(&mut self, status: &tonic::Status) {
+        // Check if the server suggested a new leader endpoint.
+        if let Some(ep_str) = status
+            .metadata()
+            .get(HEADER_RSQLITE_LEADER_ENDPOINT)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            self.current_endpoint = Some(normalize_endpoint(ep_str));
+            self.tonic_client = None;
+        } else {
+            // Header absent, invalid UTF-8, or empty: reset connection to force rediscovery on next attempt.
+            self.reset_connection();
         }
     }
 }
@@ -384,6 +395,7 @@ pub(crate) fn next_backoff(current_ms: u64, max_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tonic::{Code, Status};
 
     #[test]
     fn next_backoff_doubles_until_clamped_at_max() {
@@ -399,5 +411,112 @@ mod tests {
     fn next_backoff_saturates_instead_of_overflowing() {
         assert_eq!(next_backoff(u64::MAX, 2000), 2000);
         assert_eq!(next_backoff(u64::MAX / 2 + 1, 2000), 2000);
+    }
+
+    #[test]
+    fn test_sql_gateway_client_clone() {
+        let client = SqlGatewayClient::new(ClientConfig::new(
+            crate::discovery::DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
+        ));
+        let cloned = client.clone();
+        assert_eq!(cloned.current_endpoint, None);
+    }
+
+    #[tokio::test]
+    async fn test_client_discover_leader_direct() {
+        use crate::discovery::DiscoveryMode;
+        let client = SqlGatewayClient::new(ClientConfig::new(DiscoveryMode::Direct(
+            "127.0.0.1:50051".to_string(),
+        )));
+        let ep = client.discover_leader().await.unwrap();
+        assert_eq!(ep, "http://127.0.0.1:50051");
+    }
+
+    #[test]
+    fn test_authorized_request() {
+        let req_none = authorized_request(&None, ());
+        assert!(req_none.metadata().get("authorization").is_none());
+
+        let req_some = authorized_request(&Some("token123".to_string()), ());
+        assert_eq!(
+            req_some.metadata().get("authorization").unwrap().to_str().unwrap(),
+            "Bearer token123"
+        );
+
+        let req_invalid = authorized_request(&Some("token\nwith\ninvalid\x00chars".to_string()), ());
+        assert!(req_invalid.metadata().get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_leader_header_present_and_non_empty() {
+        let mut client = SqlGatewayClient::new(ClientConfig::new(
+            crate::discovery::DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
+        ));
+        client.current_endpoint = Some("http://old.endpoint".to_string());
+        // connect_lazy() still requires a tokio runtime to construct the channel
+        let channel = Endpoint::from_shared("http://dummy").unwrap().connect_lazy();
+        client.tonic_client = Some(TonicSqlGatewayClient::new(channel));
+
+        // Create a status with a non-empty leader endpoint header
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(HEADER_RSQLITE_LEADER_ENDPOINT, "http://new.endpoint".parse().unwrap());
+        let status = Status::with_metadata(
+            Code::Unknown,
+            "test",
+            metadata,
+        );
+
+        client.process_leader_header(&status);
+        assert_eq!(client.current_endpoint, Some("http://new.endpoint".to_string()));
+        assert!(client.tonic_client.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_leader_header_present_but_empty() {
+        let mut client = SqlGatewayClient::new(ClientConfig::new(
+            crate::discovery::DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
+        ));
+        client.current_endpoint = Some("http://old.endpoint".to_string());
+        // connect_lazy() still requires a tokio runtime to construct the channel
+        let channel = Endpoint::from_shared("http://dummy").unwrap().connect_lazy();
+        client.tonic_client = Some(TonicSqlGatewayClient::new(channel));
+
+        // Create a status with an empty leader endpoint header
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(HEADER_RSQLITE_LEADER_ENDPOINT, "".parse().unwrap());
+        let status = Status::with_metadata(
+            Code::Unknown,
+            "test",
+            metadata,
+        );
+
+        client.process_leader_header(&status);
+        // Should reset the connection because the header value is empty
+        assert!(client.current_endpoint.is_none());
+        assert!(client.tonic_client.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_leader_header_absent() {
+        let mut client = SqlGatewayClient::new(ClientConfig::new(
+            crate::discovery::DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
+        ));
+        client.current_endpoint = Some("http://old.endpoint".to_string());
+        // connect_lazy() still requires a tokio runtime to construct the channel
+        let channel = Endpoint::from_shared("http://dummy").unwrap().connect_lazy();
+        client.tonic_client = Some(TonicSqlGatewayClient::new(channel));
+
+        // Create a status without the leader endpoint header
+        let metadata = tonic::metadata::MetadataMap::new();
+        let status = Status::with_metadata(
+            Code::Unknown,
+            "test",
+            metadata,
+        );
+
+        client.process_leader_header(&status);
+        // Should reset the connection
+        assert!(client.current_endpoint.is_none());
+        assert!(client.tonic_client.is_none());
     }
 }

@@ -322,3 +322,102 @@ pub async fn pull_sync_with_tuning(
     close_result?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `RSQLITE_RSYNC_*` tuning env vars are process-global; serialize
+    /// tests that mutate them so they can't race each other.
+    static TUNING_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn sync_tuning_from_env_falls_back_to_default_on_invalid_values() {
+        let _guard = TUNING_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("RSQLITE_RSYNC_MAX_HASH_THREADS", "not-a-number");
+            std::env::set_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES", "0");
+            std::env::set_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS", "-1");
+        }
+
+        let tuning = SyncTuning::from_env();
+        let default = SyncTuning::default();
+        assert_eq!(tuning.max_hash_threads, default.max_hash_threads);
+        assert_eq!(tuning.parallel_min_pages, default.parallel_min_pages);
+        assert_eq!(tuning.hash_chunk_groups, default.hash_chunk_groups);
+
+        unsafe {
+            std::env::remove_var("RSQLITE_RSYNC_MAX_HASH_THREADS");
+            std::env::remove_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES");
+            std::env::remove_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS");
+        }
+    }
+
+    #[test]
+    fn test_sync_tuning_should_parallelize() {
+        let tuning = SyncTuning {
+            max_hash_threads: None,
+            parallel_min_pages: 100,
+            hash_chunk_groups: 16,
+        };
+        assert!(tuning.should_parallelize(100));
+        assert!(tuning.should_parallelize(101));
+        assert!(!tuning.should_parallelize(99));
+    }
+
+    #[test]
+    fn test_sync_tuning_from_env() {
+        let _guard = TUNING_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RSQLITE_RSYNC_MAX_HASH_THREADS", "4"); }
+        unsafe { std::env::set_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES", "200"); }
+        unsafe { std::env::set_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS", "32"); }
+
+        let tuning = SyncTuning::from_env();
+        assert_eq!(tuning.max_hash_threads, Some(4));
+        assert_eq!(tuning.parallel_min_pages, 200);
+        assert_eq!(tuning.hash_chunk_groups, 32);
+
+        // cleanup
+        unsafe { std::env::remove_var("RSQLITE_RSYNC_MAX_HASH_THREADS"); }
+        unsafe { std::env::remove_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES"); }
+        unsafe { std::env::remove_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS"); }
+    }
+
+    #[tokio::test]
+    async fn test_sync_local_replica_open_failure() {
+        let work_dir = tempfile::tempdir().unwrap();
+        let origin_path = work_dir.path().join("origin.db");
+        Connection::open(
+            &origin_path,
+            ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+
+        let invalid_replica_path = work_dir.path().join("nonexistent_dir/replica.db");
+        let tuning = SyncTuning::default();
+
+        let result = sync_local_with_tuning(&origin_path, &invalid_replica_path, &tuning).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pull_sync_replica_open_failure() {
+        let work_dir = tempfile::tempdir().unwrap();
+        let invalid_replica_path = work_dir.path().join("nonexistent_dir/replica.db");
+        let tuning = SyncTuning::default();
+        let ssh_options = SshConnectOptions::default();
+
+        let result = pull_sync_with_tuning(
+            "dummy_host",
+            "dummy_origin",
+            &invalid_replica_path,
+            "dummy_exe",
+            &[],
+            &ssh_options,
+            &tuning,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+}

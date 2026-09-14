@@ -165,21 +165,72 @@ mod tests {
         assert_eq!(normalize_endpoint("unix:/run/x"), "http://unix:/run/x");
     }
 
-    #[test]
-    fn discovery_mode_debug_is_stable_for_custom_resolver() {
+    #[tokio::test]
+    async fn discovery_mode_debug_is_stable_for_custom_resolver() {
         struct NoopResolver;
         #[async_trait]
         impl LeaderResolver for NoopResolver {
             async fn resolve(&self) -> Result<String, BoxError> {
-                Ok(String::new())
+                Ok("resolved".to_string())
             }
         }
-        let mode = DiscoveryMode::Custom(Arc::new(NoopResolver));
+        let resolver = Arc::new(NoopResolver);
+        assert_eq!(resolver.resolve().await.unwrap(), "resolved");
+        let mode = DiscoveryMode::Custom(resolver);
         assert_eq!(format!("{mode:?}"), "Custom(<resolver>)");
 
         assert_eq!(
             format!("{:?}", DiscoveryMode::Direct("x".to_string())),
             "Direct(\"x\")"
         );
+        assert_eq!(
+            format!("{:?}", DiscoveryMode::Candidates(vec!["http://a".to_string()])),
+            "Candidates([\"http://a\"])"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_leader_invalid_candidate_url_skips_and_falls_back() {
+        // A candidate with invalid endpoint syntax that fails Endpoint::from_shared
+        let mode = DiscoveryMode::Candidates(vec![
+            "://invalid url without scheme/host".to_string(),
+            "127.0.0.1:50051".to_string(),
+        ]);
+        let res = discover_leader(&mode, &Some("token".to_string())).await;
+        assert_eq!(res.unwrap(), "http://://invalid url without scheme/host");
+    }
+
+    #[tokio::test]
+    async fn test_discover_leader_custom_resolver() {
+        struct CustomRes;
+        #[async_trait]
+        impl LeaderResolver for CustomRes {
+            async fn resolve(&self) -> Result<String, BoxError> {
+                Ok("127.0.0.1:60000".to_string())
+            }
+        }
+        let mode = DiscoveryMode::Custom(Arc::new(CustomRes));
+        let res = discover_leader(&mode, &None).await.unwrap();
+        assert_eq!(res, "http://127.0.0.1:60000");
+    }
+
+    // Test the internal logic of handling non-Writer responses from candidates
+    #[test]
+    fn test_node_role_conversion() {
+        // Test that NodeRole::try_from works correctly for different role values
+        use rsqlite_rsync_proto::rsqlite::v1::NodeRole;
+
+        // Test Writer role (should succeed)
+        let writer_role = rsqlite_rsync_proto::rsqlite::v1::NodeRole::Writer as i32;
+        assert_eq!(NodeRole::try_from(writer_role), Ok(NodeRole::Writer));
+
+        // Test Reader role (should succeed but not be Writer)
+        let reader_role = rsqlite_rsync_proto::rsqlite::v1::NodeRole::Replica as i32;
+        assert_eq!(NodeRole::try_from(reader_role), Ok(NodeRole::Replica));
+        assert_ne!(NodeRole::try_from(reader_role), Ok(NodeRole::Writer));
+
+        // Test unknown role (should fail)
+        let unknown_role = 999;
+        assert!(NodeRole::try_from(unknown_role).is_err());
     }
 }

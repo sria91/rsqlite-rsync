@@ -277,32 +277,60 @@ data:
       echo "default-replica-sync: failed to reach ${writer_host} over ssh" >&2
       exit 1
     fi
-    [ -z "$remote_dbs" ] && exit 0
-
-    # Every file is still attempted even if one fails (a transient failure
-    # on one database shouldn't stall the others), but any failure makes the
-    # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
-    # sync as fresh -- an incomplete sync must not look complete to the
-    # freshness ledger that failover promotion decisions read.
+    # When the writer has zero databases, remote_dbs is empty -- skip
+    # the sync loop but still run the stale-file cleanup below so that
+    # dropping the last database propagates to replicas too.
     sync_failed=0
-    for remote_path in $remote_dbs; do
-      name="$(basename "$remote_path")"
-      # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
-      # src/transport/ssh.rs), so each one needs the combined -oKey=Value
-      # form rather than a bare Key=Value -- and clap rejects a
-      # hyphen-looking value passed as a separate token unless given as
-      # --flag=value (no space), since it otherwise looks like an
-      # unrecognized flag of its own.
-      if ! rsqlite-rsync \
-        --ssh-opt="-oIdentityFile=${ssh_key}" \
-        --ssh-opt="-oStrictHostKeyChecking=no" \
-        --ssh-opt="-oUserKnownHostsFile=/dev/null" \
-        --ssh-opt="-oPort=${ssh_port}" \
-        --ssh-connect-timeout 5 \
-        "${ssh_user}@${writer_host}:${remote_path}" \
-        "${data_dir}/${name}"; then
-        echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
-        sync_failed=1
+    if [ -n "$remote_dbs" ]; then
+      # Every file is still attempted even if one fails (a transient failure
+      # on one database shouldn't stall the others), but any failure makes the
+      # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
+      # sync as fresh -- an incomplete sync must not look complete to the
+      # freshness ledger that failover promotion decisions read.
+      for remote_path in $remote_dbs; do
+        name="$(basename "$remote_path")"
+        # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
+        # src/transport/ssh.rs), so each one needs the combined -oKey=Value
+        # form rather than a bare Key=Value -- and clap rejects a
+        # hyphen-looking value passed as a separate token unless given as
+        # --flag=value (no space), since it otherwise looks like an
+        # unrecognized flag of its own.
+        if ! rsqlite-rsync \
+          --ssh-opt="-oIdentityFile=${ssh_key}" \
+          --ssh-opt="-oStrictHostKeyChecking=no" \
+          --ssh-opt="-oUserKnownHostsFile=/dev/null" \
+          --ssh-opt="-oPort=${ssh_port}" \
+          --ssh-connect-timeout 5 \
+          "${ssh_user}@${writer_host}:${remote_path}" \
+          "${data_dir}/${name}"; then
+          echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
+          sync_failed=1
+        fi
+      done
+    fi
+
+    # ── Remove local databases the writer no longer has ──────────────
+    # Build a set of basenames the writer currently serves, then delete
+    # any local .db (+ sidecars) not in that set.  We only reach here
+    # after a successful SSH listing (the `if ! remote_dbs=...` guard
+    # above exits 1 on connectivity failure), so remote_dbs is the
+    # authoritative source of truth -- including the empty-set case
+    # when the writer has dropped all databases.
+    for local_path in "${data_dir}"/*.db; do
+      [ -e "$local_path" ] || continue          # glob didn't match
+      local_name="$(basename "$local_path")"
+      found=0
+      for remote_path in $remote_dbs; do
+        if [ "$(basename "$remote_path")" = "$local_name" ]; then
+          found=1
+          break
+        fi
+      done
+      if [ "$found" = "0" ]; then
+        for suffix in "" "-wal" "-shm" "-journal"; do
+          rm -f "${data_dir}/${local_name}${suffix}"
+        done
+        echo "default-replica-sync: removed stale ${local_name} (no longer on writer)" >&2
       fi
     done
 

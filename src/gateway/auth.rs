@@ -107,6 +107,22 @@ mod tests {
     }
 
     #[test]
+    fn required_rejects_non_utf8_header_value() {
+        let auth = AuthConfig::required("secret".into());
+        let mut request = request();
+        // `HeaderValue`/`AsciiMetadataValue` permit opaque, non-UTF-8 octets
+        // (bytes 0x80-0xFF are "visible" enough for `from_bytes` even though
+        // they aren't valid UTF-8), so a peer can send a header that passes
+        // construction but fails the `to_str()` call in `check`.
+        let value = tonic::metadata::MetadataValue::try_from(&[0xFFu8, 0xFE][..])
+            .expect("opaque bytes are a valid ascii-metadata value");
+        request.metadata_mut().insert("authorization", value);
+
+        let err = auth.check(request).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
     fn required_rejects_wrong_scheme() {
         let auth = AuthConfig::required("secret".into());
         let err = auth.check(request_with_header("Basic secret")).unwrap_err();

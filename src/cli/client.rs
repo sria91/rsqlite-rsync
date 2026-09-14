@@ -1017,49 +1017,60 @@ fn parse_cli_parameters(raw_params: &[String]) -> Result<Option<Parameters>> {
         if let Some((k, v)) = p.split_once('=') {
             named.push(NamedParameter {
                 name: k.trim().to_string(),
-                value: Some(parse_string_to_value(v.trim())),
+                value: Some(parse_string_to_value(v.trim())?),
             });
         } else {
-            positional.push(parse_string_to_value(p.trim()));
+            positional.push(parse_string_to_value(p.trim())?);
         }
     }
 
     Ok(Some(Parameters { positional, named }))
 }
 
-fn parse_string_to_value(s: &str) -> Value {
+fn parse_string_to_value(s: &str) -> Result<Value> {
     if s.eq_ignore_ascii_case("null") {
-        Value {
+        Ok(Value {
             value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(
                 true,
             )),
-        }
+        })
     } else if let Ok(i) = s.parse::<i64>() {
-        Value {
+        Ok(Value {
             value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(i)),
-        }
+        })
     } else if let Ok(f) = s.parse::<f64>() {
-        Value {
+        Ok(Value {
             value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(
                 f,
             )),
-        }
+        })
     } else if let Some(hex) = s.strip_prefix("x'").and_then(|h| h.strip_suffix('\'')) {
-        let bytes = (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..(i + 2).min(hex.len())], 16).ok())
-            .collect();
-        Value {
+        if hex.len() % 2 != 0 {
+            return Err(SyncError::Protocol(format!(
+                "invalid hex blob literal '{s}': odd number of hex digits"
+            )));
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for i in (0..hex.len()).step_by(2) {
+            let byte = u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| {
+                SyncError::Protocol(format!(
+                    "invalid hex blob literal '{s}': non-hex digit in '{}'",
+                    &hex[i..i + 2]
+                ))
+            })?;
+            bytes.push(byte);
+        }
+        Ok(Value {
             value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(
                 bytes,
             )),
-        }
+        })
     } else {
-        Value {
+        Ok(Value {
             value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
                 s.to_string(),
             )),
-        }
+        })
     }
 }
 
@@ -1116,6 +1127,9 @@ fn is_query_sql(sql: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+    use rsqlite_rsync::proto::rsqlite::v1::{
+        statement_result, ColumnHeader, DatabaseInfo, LeaseStatus, Row, StatementResult,
+    };
 
     fn default_test_args() -> ClientConnectionArgs {
         ClientConnectionArgs {
@@ -1138,6 +1152,13 @@ mod tests {
 
     #[test]
     fn test_client_target_resolution_modes() {
+        unsafe {
+            std::env::remove_var("RSQLITE_DATA_DIR");
+            std::env::remove_var("RSQLITE_ENDPOINT");
+            std::env::remove_var("RSQLITE_ENDPOINTS");
+            std::env::remove_var("RSQLITE_KUBE_LEASE");
+        }
+
         // Explicit Local Mode with data_dir
         let mut args = default_test_args();
         args.mode = CliRuntimeMode::Local;
@@ -1193,5 +1214,713 @@ mod tests {
         let args_default = default_test_args();
         let target = args_default.to_client_target().unwrap();
         assert!(matches!(target, ClientTarget::Remote { .. }));
+    }
+
+    #[test]
+    fn test_tx_mode_and_consistency_conversions() {
+        assert_eq!(
+            BatchTransactionMode::from(CliTxMode::Deferred),
+            BatchTransactionMode::Deferred
+        );
+        assert_eq!(
+            BatchTransactionMode::from(CliTxMode::Immediate),
+            BatchTransactionMode::Immediate
+        );
+        assert_eq!(
+            BatchTransactionMode::from(CliTxMode::Exclusive),
+            BatchTransactionMode::Exclusive
+        );
+        assert_eq!(
+            BatchTransactionMode::from(CliTxMode::None),
+            BatchTransactionMode::None
+        );
+
+        assert_eq!(
+            ConsistencyLevel::from(CliConsistency::Strong),
+            ConsistencyLevel::Strong
+        );
+        assert_eq!(
+            ConsistencyLevel::from(CliConsistency::Eventual),
+            ConsistencyLevel::Eventual
+        );
+    }
+
+    #[test]
+    fn test_formatting_helpers() {
+        assert_eq!(format_sql_value(&SqlValue::Null), "NULL");
+        assert_eq!(format_sql_value(&SqlValue::Integer(42)), "42");
+        assert_eq!(format_sql_value(&SqlValue::Float(3.5)), "3.5");
+        assert_eq!(format_sql_value(&SqlValue::Text("hello".into())), "hello");
+        assert_eq!(
+            format_sql_value(&SqlValue::Blob(vec![0xde, 0xad, 0xbe, 0xef])),
+            "x'deadbeef'"
+        );
+
+        assert_eq!(sql_value_to_json(&SqlValue::Null), serde_json::Value::Null);
+        assert_eq!(
+            sql_value_to_json(&SqlValue::Integer(100)),
+            serde_json::json!(100)
+        );
+        assert_eq!(
+            sql_value_to_json(&SqlValue::Float(1.5)),
+            serde_json::json!(1.5)
+        );
+        assert_eq!(
+            sql_value_to_json(&SqlValue::Float(f64::NAN)),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            sql_value_to_json(&SqlValue::Text("abc".into())),
+            serde_json::json!("abc")
+        );
+        assert_eq!(
+            sql_value_to_json(&SqlValue::Blob(vec![1, 2])),
+            serde_json::json!("x'0102'")
+        );
+
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x0a, 0xff]), "0aff");
+
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn test_parse_string_to_value() {
+        let v_null = parse_string_to_value("null").unwrap();
+        assert!(matches!(
+            v_null.value,
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true))
+        ));
+
+        let v_null_upper = parse_string_to_value("NULL").unwrap();
+        assert!(matches!(
+            v_null_upper.value,
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true))
+        ));
+
+        let v_int = parse_string_to_value("12345").unwrap();
+        assert!(matches!(
+            v_int.value,
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(12345))
+        ));
+
+        let v_float = parse_string_to_value("12.34").unwrap();
+        assert!(matches!(
+            v_float.value,
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::FloatValue(f)) if (f - 12.34).abs() < 1e-6
+        ));
+
+        let v_blob = parse_string_to_value("x'cafebabe'").unwrap();
+        assert!(matches!(
+            v_blob.value,
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(ref b)) if b == &[0xca, 0xfe, 0xba, 0xbe]
+        ));
+
+        let v_empty_blob = parse_string_to_value("x''").unwrap();
+        assert!(matches!(
+            v_empty_blob.value,
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::BlobValue(ref b)) if b.is_empty()
+        ));
+
+        let v_text = parse_string_to_value("plain string").unwrap();
+        assert!(matches!(
+            v_text.value,
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(ref s)) if s == "plain string"
+        ));
+    }
+
+    #[test]
+    fn test_parse_string_to_value_rejects_malformed_hex_blob() {
+        let err = parse_string_to_value("x'abc'").unwrap_err();
+        assert!(err.to_string().contains("odd number of hex digits"));
+
+        let err = parse_string_to_value("x'zz'").unwrap_err();
+        assert!(err.to_string().contains("non-hex digit"));
+
+        let err = parse_string_to_value("x'ca0g'").unwrap_err();
+        assert!(err.to_string().contains("non-hex digit"));
+    }
+
+    #[test]
+    fn test_parse_cli_parameters() {
+        assert!(parse_cli_parameters(&[]).unwrap().is_none());
+
+        let params = vec![
+            "123".to_string(),
+            "name=alice".to_string(),
+            "null".to_string(),
+        ];
+        let parsed = parse_cli_parameters(&params).unwrap().unwrap();
+        assert_eq!(parsed.positional.len(), 2);
+        assert_eq!(parsed.named.len(), 1);
+        assert_eq!(parsed.named[0].name, "name");
+    }
+
+    #[test]
+    fn test_parse_cli_parameters_propagates_malformed_hex_error() {
+        let err = parse_cli_parameters(&["x'zz'".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-hex digit"));
+
+        let err = parse_cli_parameters(&["k=x'abc'".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("odd number of hex digits"));
+    }
+
+    #[test]
+    fn test_split_sql_statements() {
+        let sql = "CREATE TABLE t (id INT); INSERT INTO t VALUES ('semi;colon', \"quoted;col\"); ;";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].sql, "CREATE TABLE t (id INT)");
+        assert_eq!(
+            stmts[1].sql,
+            "INSERT INTO t VALUES ('semi;colon', \"quoted;col\")"
+        );
+
+        // Trailing statement without semicolon
+        let trailing_sql = "SELECT 1; SELECT 2";
+        let trailing_stmts = split_sql_statements(trailing_sql);
+        assert_eq!(trailing_stmts.len(), 2);
+        assert_eq!(trailing_stmts[0].sql, "SELECT 1");
+        assert_eq!(trailing_stmts[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn test_is_query_sql() {
+        assert!(is_query_sql("SELECT 1;"));
+        assert!(is_query_sql("  select * from t"));
+        assert!(is_query_sql("PRAGMA table_info(t);"));
+        assert!(is_query_sql("EXPLAIN SELECT 1;"));
+        assert!(is_query_sql("WITH cte AS (SELECT 1) SELECT * FROM cte;"));
+        assert!(!is_query_sql("INSERT INTO t VALUES (1);"));
+        assert!(!is_query_sql("UPDATE t SET id = 2;"));
+        assert!(!is_query_sql("DELETE FROM t;"));
+        assert!(!is_query_sql("CREATE TABLE t (id INT);"));
+    }
+
+    #[test]
+    fn test_node_role_str() {
+        assert_eq!(node_role_str(NodeRole::Writer as i32), "writer");
+        assert_eq!(node_role_str(NodeRole::Replica as i32), "replica");
+        assert_eq!(node_role_str(999), "unspecified");
+    }
+
+    #[test]
+    fn test_print_functions() {
+        let exec_resp = ExecuteResponse {
+            rows_affected: 1,
+            last_insert_rowid: 42,
+            execution_time_us: 1500,
+            generation: 1,
+        };
+        print_execute_response(&exec_resp);
+
+        let batch_resp_ok = BatchResponse {
+            committed: true,
+            results: vec![StatementResult {
+                result: Some(statement_result::Result::ExecuteResult(ExecuteResponse {
+                    rows_affected: 1,
+                    last_insert_rowid: 1,
+                    execution_time_us: 500,
+                    generation: 1,
+                })),
+                error: String::new(),
+            }],
+            total_execution_time_us: 1000,
+            generation: 1,
+        };
+        print_batch_response(&batch_resp_ok);
+
+        let batch_resp_err = BatchResponse {
+            committed: false,
+            results: vec![StatementResult {
+                result: None,
+                error: "syntax error".to_string(),
+            }],
+            total_execution_time_us: 500,
+            generation: 1,
+        };
+        print_batch_response(&batch_resp_err);
+
+        let query_resp = QueryResponse {
+            columns: vec![
+                ColumnHeader {
+                    name: "id".to_string(),
+                    column_type: 1,
+                    declared_type: "INTEGER".to_string(),
+                },
+                ColumnHeader {
+                    name: "notes".to_string(),
+                    column_type: 3,
+                    declared_type: "".to_string(),
+                },
+            ],
+            rows: vec![
+                Row {
+                    values: vec![
+                        Value {
+                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(1)),
+                        },
+                        Value {
+                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
+                                "val,with\"comma\nand newline".to_string(),
+                            )),
+                        },
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value {
+                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true)),
+                        },
+                        Value {
+                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true)),
+                        },
+                    ],
+                },
+            ],
+            total_rows: 2,
+            execution_time_us: 2000,
+            generation: 1,
+            is_replica_read: false,
+        };
+
+        print_query_response(&query_resp, OutputFormat::Table);
+        print_query_response(&query_resp, OutputFormat::Json);
+        print_query_response(&query_resp, OutputFormat::Csv);
+        print_query_response(&query_resp, OutputFormat::Tsv);
+        print_query_response(&query_resp, OutputFormat::Raw);
+
+        let status_resp = ClusterStatusResponse {
+            node_id: "node-1".to_string(),
+            role: NodeRole::Writer as i32,
+            current_leader_id: "node-1".to_string(),
+            current_leader_endpoint: "http://127.0.0.1:50051".to_string(),
+            local_generation: 1,
+            uptime_secs: 3600,
+            version: "0.1.0".to_string(),
+            databases: vec![DatabaseInfo {
+                name: "test.db".to_string(),
+                file_size_bytes: 4096,
+                page_size: 4096,
+                page_count: 1,
+                journal_mode: "wal".to_string(),
+            }],
+            lease: Some(LeaseStatus {
+                is_held: true,
+                generation: 1,
+                holder_node_id: "node-1".to_string(),
+                renewed_at_secs: 1000,
+                ttl_secs: 30,
+                is_expired: false,
+            }),
+        };
+
+        print_cluster_status(&status_resp, OutputFormat::Json);
+        print_cluster_status(&status_resp, OutputFormat::Table);
+
+        let status_empty_dbs = ClusterStatusResponse {
+            node_id: "node-2".to_string(),
+            role: NodeRole::Replica as i32,
+            current_leader_id: String::new(),
+            current_leader_endpoint: String::new(),
+            local_generation: 0,
+            uptime_secs: 10,
+            version: "0.1.0".to_string(),
+            databases: vec![],
+            lease: Some(LeaseStatus {
+                is_held: false,
+                generation: 0,
+                holder_node_id: "node-1".to_string(),
+                renewed_at_secs: 0,
+                ttl_secs: 10,
+                is_expired: true,
+            }),
+        };
+        print_cluster_status(&status_empty_dbs, OutputFormat::Table);
+    }
+
+    #[test]
+    fn test_discovery_config_branches() {
+        let mut args = default_test_args();
+        args.endpoint = None;
+        args.kube_lease = Some("sqlite-lease".to_string());
+        args.kube_context = Some("ctx".to_string());
+        args.kubeconfig = Some(PathBuf::from("/path/to/config"));
+        let cfg = args.to_client_config();
+        assert!(matches!(cfg.discovery, DiscoveryMode::Custom(_)));
+
+        let mut args_candidates = default_test_args();
+        args_candidates.endpoints = vec!["http://10.0.0.1:50051".to_string()];
+        let cfg2 = args_candidates.to_client_config();
+        assert!(matches!(cfg2.discovery, DiscoveryMode::Candidates(_)));
+    }
+
+    static CLIENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_dirs_next_history_path() {
+        let _guard = CLIENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", "/tmp/mockhome"); }
+        let p = dirs_next_history_path();
+        assert_eq!(p, Some(PathBuf::from("/tmp/mockhome/.rsqlite_history")));
+
+        unsafe { std::env::remove_var("HOME"); }
+        let p2 = dirs_next_history_path();
+        assert_eq!(p2, None);
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h); }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_client_commands_and_metacommands() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut args = default_test_args();
+        args.mode = CliRuntimeMode::Local;
+        args.data_dir = Some(temp_dir.path().to_path_buf());
+
+        // 1. Exec command
+        let exec_cmd = ClientCommand::Exec {
+            database: "app.db".to_string(),
+            sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);".to_string(),
+            params: vec![],
+        };
+        run_client_command(&args, &exec_cmd).await.unwrap();
+
+        // 2. Exec with parameters
+        let insert_cmd = ClientCommand::Exec {
+            database: "app.db".to_string(),
+            sql: "INSERT INTO users (id, name) VALUES (?, ?);".to_string(),
+            params: vec!["1".to_string(), "alice".to_string()],
+        };
+        run_client_command(&args, &insert_cmd).await.unwrap();
+
+        // 3. Query command
+        let query_cmd = ClientCommand::Query {
+            database: "app.db".to_string(),
+            sql: "SELECT * FROM users;".to_string(),
+            params: vec![],
+            format: OutputFormat::Table,
+            max_rows: 10,
+            consistency: CliConsistency::Strong,
+        };
+        run_client_command(&args, &query_cmd).await.unwrap();
+
+        // 4. Batch command with sql string
+        let batch_cmd = ClientCommand::Batch {
+            database: "app.db".to_string(),
+            file: None,
+            sql: Some("INSERT INTO users VALUES (2, 'bob'); INSERT INTO users VALUES (3, 'charlie');".to_string()),
+            tx_mode: CliTxMode::Deferred,
+            stop_on_error: true,
+        };
+        run_client_command(&args, &batch_cmd).await.unwrap();
+
+        // 5. Batch command with file
+        let batch_file = temp_dir.path().join("batch.sql");
+        std::fs::write(&batch_file, "INSERT INTO users VALUES (4, 'david');").unwrap();
+        let batch_file_cmd = ClientCommand::Batch {
+            database: "app.db".to_string(),
+            file: Some(batch_file.clone()),
+            sql: None,
+            tx_mode: CliTxMode::Immediate,
+            stop_on_error: false,
+        };
+        run_client_command(&args, &batch_file_cmd).await.unwrap();
+
+        // 6. Batch command with empty / missing
+        let batch_empty_cmd = ClientCommand::Batch {
+            database: "app.db".to_string(),
+            file: None,
+            sql: Some("   ".to_string()),
+            tx_mode: CliTxMode::Deferred,
+            stop_on_error: false,
+        };
+        run_client_command(&args, &batch_empty_cmd).await.unwrap();
+
+        let batch_none_cmd = ClientCommand::Batch {
+            database: "app.db".to_string(),
+            file: None,
+            sql: None,
+            tx_mode: CliTxMode::Deferred,
+            stop_on_error: false,
+        };
+        assert!(run_client_command(&args, &batch_none_cmd).await.is_err());
+
+        // 7. Status command
+        let status_cmd = ClientCommand::Status {
+            format: OutputFormat::Table,
+        };
+        run_client_command(&args, &status_cmd).await.unwrap();
+
+        // 8. SQL shorthand
+        run_sql_shorthand(
+            &args,
+            "app.db",
+            "SELECT count(*) FROM users;",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+
+        run_sql_shorthand(
+            &args,
+            "app.db",
+            "INSERT INTO users VALUES (5, 'eve');",
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+
+        // 9. Metacommands
+        let mut client = args.to_client().unwrap();
+        let mut current_db = "app.db".to_string();
+        let mut current_format = OutputFormat::Table;
+
+        assert!(handle_metacommand(&mut client, ".quit", &mut current_db, &mut current_format).await.unwrap());
+        assert!(handle_metacommand(&mut client, ".exit", &mut current_db, &mut current_format).await.unwrap());
+        assert!(handle_metacommand(&mut client, ".q", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".help", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".tables", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".schema", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".schema users", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".database", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".database new.db", &mut current_db, &mut current_format).await.unwrap());
+        assert_eq!(current_db, "new.db");
+
+        assert!(!handle_metacommand(&mut client, ".mode", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".mode json", &mut current_db, &mut current_format).await.unwrap());
+        assert_eq!(current_format, OutputFormat::Json);
+        assert!(!handle_metacommand(&mut client, ".mode csv", &mut current_db, &mut current_format).await.unwrap());
+        assert_eq!(current_format, OutputFormat::Csv);
+        assert!(!handle_metacommand(&mut client, ".mode tsv", &mut current_db, &mut current_format).await.unwrap());
+        assert_eq!(current_format, OutputFormat::Tsv);
+        assert!(!handle_metacommand(&mut client, ".mode raw", &mut current_db, &mut current_format).await.unwrap());
+        assert_eq!(current_format, OutputFormat::Raw);
+        assert!(!handle_metacommand(&mut client, ".mode table", &mut current_db, &mut current_format).await.unwrap());
+        assert_eq!(current_format, OutputFormat::Table);
+        assert!(!handle_metacommand(&mut client, ".mode invalid", &mut current_db, &mut current_format).await.unwrap());
+
+        assert!(!handle_metacommand(&mut client, ".status", &mut current_db, &mut current_format).await.unwrap());
+
+        assert!(!handle_metacommand(&mut client, &format!(".read {}", batch_file.display()), &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".read non_existent.sql", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".read", &mut current_db, &mut current_format).await.unwrap());
+        assert!(!handle_metacommand(&mut client, ".unknown", &mut current_db, &mut current_format).await.unwrap());
+
+        // 10. Drop database
+        let drop_cmd = ClientCommand::DropDatabase {
+            database: "app.db".to_string(),
+            yes: true,
+        };
+        run_client_command(&args, &drop_cmd).await.unwrap();
+
+        // Dropping non-existent database
+        let drop_cmd_nonexistent = ClientCommand::DropDatabase {
+            database: "app.db".to_string(),
+            yes: true,
+        };
+        run_client_command(&args, &drop_cmd_nonexistent).await.unwrap();
+    }
+
+    #[test]
+    fn test_print_json_with_missing_column_names() {
+        let resp = QueryResponse {
+            columns: vec![],
+            rows: vec![rsqlite_rsync::proto::rsqlite::v1::Row {
+                values: vec![
+                    Value {
+                        value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(42)),
+                    },
+                    Value {
+                        value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
+                            "test".into(),
+                        )),
+                    },
+                ],
+            }],
+            total_rows: 1,
+            execution_time_us: 100,
+            is_replica_read: false,
+            generation: 1,
+        };
+        print_json(&resp);
+    }
+
+    #[test]
+    fn test_print_cluster_status_formats() {
+        let status = ClusterStatusResponse {
+            node_id: "node-1".into(),
+            role: NodeRole::Writer as i32,
+            current_leader_id: "node-1".into(),
+            current_leader_endpoint: "http://127.0.0.1:50051".into(),
+            local_generation: 1,
+            lease: Some(rsqlite_rsync::proto::rsqlite::v1::LeaseStatus {
+                is_held: true,
+                holder_node_id: "node-1".into(),
+                generation: 1,
+                renewed_at_secs: 100,
+                ttl_secs: 60,
+                is_expired: false,
+            }),
+            uptime_secs: 120,
+            version: "0.1.0".into(),
+            databases: vec![rsqlite_rsync::proto::rsqlite::v1::DatabaseInfo {
+                name: "app.db".into(),
+                file_size_bytes: 4096,
+                page_size: 4096,
+                page_count: 1,
+                journal_mode: "wal".into(),
+            }],
+        };
+
+        // Test JSON format
+        print_cluster_status(&status, OutputFormat::Json);
+        // Test Table format with databases
+        print_cluster_status(&status, OutputFormat::Table);
+
+        // Test with empty databases and no leader
+        let empty_status = ClusterStatusResponse {
+            node_id: "node-2".into(),
+            role: NodeRole::Replica as i32,
+            current_leader_id: String::new(),
+            current_leader_endpoint: String::new(),
+            local_generation: 1,
+            lease: None,
+            uptime_secs: 50,
+            version: "0.1.0".into(),
+            databases: vec![],
+        };
+        print_cluster_status(&empty_status, OutputFormat::Table);
+
+        // Test with expired lease
+        let expired_status = ClusterStatusResponse {
+            node_id: "node-3".into(),
+            role: 999, // unspecified
+            current_leader_id: "node-1".into(),
+            current_leader_endpoint: "http://127.0.0.1:50051".into(),
+            local_generation: 1,
+            lease: Some(rsqlite_rsync::proto::rsqlite::v1::LeaseStatus {
+                is_held: false,
+                holder_node_id: "node-1".into(),
+                generation: 1,
+                renewed_at_secs: 0,
+                ttl_secs: 10,
+                is_expired: true,
+            }),
+            uptime_secs: 10,
+            version: "0.1.0".into(),
+            databases: vec![],
+        };
+        print_cluster_status(&expired_status, OutputFormat::Table);
+    }
+
+    #[test]
+    fn test_client_target_resolution_env_vars() {
+        let _guard = CLIENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (old_data_dir, old_endpoint, old_endpoints, old_kube_lease) = (
+            std::env::var("RSQLITE_DATA_DIR").ok(),
+            std::env::var("RSQLITE_ENDPOINT").ok(),
+            std::env::var("RSQLITE_ENDPOINTS").ok(),
+            std::env::var("RSQLITE_KUBE_LEASE").ok(),
+        );
+        unsafe {
+            std::env::set_var("RSQLITE_DATA_DIR", "/tmp/rsqlite-test-env");
+            std::env::remove_var("RSQLITE_ENDPOINT");
+            std::env::remove_var("RSQLITE_ENDPOINTS");
+            std::env::remove_var("RSQLITE_KUBE_LEASE");
+        }
+
+        let args = ClientConnectionArgs {
+            mode: CliRuntimeMode::Local,
+            endpoint: None,
+            endpoints: vec![],
+            data_dir: None,
+            kube_lease: None,
+            kube_namespace: "default".into(),
+            kube_service: "".into(),
+            kube_context: None,
+            kubeconfig: None,
+            kubectl_path: "kubectl".into(),
+            grpc_port: 50051,
+            token: None,
+            timeout: 5,
+            max_retries: 0,
+        };
+        let target = args.to_client_target().unwrap();
+        match target {
+            ClientTarget::Local { data_dir } => {
+                assert_eq!(data_dir, PathBuf::from("/tmp/rsqlite-test-env"));
+            }
+            _ => panic!("expected Local target"),
+        }
+
+        // Auto mode with data dir env var and no remote env vars
+        let args_auto = ClientConnectionArgs {
+            mode: CliRuntimeMode::Auto,
+            endpoint: None,
+            endpoints: vec![],
+            data_dir: None,
+            kube_lease: None,
+            kube_namespace: "default".into(),
+            kube_service: "".into(),
+            kube_context: None,
+            kubeconfig: None,
+            kubectl_path: "kubectl".into(),
+            grpc_port: 50051,
+            token: None,
+            timeout: 5,
+            max_retries: 0,
+        };
+        let target_auto = args_auto.to_client_target().unwrap();
+        match target_auto {
+            ClientTarget::Local { data_dir } => {
+                assert_eq!(data_dir, PathBuf::from("/tmp/rsqlite-test-env"));
+            }
+            _ => panic!("expected Local target"),
+        }
+
+        // Local mode with empty / whitespace data dir
+        unsafe {
+            std::env::set_var("RSQLITE_DATA_DIR", "   ");
+        }
+        let args_empty = ClientConnectionArgs {
+            mode: CliRuntimeMode::Local,
+            endpoint: None,
+            endpoints: vec![],
+            data_dir: None,
+            kube_lease: None,
+            kube_namespace: "default".into(),
+            kube_service: "".into(),
+            kube_context: None,
+            kubeconfig: None,
+            kubectl_path: "kubectl".into(),
+            grpc_port: 50051,
+            token: None,
+            timeout: 5,
+            max_retries: 0,
+        };
+        assert!(args_empty.to_client_target().is_err());
+
+        // Local mode with no env var
+        unsafe {
+            std::env::remove_var("RSQLITE_DATA_DIR");
+        }
+        assert!(args_empty.to_client_target().is_err());
+
+        // Cleanup
+        if let Some(v) = old_data_dir { unsafe { std::env::set_var("RSQLITE_DATA_DIR", v); } } else { unsafe { std::env::remove_var("RSQLITE_DATA_DIR"); } }
+        if let Some(v) = old_endpoint { unsafe { std::env::set_var("RSQLITE_ENDPOINT", v); } } else { unsafe { std::env::remove_var("RSQLITE_ENDPOINT"); } }
+        if let Some(v) = old_endpoints { unsafe { std::env::set_var("RSQLITE_ENDPOINTS", v); } } else { unsafe { std::env::remove_var("RSQLITE_ENDPOINTS"); } }
+        if let Some(v) = old_kube_lease { unsafe { std::env::set_var("RSQLITE_KUBE_LEASE", v); } } else { unsafe { std::env::remove_var("RSQLITE_KUBE_LEASE"); } }
     }
 }

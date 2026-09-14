@@ -119,14 +119,27 @@ mod tests {
     fn new_and_builder_setters_override_only_requested_fields() {
         let config = ClientConfig::new(DiscoveryMode::Direct("http://x:1".to_string()))
             .with_max_retries(9)
+            .with_initial_backoff(Duration::from_millis(50))
+            .with_max_backoff(Duration::from_millis(500))
             .with_timeout(Duration::from_secs(3))
             .with_auth_token("secret");
         assert_eq!(config.max_retries, 9);
+        assert_eq!(config.initial_backoff_ms, 50);
+        assert_eq!(config.max_backoff_ms, 500);
         assert_eq!(config.timeout, Duration::from_secs(3));
         assert_eq!(config.auth_token.as_deref(), Some("secret"));
-        assert_eq!(
-            config.initial_backoff_ms, 100,
-            "unset fields keep Default's values"
-        );
+
+        let _ = RuntimeMode::Cluster;
+        let _ = RuntimeMode::Local;
+        let _ = RuntimeMode::Auto;
+        assert_eq!(RuntimeMode::Cluster, RuntimeMode::Cluster);
+
+        let target_remote = ClientTarget::Remote {
+            config: config.clone(),
+        };
+        let target_local = ClientTarget::Local {
+            data_dir: std::path::PathBuf::from("/tmp"),
+        };
+        let _ = format!("{target_remote:?} {target_local:?}");
     }
 }

@@ -1492,4 +1492,275 @@ mod tests {
             Err(SyncError::Protocol(message)) if message.contains("--ha-kube-lease-name is required")
         ));
     }
+
+    #[test]
+    fn test_lease_from_observation() {
+        use rsqlite_rsync::ha::{LeaseObservation, LeaseRecord};
+        let lease = LeaseRecord {
+            holder_node_id: "node-1".into(),
+            generation: 2,
+            renewed_at_secs: 100,
+            ttl_secs: 30,
+        };
+        assert_eq!(lease_from_observation(&LeaseObservation::Missing), None);
+        assert_eq!(
+            lease_from_observation(&LeaseObservation::Acquired(lease.clone())),
+            Some(lease.clone())
+        );
+        assert_eq!(
+            lease_from_observation(&LeaseObservation::Renewed(lease.clone())),
+            Some(lease.clone())
+        );
+        assert_eq!(
+            lease_from_observation(&LeaseObservation::Replaced(lease.clone())),
+            Some(lease.clone())
+        );
+        assert_eq!(
+            lease_from_observation(&LeaseObservation::Unchanged(lease.clone())),
+            Some(lease.clone())
+        );
+        assert_eq!(
+            lease_from_observation(&LeaseObservation::Transferred {
+                previous: lease.clone(),
+                current: lease.clone(),
+            }),
+            Some(lease.clone())
+        );
+    }
+
+    #[test]
+    fn test_readiness_aware_executor_lifecycle() {
+        use rsqlite_rsync::ha::{
+            DemotionReason, FileActionExecutor, HaActionExecutor, HaSharedState, PromotionViolation,
+            TracingExecutor, WriteFenceViolation,
+        };
+
+        let tmp = tempdir().unwrap();
+        let role_file = tmp.path().join("role.txt");
+        let audit_file = tmp.path().join("audit.log");
+        let readiness_file = tmp.path().join("ready.txt");
+
+        let readiness_state = Arc::new(AtomicBool::new(false));
+        let ha_state = Arc::new(RwLock::new(HaSharedState::new("node-1", false)));
+
+        let mut executor = ReadinessAwareExecutor::new(
+            TracingExecutor::new(
+                FileActionExecutor::new(role_file.clone(), audit_file.clone()),
+                "test",
+            ),
+            Some(readiness_file.clone()),
+            readiness_state.clone(),
+            ha_state.clone(),
+        );
+
+        executor.initialize_not_ready().unwrap();
+        assert!(!readiness_state.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+
+        // enable_writer
+        executor.enable_writer(5).unwrap();
+        assert!(readiness_state.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "ready\n");
+        assert_eq!(ha_state.read().unwrap().role, NodeRole::Writer);
+        assert_eq!(ha_state.read().unwrap().generation, 5);
+
+        // keep_writer
+        executor.keep_writer().unwrap();
+        assert!(readiness_state.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "ready\n");
+        assert_eq!(ha_state.read().unwrap().role, NodeRole::Writer);
+
+        // disable_writer
+        executor
+            .disable_writer(&DemotionReason::FenceViolation(WriteFenceViolation::LeaseExpired))
+            .unwrap();
+        assert!(!readiness_state.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+        assert_eq!(ha_state.read().unwrap().role, NodeRole::Replica);
+
+        // ensure_replica
+        executor.ensure_replica().unwrap();
+        assert!(!readiness_state.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+        assert_eq!(ha_state.read().unwrap().role, NodeRole::Replica);
+
+        // record_promotion_denied
+        executor
+            .record_promotion_denied(&PromotionViolation::TargetGenerationMismatch {
+                target: 5,
+                lease: 4,
+            })
+            .unwrap();
+        assert!(!readiness_state.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+        assert_eq!(ha_state.read().unwrap().role, NodeRole::Replica);
+    }
+
+    #[tokio::test]
+    async fn test_readiness_http_server_endpoints() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let readiness = Arc::new(AtomicBool::new(false));
+        let last_tick = Arc::new(AtomicU64::new(0));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let server_task = tokio::spawn(run_readiness_http_server(
+            listener,
+            readiness.clone(),
+            last_tick.clone(),
+            Duration::from_secs(5),
+            shutdown_rx,
+        ));
+
+        // Helper to send HTTP request
+        async fn get_endpoint(addr: std::net::SocketAddr, path: &str) -> (String, String) {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let res = String::from_utf8_lossy(&buf).into_owned();
+            let parts: Vec<&str> = res.split("\r\n\r\n").collect();
+            let header = parts[0].to_string();
+            let body = parts.get(1).unwrap_or(&"").to_string();
+            (header, body)
+        }
+
+        // /live
+        let (head, body) = get_endpoint(addr, "/live").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(body, "live\n");
+
+        // /ready when not ready
+        let (head, body) = get_endpoint(addr, "/ready").await;
+        assert!(head.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_eq!(body, "not-ready\n");
+
+        // /ready when ready
+        readiness.store(true, Ordering::SeqCst);
+        let (head, body) = get_endpoint(addr, "/ready").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(body, "ready\n");
+
+        // /healthz when initializing (last_tick == 0)
+        let (head, body) = get_endpoint(addr, "/healthz").await;
+        assert!(head.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_eq!(body, "initializing\n");
+
+        // /healthz when healthy
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        last_tick.store(now, Ordering::SeqCst);
+        let (head, body) = get_endpoint(addr, "/healthz").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(body, "healthy\n");
+
+        // /healthz when stale
+        last_tick.store(now.saturating_sub(100), Ordering::SeqCst);
+        let (head, body) = get_endpoint(addr, "/healthz").await;
+        assert!(head.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_eq!(body, "stale\n");
+
+        // 404 on unknown endpoint
+        let (head, body) = get_endpoint(addr, "/unknown").await;
+        assert!(head.starts_with("HTTP/1.1 404 Not Found"));
+        assert_eq!(body, "not-found\n");
+
+        // Shutdown
+        shutdown_tx.send(true).unwrap();
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_batch_mode_validation_errors() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // batch with HA
+        let args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json", "--ha"]).unwrap();
+        let err = rt.block_on(run_batch_mode(args)).unwrap_err();
+        assert!(err.to_string().contains("--batch-manifest cannot be used with --ha"));
+
+        // batch with server
+        let args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json", "--server"]).unwrap();
+        let err = rt.block_on(run_batch_mode(args)).unwrap_err();
+        assert!(err.to_string().contains("--batch-manifest cannot be used with --server"));
+
+        // batch with origin positional
+        let args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json", "origin.db"]).unwrap();
+        let err = rt.block_on(run_batch_mode(args)).unwrap_err();
+        assert!(err.to_string().contains("batch mode does not accept ORIGIN/REPLICA"));
+
+        // batch jobs = 0
+        let mut args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
+        args.batch_jobs = 0;
+        let err = rt.block_on(run_batch_mode(args)).unwrap_err();
+        assert!(err.to_string().contains("--batch-jobs must be greater than 0"));
+
+        // batch jitter > 100
+        let mut args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
+        args.batch_retry_jitter_pct = 150;
+        let err = rt.block_on(run_batch_mode(args)).unwrap_err();
+        assert!(err.to_string().contains("--batch-retry-jitter-pct must be between 0 and 100"));
+
+        // batch backoff max < backoff
+        let mut args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
+        args.batch_retry_backoff_ms = 500;
+        args.batch_retry_backoff_max_ms = 100;
+        let err = rt.block_on(run_batch_mode(args)).unwrap_err();
+        assert!(err.to_string().contains("--batch-retry-backoff-max-ms must be >= --batch-retry-backoff-ms"));
+    }
+
+    #[test]
+    fn test_batch_mode_execution_success() {
+        use rsqlite_rsync::db::{ffi, Connection};
+        let tmp = tempdir().unwrap();
+        let db1 = tmp.path().join("db1.db");
+        let db1_rep = tmp.path().join("db1_rep.db");
+        let conn = Connection::open(&db1, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE).unwrap();
+        conn.exec("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);").unwrap();
+        drop(conn);
+
+        let manifest_content = format!(
+            r#"{{ "syncs": [{{ "origin": "{}", "replica": "{}" }}] }}"#,
+            db1.display(),
+            db1_rep.display()
+        );
+        let manifest_file = tmp.path().join("manifest.json");
+        std::fs::write(&manifest_file, manifest_content).unwrap();
+
+        let args = Args::try_parse_from([
+            "rsqlite-rsync",
+            "--batch-manifest",
+            manifest_file.to_str().unwrap(),
+        ]).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_batch_mode(args)).unwrap();
+        assert!(db1_rep.exists());
+    }
+
+    #[test]
+    fn test_dry_run_local_execution() {
+        use rsqlite_rsync::db::{ffi, Connection};
+        let tmp = tempdir().unwrap();
+        let o_path = tmp.path().join("orig.db");
+        let r_path = tmp.path().join("repl.db");
+
+        let o_conn = Connection::open(&o_path, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE).unwrap();
+        o_conn.exec("CREATE TABLE t (x); INSERT INTO t VALUES (42);").unwrap();
+        drop(o_conn);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Dry run before replica exists
+        rt.block_on(dry_run_local(&o_path, &r_path)).unwrap();
+
+        // Create replica
+        let r_conn = Connection::open(&r_path, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE).unwrap();
+        drop(r_conn);
+
+        // Dry run when replica exists
+        rt.block_on(dry_run_local(&o_path, &r_path)).unwrap();
+    }
 }
