@@ -102,6 +102,8 @@ Optional Kubernetes flags:
 | `--ha-grpc-insecure-no-auth` | Explicitly disable gateway authentication — local development only, or when a trusted-network/mTLS boundary already authenticates callers |
 | `--ha-data-dir <PATH>` | Directory of `.db` files the gateway serves |
 | `--ha-allow-replica-reads` | Permit eventual-consistency reads on replica nodes |
+| `--ha-service-name <NAME>` (env `RSQLITE_HA_SERVICE_NAME`) | Headless service name for cluster DNS in Kubernetes (default: `sqlite-ha`) |
+| `--ha-grpc-port <PORT>` (env `RSQLITE_GRPC_PORT`) | gRPC port for cluster nodes (default: `50051`) |
 
 See [SQL Gateway and client](../README.md#sql-gateway-and-client) in the README for the client-side `--token`/`RSQLITE_TOKEN` counterpart, and [Security](../README.md#security) for the full rationale.
 
@@ -347,26 +349,26 @@ containers:
 
 ### Normal Operation
 
-1. One pod holds the lease and is writer
-2. Other pods are replicas, continuously syncing
-3. Service routes traffic only to writer (via readiness probe)
+1. One pod holds the lease and operates as active writer
+2. Other pods operate as replicas, continuously syncing from the writer
+3. Clients route traffic to the writer via leader discovery, Kubernetes Lease lookup, or automatic `NOT_LEADER` redirection
 
 ### When Writer Pod Dies
 
-1. Lease expires (no renewal)
-2. Another pod detects lease available
-3. That pod checks its freshness ledger
-4. If fresh enough, promotes to writer
-5. Readiness probe returns 200, receives traffic
-6. Starts renewing lease (via sidecar)
+1. Lease expires (no renewal from dead writer)
+2. Another pod detects lease availability
+3. That pod checks its freshness ledger against configured thresholds
+4. If fresh enough, promotes to writer (`writer:N`)
+5. HTTP `/ready` endpoint transitions to 200 OK and RPC write fence permits writes
+6. Node starts renewing lease (via sidecar)
 
 ### When Network Partitions Writer
 
-1. Writer can't renew lease (no k8s API access)
+1. Writer can't renew lease (loss of Kubernetes API or storage access)
 2. Lease expires from perspective of other pods
-3. Writer demotes itself after TTL expires (fail-safe)
-4. Another pod promotes
-5. Old writer rejoins, sees newer generation, stays replica
+3. Writer demotes itself after TTL expires (fail-safe fencing)
+4. Another healthy pod promotes to writer
+5. Old writer rejoins, sees newer generation, and transitions to replica
 
 ### Promotion Denied Cases
 
