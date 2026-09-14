@@ -287,7 +287,8 @@ data:
       # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
       # sync as fresh -- an incomplete sync must not look complete to the
       # freshness ledger that failover promotion decisions read.
-      for remote_path in $remote_dbs; do
+      echo "$remote_dbs" | while IFS= read -r remote_path; do
+        [ -n "$remote_path" ] || continue
         name="$(basename "$remote_path")"
         # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
         # src/transport/ssh.rs), so each one needs the combined -oKey=Value
@@ -316,11 +317,20 @@ data:
     # above exits 1 on connectivity failure), so remote_dbs is the
     # authoritative source of truth -- including the empty-set case
     # when the writer has dropped all databases.
+    #
+    # Re-check the pod's role before deleting: if this pod was promoted
+    # to writer between the listing above and now, removing databases
+    # would destroy production data.
+    if [ -f /data/role_state.txt ] && grep -q "WRITER" /data/role_state.txt; then
+      echo "default-replica-sync: pod is now writer — skipping stale-file cleanup" >&2
+      exit "$sync_failed"
+    fi
     for local_path in "${data_dir}"/*.db; do
       [ -e "$local_path" ] || continue          # glob didn't match
       local_name="$(basename "$local_path")"
       found=0
-      for remote_path in $remote_dbs; do
+      echo "$remote_dbs" | while IFS= read -r remote_path; do
+        [ -n "$remote_path" ] || continue
         if [ "$(basename "$remote_path")" = "$local_name" ]; then
           found=1
           break

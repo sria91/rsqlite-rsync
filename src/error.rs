@@ -70,6 +70,11 @@ impl From<rsqlite_rsync_client::ClientError> for SyncError {
             rsqlite_rsync_client::ClientError::Connect { .. } => {
                 SyncError::Network(error.to_string())
             }
+            rsqlite_rsync_client::ClientError::RetriesExhausted { ref source, .. }
+                if matches!(**source, rsqlite_rsync_client::ClientError::Connect { .. }) =>
+            {
+                SyncError::Network(error.to_string())
+            }
             other => SyncError::Protocol(other.to_string()),
         }
     }
@@ -143,20 +148,13 @@ mod tests {
             .await
             .expect_err("nothing is listening on the dropped port");
 
-        match err {
-            rsqlite_rsync_client::ClientError::RetriesExhausted { source, .. } => {
-                let client_err = *source;
-                assert!(matches!(
-                    client_err,
-                    rsqlite_rsync_client::ClientError::Connect { .. }
-                ));
-                let sync_err: SyncError = client_err.into();
-                assert!(matches!(sync_err, SyncError::Network(_)));
-            }
-            other => {
-                let sync_err: SyncError = other.into();
-                assert!(matches!(sync_err, SyncError::Network(_) | SyncError::Protocol(_)));
-            }
-        }
+        // Convert the *outer* error directly — the production `From` impl
+        // must handle `RetriesExhausted { source: Connect { .. } }` just
+        // as well as a bare `Connect`.
+        let sync_err: SyncError = err.into();
+        assert!(
+            matches!(sync_err, SyncError::Network(_)),
+            "expected SyncError::Network, got {sync_err:?}"
+        );
     }
 }

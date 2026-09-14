@@ -859,8 +859,9 @@ mod tests {
         assert!(err.to_string().contains("nul byte"));
 
         // 2. Connection::open on non-existent file in readonly mode
-        let non_existent = Path::new("/tmp/non_existent_path_rsqlite/db.sqlite");
-        let res2 = Connection::open(non_existent, ffi::SQLITE_OPEN_READONLY);
+        let tmpdir = tempfile::tempdir().unwrap();
+        let non_existent = tmpdir.path().join("no_such_subdir/db.sqlite");
+        let res2 = Connection::open(&non_existent, ffi::SQLITE_OPEN_READONLY);
         assert!(res2.is_err());
         let err = match res2 {
             Err(e) => e,

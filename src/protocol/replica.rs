@@ -190,6 +190,7 @@ pub async fn run_with_tuning(
     let need_fine_msg = transport.recv().await?;
     let need_fine = match need_fine_msg {
         Message::GroupsNeedFine { group_indices } => group_indices,
+        Message::Error { message } => return Err(crate::error::SyncError::Protocol(message)),
         other => {
             return Err(protocol_violation(
                 transport,
@@ -212,7 +213,7 @@ pub async fn run_with_tuning(
     }
 
     // ── Fine pass ────────────────────────────────────────────────────────────
-    for group_idx in &need_fine {
+    for (i, group_idx) in need_fine.iter().enumerate() {
         let first_page = group_idx * GROUP_SIZE + 1;
         let last_page = ((*group_idx + 1) * GROUP_SIZE).min(replica_page_count);
 
@@ -252,8 +253,22 @@ pub async fn run_with_tuning(
                     .await?;
             }
             Message::Done => {
-                info!("Origin sent Done early — sync complete");
+                let remaining = need_fine.len() - i - 1;
+                if remaining > 0 {
+                    return Err(protocol_violation(
+                        transport,
+                        format!(
+                            "origin sent Done mid-fine-pass with {remaining} group(s) still pending"
+                        ),
+                    )
+                    .await);
+                }
+                // Last group — treat as the final Done.
+                info!("Origin sent Done on last fine-pass group — sync complete");
                 return Ok(());
+            }
+            Message::Error { message } => {
+                return Err(crate::error::SyncError::Protocol(message));
             }
             other => {
                 return Err(protocol_violation(
@@ -480,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fine_pass_handles_early_done_from_origin() {
+    async fn fine_pass_rejects_early_done_with_pending_groups() {
         let file = NamedTempFile::new().unwrap();
         let conn = open_rw(file.path());
 
@@ -491,24 +506,26 @@ mod tests {
                 page_count: 0,
             },
             Message::GroupsNeedFine {
-                group_indices: vec![0],
+                group_indices: vec![0, 1],
             },
+            // Origin sends Done after the first group — group 1 is still
+            // pending, so the replica must reject this as a protocol error.
             Message::Done,
         ]);
 
         let result = run(&conn, &mut transport).await;
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
         assert!(
-            !transport
-                .sent
-                .iter()
-                .any(|m| matches!(m, Message::PagesAck { .. })),
-            "no PagesAck should be sent when origin ends early with Done"
+            matches!(
+                result,
+                Err(crate::error::SyncError::Protocol(ref msg))
+                    if msg.contains("mid-fine-pass") && msg.contains("1 group(s) still pending")
+            ),
+            "expected protocol error for early Done, got {result:?}"
         );
     }
 
     #[tokio::test]
-    async fn fine_pass_rejects_unexpected_message_instead_of_sendpages_or_done() {
+    async fn fine_pass_surfaces_peer_error_message() {
         let file = NamedTempFile::new().unwrap();
         let conn = open_rw(file.path());
 
@@ -529,9 +546,9 @@ mod tests {
         let result = run(&conn, &mut transport).await;
         assert!(matches!(
             result,
-            Err(crate::error::SyncError::Protocol(message))
-                if message.contains("expected SendPages or Done")
-        ));
+            Err(crate::error::SyncError::Protocol(ref message))
+                if message == "boom"
+        ), "expected protocol error with peer message, got {result:?}");
     }
 
     #[tokio::test]

@@ -507,6 +507,20 @@ impl DatabaseEngine {
                             journal_mode: "wal".into(),
                         });
                     }
+                    Err(crate::error::SyncError::Sqlite { code, .. })
+                        if code == ffi::SQLITE_BUSY || code == ffi::SQLITE_LOCKED =>
+                    {
+                        tracing::warn!(
+                            database = %rel_name,
+                            sqlite_code = code,
+                            "database temporarily locked while listing — re-add on next tick"
+                        );
+                        // Don't silently omit: propagate so the caller knows
+                        // the listing is incomplete.
+                        return Err(crate::error::SyncError::Busy(format!(
+                            "database '{rel_name}' is temporarily locked (SQLITE code {code})"
+                        )));
+                    }
                     Err(error) => {
                         tracing::warn!(
                             database = %rel_name,

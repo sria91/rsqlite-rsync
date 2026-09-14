@@ -1045,6 +1045,11 @@ fn parse_string_to_value(s: &str) -> Result<Value> {
             )),
         })
     } else if let Some(hex) = s.strip_prefix("x'").and_then(|h| h.strip_suffix('\'')) {
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SyncError::Protocol(format!(
+                "invalid hex blob literal '{s}': contains non-hex characters"
+            )));
+        }
         if hex.len() % 2 != 0 {
             return Err(SyncError::Protocol(format!(
                 "invalid hex blob literal '{s}': odd number of hex digits"
@@ -1152,12 +1157,24 @@ mod tests {
 
     #[test]
     fn test_client_target_resolution_modes() {
+        let _guard = CLIENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Capture original values so we can restore them at the end.
+        let orig_data_dir = std::env::var("RSQLITE_DATA_DIR").ok();
+        let orig_endpoint = std::env::var("RSQLITE_ENDPOINT").ok();
+        let orig_endpoints = std::env::var("RSQLITE_ENDPOINTS").ok();
+        let orig_kube_lease = std::env::var("RSQLITE_KUBE_LEASE").ok();
+
+        // Clear the env vars for the duration of this test.
         unsafe {
             std::env::remove_var("RSQLITE_DATA_DIR");
             std::env::remove_var("RSQLITE_ENDPOINT");
             std::env::remove_var("RSQLITE_ENDPOINTS");
             std::env::remove_var("RSQLITE_KUBE_LEASE");
         }
+
+        // Wrap the assertions in a closure so restoration always runs.
+        let result = std::panic::catch_unwind(|| {
 
         // Explicit Local Mode with data_dir
         let mut args = default_test_args();
@@ -1214,6 +1231,31 @@ mod tests {
         let args_default = default_test_args();
         let target = args_default.to_client_target().unwrap();
         assert!(matches!(target, ClientTarget::Remote { .. }));
+        });
+
+        // Restore original env vars regardless of test outcome.
+        unsafe {
+            match orig_data_dir {
+                Some(v) => std::env::set_var("RSQLITE_DATA_DIR", v),
+                None => std::env::remove_var("RSQLITE_DATA_DIR"),
+            }
+            match orig_endpoint {
+                Some(v) => std::env::set_var("RSQLITE_ENDPOINT", v),
+                None => std::env::remove_var("RSQLITE_ENDPOINT"),
+            }
+            match orig_endpoints {
+                Some(v) => std::env::set_var("RSQLITE_ENDPOINTS", v),
+                None => std::env::remove_var("RSQLITE_ENDPOINTS"),
+            }
+            match orig_kube_lease {
+                Some(v) => std::env::set_var("RSQLITE_KUBE_LEASE", v),
+                None => std::env::remove_var("RSQLITE_KUBE_LEASE"),
+            }
+        }
+
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
@@ -1338,10 +1380,10 @@ mod tests {
         assert!(err.to_string().contains("odd number of hex digits"));
 
         let err = parse_string_to_value("x'zz'").unwrap_err();
-        assert!(err.to_string().contains("non-hex digit"));
+        assert!(err.to_string().contains("non-hex characters"));
 
         let err = parse_string_to_value("x'ca0g'").unwrap_err();
-        assert!(err.to_string().contains("non-hex digit"));
+        assert!(err.to_string().contains("non-hex characters"));
     }
 
     #[test]
@@ -1364,7 +1406,7 @@ mod tests {
         let err = parse_cli_parameters(&["x'zz'".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("non-hex digit"));
+        assert!(err.contains("non-hex characters"));
 
         let err = parse_cli_parameters(&["k=x'abc'".to_string()])
             .unwrap_err()

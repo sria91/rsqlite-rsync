@@ -118,14 +118,19 @@ pub(crate) async fn discover_leader(
                 }
             }
             // No candidate reported itself as writer (or none were
-            // reachable): fall back to the first candidate. Callers relying
-            // on automatic failover should expect a subsequent NOT_LEADER
-            // redirect or connection error in this case, not necessarily a
-            // successful call.
+            // reachable): fall back to the first *syntactically valid*
+            // candidate. Callers relying on automatic failover should
+            // expect a subsequent NOT_LEADER redirect or connection error
+            // in this case, not necessarily a successful call.
             candidates
-                .first()
+                .iter()
                 .map(|s| normalize_endpoint(s))
-                .ok_or_else(|| ClientError::discovery("no candidates configured for discovery"))
+                .find(|norm| Endpoint::from_shared(norm.clone()).is_ok())
+                .ok_or_else(|| {
+                    ClientError::discovery(
+                        "no syntactically valid candidates configured for discovery",
+                    )
+                })
         }
         DiscoveryMode::Custom(resolver) => resolver
             .resolve()
@@ -190,14 +195,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_discover_leader_invalid_candidate_url_skips_and_falls_back() {
-        // A candidate with invalid endpoint syntax that fails Endpoint::from_shared
+    async fn test_discover_leader_invalid_candidate_url_skips_and_falls_back_to_valid() {
+        // A candidate with invalid endpoint syntax that fails
+        // `Endpoint::from_shared` is skipped; the first syntactically valid
+        // candidate is used as the fallback instead.
         let mode = DiscoveryMode::Candidates(vec![
             "://invalid url without scheme/host".to_string(),
             "127.0.0.1:50051".to_string(),
         ]);
         let res = discover_leader(&mode, &Some("token".to_string())).await;
-        assert_eq!(res.unwrap(), "http://://invalid url without scheme/host");
+        assert_eq!(res.unwrap(), "http://127.0.0.1:50051");
+    }
+
+    #[tokio::test]
+    async fn test_discover_leader_all_invalid_candidates_returns_error() {
+        let mode = DiscoveryMode::Candidates(vec![
+            "://invalid url 1".to_string(),
+            "://invalid url 2".to_string(),
+        ]);
+        let res = discover_leader(&mode, &None).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("no syntactically valid candidates"));
     }
 
     #[tokio::test]
