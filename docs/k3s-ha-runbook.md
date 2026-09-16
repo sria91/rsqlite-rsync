@@ -89,8 +89,10 @@ holds the role.
 
 ## Apply The Stack
 
+Run these commands from the repository root:
+
 1. Apply with required variables:
-   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' ../scripts/apply-k3s-ha-stack.sh`
+   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
      — `<writer-host>` is a placeholder: `sqlite-ha-writer` (see
      Architecture above) only exposes the probe/gRPC ports, not SSH, so it
      can't resolve this SSH example either — resolve it in your real sync
