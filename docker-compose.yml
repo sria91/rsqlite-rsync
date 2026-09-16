@@ -43,7 +43,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["/bin/sh", "-c", "sleep infinity"]
+    entrypoint: ["/bin/sh", "-c", "sleep infinity"]
     stdin_open: true
     tty: true
     restart: unless-stopped
