@@ -81,9 +81,13 @@ if [[ "$RSQLITE_RSYNC_AUTH_SECRET" != "sqlite-ha-grpc-auth" ]]; then
     --dry-run=client -o yaml | kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f -
 fi
 
-# If the auth token was explicitly rotated in the target Secret or the default gateway Secret,
-# restart the StatefulSet so existing gateway pods reload the new token into memory.
+# If the auth token was explicitly rotated, or if both stored tokens were missing
+# (a newly generated token was provisioned), restart the StatefulSet so existing
+# gateway pods reload the new token into memory.
 token_rotated=0
+if [[ -z "$target_existing_token" && -z "$default_gateway_existing_token" ]]; then
+  token_rotated=1
+fi
 if [[ -n "$target_existing_token" && "$target_existing_token" != "$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" ]]; then
   token_rotated=1
 fi
