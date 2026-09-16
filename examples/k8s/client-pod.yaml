@@ -32,11 +32,24 @@ metadata:
   labels:
     app: sqlite-ha-client
 spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: rsqlite-rsync-client
       image: __RSQLITE_RSYNC_IMAGE__
       imagePullPolicy: IfNotPresent
       command: ["/bin/sh", "-c", "sleep infinity"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
       env:
         - name: RSQLITE_ENDPOINTS
           value: "__RSQLITE_RSYNC_ENDPOINTS__"
@@ -47,3 +60,13 @@ spec:
               key: token
       stdin: true
       tty: true
+      volumeMounts:
+        - name: sqlite-data
+          mountPath: /var/lib/sqlite
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: sqlite-data
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

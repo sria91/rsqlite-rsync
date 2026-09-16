@@ -9,7 +9,7 @@ if [[ ! -f "$template" ]]; then
   exit 1
 fi
 
-: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:latest)}"
+: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:0.5.0 or @sha256:...)}"
 
 RSQLITE_RSYNC_NAMESPACE="${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}"
 RSQLITE_RSYNC_CLIENT_POD_NAME="${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client}"
@@ -92,7 +92,7 @@ if [[ -n "$default_gateway_existing_token" && "$default_gateway_existing_token" 
 fi
 
 if [[ "$token_rotated" -eq 1 ]]; then
-  for ss in "$RSQLITE_RSYNC_NAMESPACE" sqlite-ha; do
+  for ss in sqlite-ha; do
     if kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get statefulset "$ss" >/dev/null 2>&1; then
       echo "Rotating gateway auth token: restarting statefulset/$ss to load new token..."
       kubectl -n "$RSQLITE_RSYNC_NAMESPACE" rollout restart "statefulset/$ss"
