@@ -102,19 +102,20 @@ Run these commands from the repository root:
 2. Optional overrides:
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
    - `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`)
+   - `RSQLITE_RSYNC_CLIENT_POD_NAME` (default: `sqlite-ha-client`, when applying the client pod)
 3. Watch rollout:
-   - `kubectl rollout status statefulset/sqlite-ha`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" rollout status statefulset/sqlite-ha`
 4. Inspect role transitions:
-   - `kubectl logs statefulset/sqlite-ha -c rsqlite-rsync --tail=200`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" logs statefulset/sqlite-ha -c rsqlite-rsync --tail=200`
 5. Verify which pod is currently the writer:
-   - `kubectl exec sqlite-ha-0 -c rsqlite-rsync -- cat /var/run/rsqlite-rsync/role_state.txt`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" exec sqlite-ha-0 -c rsqlite-rsync -- cat /var/run/rsqlite-rsync/role_state.txt`
      (repeat per pod, or grep the audit log — exactly one pod should report `writer:N`)
-   - or `kubectl get pods --show-labels` (exactly one `role=writer`) / `kubectl get endpoints sqlite-ha-writer`
+   - or `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get pods --show-labels` (exactly one `role=writer`) / `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get endpoints sqlite-ha-writer`
      — convenience checks, not the ground truth; see Architecture above
 6. Retrieve the gRPC SQL Gateway auth token (the script provisions this automatically — see [Security](../README.md#security) for why it's required):
-   - `kubectl get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
    - also printed at the end of `apply-k3s-ha-stack.sh`'s own output
-7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) via [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) (`RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync client status` works with no extra flags.
+7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) via [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) (`RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" "${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client}" -- rsqlite-rsync client status` works with no extra flags.
 
 ## Node Storage
 
@@ -163,7 +164,7 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
    repeatedly, or scale the StatefulSet to 0 and back).
 4. Confirm lease holder and generation update.
 5. Confirm replica pods continue sync loop and freshness writes.
-6. Confirm `kubectl get endpoints sqlite-ha-writer` converges on the new
+6. Confirm `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get endpoints sqlite-ha-writer` converges on the new
    writer's pod IP within roughly one `LABEL_UPDATE_SLEEP_SECONDS` (2s)
    after step 3 — total time-to-new-endpoint is bound by lease-election
    timing, not by this step, which only adds the label-updater's poll
