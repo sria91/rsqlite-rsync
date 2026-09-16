@@ -109,6 +109,8 @@ Complete deployment examples are available at:
 - examples/k8s/k3s-ha-stack.yaml
 - examples/k8s/local-dev-file-lease.yaml
 - examples/k8s/client-pod.yaml
+- scripts/apply-k3s-ha-stack.sh
+- scripts/apply-client-pod.sh
 
 For a concrete k3s-focused runbook and rollout checklist, see:
 

@@ -278,15 +278,22 @@ data:
       if [ -z "$remote_dbs" ]; then
         return 1
       fi
-      while IFS= read -r remote_path; do
+      set -f
+      old_ifs="$IFS"
+      nl="$(printf '\nx')"
+      nl="${nl%x}"
+      IFS="$nl"
+      found=1
+      for remote_path in $remote_dbs; do
         [ -n "$remote_path" ] || continue
         if [ "$(basename "$remote_path")" = "$target_name" ]; then
-          return 0
+          found=0
+          break
         fi
-      done <<EOF
-$remote_dbs
-EOF
-      return 1
+      done
+      IFS="$old_ifs"
+      set +f
+      return "$found"
     }
 
     holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
@@ -318,7 +325,13 @@ EOF
       # whole script exit nonzero so replica-sync.sh does *not* mark this tick's
       # sync as fresh -- an incomplete sync must not look complete to the
       # freshness ledger that failover promotion decisions read.
-      while IFS= read -r remote_path; do
+      set -f
+      old_ifs="$IFS"
+      nl="$(printf '\nx')"
+      nl="${nl%x}"
+      IFS="$nl"
+      for remote_path in $remote_dbs; do
+        IFS="$old_ifs"
         [ -n "$remote_path" ] || continue
         name="$(basename "$remote_path")"
         # --ssh-opt values go straight to `ssh` with no implicit `-o` (see
@@ -338,9 +351,10 @@ EOF
           echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2
           sync_failed=1
         fi
-      done <<EOF
-$remote_dbs
-EOF
+        IFS="$nl"
+      done
+      IFS="$old_ifs"
+      set +f
     fi
 
     # ── Remove local databases the writer no longer has ──────────────

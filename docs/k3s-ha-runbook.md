@@ -112,7 +112,7 @@ holds the role.
 6. Retrieve the gRPC SQL Gateway auth token (the script provisions this automatically — see [Security](../README.md#security) for why it's required):
    - `kubectl get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
    - also printed at the end of `apply-k3s-ha-stack.sh`'s own output
-7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) (`kubectl apply -f examples/k8s/client-pod.yaml`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it sqlite-ha-client -- rsqlite-rsync client status` works with no extra flags.
+7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) via [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) (`RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync client status` works with no extra flags.
 
 ## Node Storage
 
@@ -170,6 +170,7 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 - [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml)
 - [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh)
 - [examples/k8s/client-pod.yaml](examples/k8s/client-pod.yaml) — debug/test client pod for querying the cluster
+- [scripts/apply-client-pod.sh](scripts/apply-client-pod.sh) — apply helper for client pod
 - [examples/k8s/ha-deployment.yaml](examples/k8s/ha-deployment.yaml)
 - [examples/k8s/ha-deployment-readonly.yaml](examples/k8s/ha-deployment-readonly.yaml)
 - [examples/k8s/local-dev-file-lease.yaml](examples/k8s/local-dev-file-lease.yaml) — single-node local testing without Kubernetes Lease election

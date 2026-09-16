@@ -18,32 +18,32 @@
 # same auth Secret name.
 #
 # Usage:
-#   kubectl apply -n sqlite-ha -f examples/k8s/client-pod.yaml
+#   RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh
 #   kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync client status
 #   kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync sql -d demo.db "SELECT 1"
 #   kubectl exec -it -n sqlite-ha sqlite-ha-client -- rsqlite-rsync client repl -d demo.db
 #
 # Teardown:
-#   kubectl delete -n sqlite-ha -f examples/k8s/client-pod.yaml
+#   kubectl delete pod sqlite-ha-client -n sqlite-ha
 apiVersion: v1
 kind: Pod
 metadata:
-  name: sqlite-ha-client
+  name: __RSQLITE_RSYNC_CLIENT_POD_NAME__
   labels:
     app: sqlite-ha-client
 spec:
   containers:
     - name: rsqlite-rsync-client
-      image: rsqlite-rsync:dev
+      image: __RSQLITE_RSYNC_IMAGE__
       imagePullPolicy: IfNotPresent
       command: ["/bin/sh", "-c", "sleep infinity"]
       env:
         - name: RSQLITE_ENDPOINTS
-          value: "http://sqlite-ha-0.sqlite-ha:50051,http://sqlite-ha-1.sqlite-ha:50051,http://sqlite-ha-2.sqlite-ha:50051"
+          value: "__RSQLITE_RSYNC_ENDPOINTS__"
         - name: RSQLITE_TOKEN
           valueFrom:
             secretKeyRef:
-              name: sqlite-ha-grpc-auth
+              name: __RSQLITE_RSYNC_AUTH_SECRET__
               key: token
       stdin: true
       tty: true

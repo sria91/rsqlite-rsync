@@ -367,6 +367,7 @@ synced_at_secs=1731000099
 - [examples/k8s/local-dev-file-lease.yaml](examples/k8s/local-dev-file-lease.yaml) (single-node local testing, file-based lease, no Kubernetes election required)
 - [examples/k8s/client-pod.yaml](examples/k8s/client-pod.yaml) (debug/test client pod, pre-wired with cluster endpoints and the gRPC auth token)
 - [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) (one-command apply with required image and replica sync command env vars)
+- [scripts/apply-client-pod.sh](scripts/apply-client-pod.sh) (one-command apply helper for client pod)
 
 ### SQL Gateway and client
 
