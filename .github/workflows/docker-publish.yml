@@ -19,6 +19,10 @@ on:
         type: boolean
         default: true
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.tag || github.sha }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -43,7 +47,22 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate Custom Tag
+        id: validate_tag
+        env:
+          CUSTOM_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$CUSTOM_TAG" ]]; then
+            if [[ ! "$CUSTOM_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+              echo "::error::Invalid Docker tag '$CUSTOM_TAG'. Must match ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$"
+              exit 1
+            fi
+            echo "custom_tag=$CUSTOM_TAG" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Extract Crate Version
         id: crate_version
@@ -56,14 +75,14 @@ jobs:
           echo "Extracted crate version: $VERSION"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Log in to GitHub Container Registry
         if: ${{ inputs.push }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -71,21 +90,22 @@ jobs:
 
       - name: Extract Docker metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.arch }}
           flavor: |
             latest=false
           tags: |
+            type=raw,value=${{ github.sha }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
             type=raw,value=${{ steps.crate_version.outputs.version }},enable=${{ steps.crate_version.outputs.version != '' }}
             type=raw,value=v${{ steps.crate_version.outputs.version }},enable=${{ steps.crate_version.outputs.version != '' }}
             type=sha,format=short,prefix=
-            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=raw,value=${{ steps.validate_tag.outputs.custom_tag }},enable=${{ steps.validate_tag.outputs.custom_tag != '' }}
             type=ref,event=branch
 
       - name: Build and push arch-specific Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
         with:
           context: .
           file: ./Dockerfile
@@ -107,7 +127,22 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate Custom Tag
+        id: validate_tag
+        env:
+          CUSTOM_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$CUSTOM_TAG" ]]; then
+            if [[ ! "$CUSTOM_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+              echo "::error::Invalid Docker tag '$CUSTOM_TAG'. Must match ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$"
+              exit 1
+            fi
+            echo "custom_tag=$CUSTOM_TAG" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Extract Crate Version
         id: crate_version
@@ -119,44 +154,53 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch manifests
+        env:
+          CUSTOM_TAG: ${{ steps.validate_tag.outputs.custom_tag }}
+          FULL_SHA: ${{ github.sha }}
+          IS_MASTER: ${{ github.ref == 'refs/heads/master' }}
+          CRATE_VER: ${{ steps.crate_version.outputs.version }}
         run: |
           BASE_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           ARCHS=("amd64" "arm64" "arm32")
 
+          # Sources are always the immutable full commit-SHA tagged arch images
+          sources=()
+          for arch in "${ARCHS[@]}"; do
+            sources+=("${BASE_IMAGE}-${arch}:${FULL_SHA}")
+          done
+
           create_manifest() {
-            local tag="$1"
-            local sources=()
-            for arch in "${ARCHS[@]}"; do
-              sources+=("${BASE_IMAGE}-${arch}:${tag}")
-            done
-            echo "Creating multi-arch manifest for ${BASE_IMAGE}:${tag} from:"
+            local dest_tag="$1"
+            echo "Creating multi-arch manifest for ${BASE_IMAGE}:${dest_tag} from immutable sources:"
             printf ' - %s\n' "${sources[@]}"
-            docker buildx imagetools create -t "${BASE_IMAGE}:${tag}" "${sources[@]}"
+            docker buildx imagetools create -t "${BASE_IMAGE}:${dest_tag}" "${sources[@]}"
           }
 
-          if [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+          # Immutable commit SHA manifest
+          create_manifest "$FULL_SHA"
+
+          SHORT_SHA=$(echo "$FULL_SHA" | cut -c1-7)
+          create_manifest "$SHORT_SHA"
+
+          if [[ "$IS_MASTER" == "true" ]]; then
             create_manifest "latest"
           fi
 
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          create_manifest "$SHORT_SHA"
-
-          CRATE_VER="${{ steps.crate_version.outputs.version }}"
           if [[ -n "$CRATE_VER" ]]; then
             create_manifest "$CRATE_VER"
             create_manifest "v${CRATE_VER}"
           fi
 
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            create_manifest "${{ inputs.tag }}"
+          if [[ -n "$CUSTOM_TAG" ]]; then
+            create_manifest "$CUSTOM_TAG"
           fi
