@@ -92,14 +92,9 @@ holds the role.
 Run these commands from the repository root:
 
 1. Apply with required variables:
-   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
-     — `<writer-host>` is a placeholder: `sqlite-ha-writer` (see
-     Architecture above) only exposes the probe/gRPC ports, not SSH, so it
-     can't resolve this SSH example either — resolve it in your real sync
-     command (e.g. by reading the Lease or `role_state.txt` from within
-     the sync sidecar) before substituting
-     it into this variable.
+   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-k3s-ha-stack.sh`
 2. Optional overrides:
+   - `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` (default: `sh /scripts/default-replica-sync.sh`, which syncs all `*.db` files via the SSH sidecar; override if using a custom sync command/transport)
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
    - `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`)
    - `RSQLITE_RSYNC_CLIENT_POD_NAME` (default: `sqlite-ha-client`, when applying the client pod)
