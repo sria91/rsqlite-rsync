@@ -1,0 +1,41 @@
+# Standalone client deployment example for Docker Compose.
+#
+# Supports two execution modes:
+# 1. Standalone Local Mode (default): In-process SQLite against local volume.
+# 2. HA Cluster Remote Mode: Connects over gRPC to SQL Gateway.
+#    Use https:// endpoints or trusted local boundaries when passing RSQLITE_TOKEN.
+#
+# Usage:
+#   docker compose -f examples/docker/docker-compose.client.yml up -d
+#   docker compose -f examples/docker/docker-compose.client.yml exec rsqlite-client rsqlite-rsync client status
+#   docker compose -f examples/docker/docker-compose.client.yml exec rsqlite-client rsqlite-rsync sql -d demo.db "SELECT 1"
+#   docker compose -f examples/docker/docker-compose.client.yml down
+
+services:
+  rsqlite-client:
+    container_name: rsqlite-client
+    image: ${RSQLITE_RSYNC_IMAGE:-ghcr.io/sria91/rsqlite-rsync:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "-c", "sleep infinity"]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      RSQLITE_MODE: ${RSQLITE_MODE:-local}
+      RSQLITE_DATA_DIR: ${RSQLITE_DATA_DIR:-/var/lib/sqlite}
+      # Remote endpoint (use https:// for remote/untrusted networks; http:// only for trusted local networks)
+      RSQLITE_ENDPOINT:
+      RSQLITE_ENDPOINTS: ${RSQLITE_ENDPOINTS:-}
+      # Bearer token for SQL Gateway authentication
+      RSQLITE_TOKEN: ${RSQLITE_TOKEN:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - sqlite-client-data:${RSQLITE_DATA_DIR:-/var/lib/sqlite}
+
+volumes:
+  sqlite-client-data:
+    driver: local

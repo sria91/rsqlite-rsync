@@ -369,6 +369,11 @@ synced_at_secs=1731000099
 - [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) (one-command apply with required image and replica sync command env vars)
 - [scripts/apply-client-pod.sh](scripts/apply-client-pod.sh) (one-command apply helper for client pod)
 
+#### Docker Compose deployment references
+
+- [docker-compose.yml](docker-compose.yml) (standalone client container with persistent volume and local/cluster execution mode support)
+- [examples/docker/docker-compose.client.yml](examples/docker/docker-compose.client.yml) (example standalone client deployment manifest)
+
 ### SQL Gateway and client
 
 When `--ha-grpc-bind` is set on an `--ha` node, the process also serves a
