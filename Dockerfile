@@ -33,7 +33,7 @@ RUN xx-cargo --setup-target-triple
 WORKDIR /usr/src/rsqlite-rsync
 
 # Copy manifest files and all source trees referenced by Cargo.toml
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY src ./src
 COPY benches ./benches
