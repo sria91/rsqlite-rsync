@@ -13,6 +13,10 @@ fi
 
 RSQLITE_RSYNC_NAMESPACE="${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}"
 RSQLITE_RSYNC_CLIENT_POD_NAME="${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client}"
+# Security notice: RSQLITE_RSYNC_ENDPOINTS defaults to intra-cluster plaintext HTTP endpoints
+# on the assumption of a trusted cluster network (private node network/Service mesh boundary).
+# For untrusted network segments or external traffic, terminate TLS using an ingress/mTLS mesh
+# (e.g. Istio, Linkerd, Cilium) and configure secure HTTPS endpoints.
 RSQLITE_RSYNC_ENDPOINTS="${RSQLITE_RSYNC_ENDPOINTS:-http://sqlite-ha-0.sqlite-ha:50051,http://sqlite-ha-1.sqlite-ha:50051,http://sqlite-ha-2.sqlite-ha:50051}"
 RSQLITE_RSYNC_AUTH_SECRET="${RSQLITE_RSYNC_AUTH_SECRET:-sqlite-ha-grpc-auth}"
 # The gRPC SQL Gateway requires a bearer token (see `--ha-grpc-auth-token` /
@@ -49,11 +53,21 @@ sed \
 
 kubectl get namespace "$RSQLITE_RSYNC_NAMESPACE" >/dev/null 2>&1 || kubectl create namespace "$RSQLITE_RSYNC_NAMESPACE"
 
+target_existing_token="$(kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret "$RSQLITE_RSYNC_AUTH_SECRET" \
+  -o go-template='{{if .data.token}}{{.data.token | base64decode}}{{end}}' 2>/dev/null || true)"
+
 if [[ -z "$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" ]]; then
-  existing_token="$(kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret "$RSQLITE_RSYNC_AUTH_SECRET" \
-    -o go-template='{{if .data.token}}{{.data.token | base64decode}}{{end}}' 2>/dev/null || true)"
-  if [[ -n "$existing_token" ]]; then
-    RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$existing_token"
+  if [[ -n "$target_existing_token" ]]; then
+    RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$target_existing_token"
+  elif [[ "$RSQLITE_RSYNC_AUTH_SECRET" != "sqlite-ha-grpc-auth" ]]; then
+    # Fallback: check if the default gateway secret exists to sync token from it
+    default_secret_token="$(kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret sqlite-ha-grpc-auth \
+      -o go-template='{{if .data.token}}{{.data.token | base64decode}}{{end}}' 2>/dev/null || true)"
+    if [[ -n "$default_secret_token" ]]; then
+      RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$default_secret_token"
+    else
+      RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$(generate_token)"
+    fi
   else
     RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$(generate_token)"
   fi
@@ -62,6 +76,24 @@ fi
 kubectl -n "$RSQLITE_RSYNC_NAMESPACE" create secret generic "$RSQLITE_RSYNC_AUTH_SECRET" \
   --from-literal=token="$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" \
   --dry-run=client -o yaml | kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f -
+
+# If a custom auth secret is specified and the default sqlite-ha-grpc-auth secret exists, keep them in sync
+if [[ "$RSQLITE_RSYNC_AUTH_SECRET" != "sqlite-ha-grpc-auth" ]] && kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret sqlite-ha-grpc-auth >/dev/null 2>&1; then
+  kubectl -n "$RSQLITE_RSYNC_NAMESPACE" create secret generic sqlite-ha-grpc-auth \
+    --from-literal=token="$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" \
+    --dry-run=client -o yaml | kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f -
+fi
+
+# If the auth token was explicitly rotated, restart the StatefulSet so the gateway loads the new token
+if [[ -n "$target_existing_token" && "$target_existing_token" != "$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" ]]; then
+  for ss in "$RSQLITE_RSYNC_NAMESPACE" sqlite-ha; do
+    if kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get statefulset "$ss" >/dev/null 2>&1; then
+      echo "Rotating gateway auth token: restarting statefulset/$ss to load new token..."
+      kubectl -n "$RSQLITE_RSYNC_NAMESPACE" rollout restart "statefulset/$ss"
+      break
+    fi
+  done
+fi
 
 if kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get pod "$RSQLITE_RSYNC_CLIENT_POD_NAME" >/dev/null 2>&1; then
   echo "Recreating existing client pod $RSQLITE_RSYNC_CLIENT_POD_NAME in namespace $RSQLITE_RSYNC_NAMESPACE..."
@@ -79,7 +111,17 @@ echo "auth secret: $RSQLITE_RSYNC_AUTH_SECRET"
 echo "gRPC gateway token: kubectl -n $RSQLITE_RSYNC_NAMESPACE get secret $RSQLITE_RSYNC_AUTH_SECRET -o go-template='{{.data.token | base64decode}}'"
 echo ""
 echo "Waiting for pod/$RSQLITE_RSYNC_CLIENT_POD_NAME to become Ready..."
-kubectl -n "$RSQLITE_RSYNC_NAMESPACE" wait --for=condition=Ready "pod/$RSQLITE_RSYNC_CLIENT_POD_NAME" --timeout=60s || true
+wait_status=0
+kubectl -n "$RSQLITE_RSYNC_NAMESPACE" wait --for=condition=Ready "pod/$RSQLITE_RSYNC_CLIENT_POD_NAME" --timeout=60s || wait_status=$?
+
+if [[ "$wait_status" -ne 0 ]]; then
+  echo "" >&2
+  echo "Error: pod/$RSQLITE_RSYNC_CLIENT_POD_NAME failed to become Ready within 60s (exit status $wait_status)." >&2
+  echo "Check pod status: kubectl -n $RSQLITE_RSYNC_NAMESPACE describe pod $RSQLITE_RSYNC_CLIENT_POD_NAME" >&2
+  echo "Check pod logs:   kubectl -n $RSQLITE_RSYNC_NAMESPACE logs pod/$RSQLITE_RSYNC_CLIENT_POD_NAME" >&2
+  exit "$wait_status"
+fi
+
 echo ""
 echo "Useful commands:"
 echo "  kubectl exec -it -n $RSQLITE_RSYNC_NAMESPACE $RSQLITE_RSYNC_CLIENT_POD_NAME -- rsqlite-rsync client status"

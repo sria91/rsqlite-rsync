@@ -134,9 +134,12 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 ## Important Operational Notes
 
+- **Security & Transport Considerations:**
+  - The reference HA manifest and the client helper default to intra-cluster plaintext HTTP for gRPC communication, transmitting the `RSQLITE_TOKEN` as cleartext within the cluster network (trusted-network exception).
+  - For production environments, multi-tenant clusters, or communication across untrusted network boundaries, this pattern should be enhanced to enforce transport encryption using a TLS/mTLS reverse proxy, Kubernetes ingress with TLS termination, or a service mesh (such as Istio, Linkerd, or Cilium Service Mesh). Configure matching secure endpoints (e.g. `https://...`) when doing so.
 - This pattern defaults to `--ha-startup-fence-mode=permissive`, so all pods start and pass Kubernetes readiness (`/healthz`) once their reconcile loop has ticked — writer or replica. `/ready` (writer-only status) still reflects role and is what `role_state.txt`/the audit log/`rsqlite-rsync client status` show.
 - If you use `require-writer`, non-writer pods can fail startup by design.
-- `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` is required by [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) so you can plug in your real transport and auth model.
+- `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` is required by [scripts/apply-k3s-ha-stack.sh](../scripts/apply-k3s-ha-stack.sh) so you can plug in your real transport and auth model.
 - Freshness ledger is written by the sync sidecar to `/var/run/rsqlite-rsync/freshness.txt`, which HA mode consumes for promotion safety.
 - Keep lease renew interval shorter than lease duration (the example renews every 2s with 15s duration).
 
@@ -166,11 +169,11 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 ## Related Files
 
-- [docs/ha-kubernetes.md](docs/ha-kubernetes.md)
-- [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml)
-- [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh)
-- [examples/k8s/client-pod.yaml](examples/k8s/client-pod.yaml) — debug/test client pod for querying the cluster
-- [scripts/apply-client-pod.sh](scripts/apply-client-pod.sh) — apply helper for client pod
-- [examples/k8s/ha-deployment.yaml](examples/k8s/ha-deployment.yaml)
-- [examples/k8s/ha-deployment-readonly.yaml](examples/k8s/ha-deployment-readonly.yaml)
-- [examples/k8s/local-dev-file-lease.yaml](examples/k8s/local-dev-file-lease.yaml) — single-node local testing without Kubernetes Lease election
+- [docs/ha-kubernetes.md](ha-kubernetes.md)
+- [examples/k8s/k3s-ha-stack.yaml](../examples/k8s/k3s-ha-stack.yaml)
+- [scripts/apply-k3s-ha-stack.sh](../scripts/apply-k3s-ha-stack.sh)
+- [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) — debug/test client pod for querying the cluster
+- [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) — apply helper for client pod
+- [examples/k8s/ha-deployment.yaml](../examples/k8s/ha-deployment.yaml)
+- [examples/k8s/ha-deployment-readonly.yaml](../examples/k8s/ha-deployment-readonly.yaml)
+- [examples/k8s/local-dev-file-lease.yaml](../examples/k8s/local-dev-file-lease.yaml) — single-node local testing without Kubernetes Lease election
