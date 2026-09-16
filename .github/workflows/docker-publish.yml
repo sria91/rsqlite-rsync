@@ -1,0 +1,162 @@
+name: Publish Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Custom image tag (optional, e.g. custom-build-1; defaults to crate version, short git sha, and latest on master)'
+        required: false
+        type: string
+        default: ''
+      push:
+        description: 'Push images to GHCR'
+        required: true
+        type: boolean
+        default: true
+      create_manifest:
+        description: 'Create unified multi-arch manifest list for the base image (without arch suffix in image name)'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push-arch:
+    name: Build & Push (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+          - platform: linux/arm/v7
+            arch: arm32
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Crate Version
+        id: crate_version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rsqlite-rsync") | .version')
+          if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+            VERSION=$(grep -m1 '^version' Cargo.toml | awk -F '"' '{print $2}')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Extracted crate version: $VERSION"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.arch }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+            type=raw,value=${{ steps.crate_version.outputs.version }},enable=${{ steps.crate_version.outputs.version != '' }}
+            type=raw,value=v${{ steps.crate_version.outputs.version }},enable=${{ steps.crate_version.outputs.version != '' }}
+            type=sha,format=short,prefix=
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=ref,event=branch
+
+      - name: Build and push arch-specific Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+
+  create-multiarch-manifest:
+    name: Create & Push Multi-Arch Manifest
+    needs: build-and-push-arch
+    if: ${{ inputs.push && inputs.create_manifest }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Crate Version
+        id: crate_version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rsqlite-rsync") | .version')
+          if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+            VERSION=$(grep -m1 '^version' Cargo.toml | awk -F '"' '{print $2}')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifests
+        run: |
+          BASE_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          ARCHS=("amd64" "arm64" "arm32")
+
+          create_manifest() {
+            local tag="$1"
+            local sources=()
+            for arch in "${ARCHS[@]}"; do
+              sources+=("${BASE_IMAGE}-${arch}:${tag}")
+            done
+            echo "Creating multi-arch manifest for ${BASE_IMAGE}:${tag} from:"
+            printf ' - %s\n' "${sources[@]}"
+            docker buildx imagetools create -t "${BASE_IMAGE}:${tag}" "${sources[@]}"
+          }
+
+          if [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+            create_manifest "latest"
+          fi
+
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          create_manifest "$SHORT_SHA"
+
+          CRATE_VER="${{ steps.crate_version.outputs.version }}"
+          if [[ -n "$CRATE_VER" ]]; then
+            create_manifest "$CRATE_VER"
+            create_manifest "v${CRATE_VER}"
+          fi
+
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            create_manifest "${{ inputs.tag }}"
+          fi
