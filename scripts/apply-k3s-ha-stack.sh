@@ -9,7 +9,7 @@ if [[ ! -f "$template" ]]; then
   exit 1
 fi
 
-: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/ORG/rsqlite-rsync:TAG)}"
+: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:latest)}"
 # Defaults to the manifest's own SSH-based sync (default-replica-sync.sh,
 # using the sshd sidecar + sqlite-ha-ssh-keys Secret below) if unset. Set
 # this to plug in a real transport/auth model instead.
@@ -90,5 +90,5 @@ echo "namespace: $RSQLITE_RSYNC_NAMESPACE"
 echo "hostDataDir: $RSQLITE_RSYNC_HOST_DATA_DIR"
 echo "image: $RSQLITE_RSYNC_IMAGE"
 echo "gRPC gateway token: kubectl -n $RSQLITE_RSYNC_NAMESPACE get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'"
-kubectl -n "$RSQLITE_RSYNC_NAMESPACE" rollout restart "statefulset/$RSQLITE_RSYNC_NAMESPACE"
+kubectl -n "$RSQLITE_RSYNC_NAMESPACE" rollout restart statefulset/sqlite-ha
 kubectl get pods -n "$RSQLITE_RSYNC_NAMESPACE" -w

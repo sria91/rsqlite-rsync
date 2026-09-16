@@ -89,30 +89,28 @@ holds the role.
 
 ## Apply The Stack
 
+Run these commands from the repository root:
+
 1. Apply with required variables:
-   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
-     — `<writer-host>` is a placeholder: `sqlite-ha-writer` (see
-     Architecture above) only exposes the probe/gRPC ports, not SSH, so it
-     can't resolve this SSH example either — resolve it in your real sync
-     command (e.g. by reading the Lease or `role_state.txt` from within
-     the sync sidecar) before substituting
-     it into this variable.
+   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-k3s-ha-stack.sh`
 2. Optional overrides:
+   - `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` (default: `sh /scripts/default-replica-sync.sh`, which syncs all `*.db` files via the SSH sidecar; override if using a custom sync command/transport)
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
    - `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`)
+   - `RSQLITE_RSYNC_CLIENT_POD_NAME` (default: `sqlite-ha-client`, when applying the client pod)
 3. Watch rollout:
-   - `kubectl rollout status statefulset/sqlite-ha`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" rollout status statefulset/sqlite-ha`
 4. Inspect role transitions:
-   - `kubectl logs statefulset/sqlite-ha -c rsqlite-rsync --tail=200`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" logs statefulset/sqlite-ha -c rsqlite-rsync --tail=200`
 5. Verify which pod is currently the writer:
-   - `kubectl exec sqlite-ha-0 -c rsqlite-rsync -- cat /var/run/rsqlite-rsync/role_state.txt`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" exec sqlite-ha-0 -c rsqlite-rsync -- cat /var/run/rsqlite-rsync/role_state.txt`
      (repeat per pod, or grep the audit log — exactly one pod should report `writer:N`)
-   - or `kubectl get pods --show-labels` (exactly one `role=writer`) / `kubectl get endpoints sqlite-ha-writer`
+   - or `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get pods --show-labels` (exactly one `role=writer`) / `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get endpoints sqlite-ha-writer`
      — convenience checks, not the ground truth; see Architecture above
 6. Retrieve the gRPC SQL Gateway auth token (the script provisions this automatically — see [Security](../README.md#security) for why it's required):
-   - `kubectl get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
+   - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
    - also printed at the end of `apply-k3s-ha-stack.sh`'s own output
-7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) (`kubectl apply -f examples/k8s/client-pod.yaml`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it sqlite-ha-client -- rsqlite-rsync client status` works with no extra flags.
+7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) via [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) (`RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" "${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client}" -- rsqlite-rsync client status` works with no extra flags.
 
 ## Node Storage
 
@@ -134,9 +132,12 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 ## Important Operational Notes
 
+- **Security & Transport Considerations:**
+  - The reference HA manifest and the client helper default to intra-cluster plaintext HTTP for gRPC communication, transmitting the `RSQLITE_TOKEN` as cleartext within the cluster network (trusted-network exception).
+  - For production environments, multi-tenant clusters, or communication across untrusted network boundaries, this pattern should be enhanced to enforce transport encryption using a TLS/mTLS reverse proxy, Kubernetes ingress with TLS termination, or a service mesh (such as Istio, Linkerd, or Cilium Service Mesh). Configure matching secure endpoints (e.g. `https://...`) when doing so.
 - This pattern defaults to `--ha-startup-fence-mode=permissive`, so all pods start and pass Kubernetes readiness (`/healthz`) once their reconcile loop has ticked — writer or replica. `/ready` (writer-only status) still reflects role and is what `role_state.txt`/the audit log/`rsqlite-rsync client status` show.
 - If you use `require-writer`, non-writer pods can fail startup by design.
-- `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` is required by [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh) so you can plug in your real transport and auth model.
+- `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` defaults to `sh /scripts/default-replica-sync.sh` in [scripts/apply-k3s-ha-stack.sh](../scripts/apply-k3s-ha-stack.sh) when unset; set this variable to override the default for a production-specific transport and authentication model.
 - Freshness ledger is written by the sync sidecar to `/var/run/rsqlite-rsync/freshness.txt`, which HA mode consumes for promotion safety.
 - Keep lease renew interval shorter than lease duration (the example renews every 2s with 15s duration).
 
@@ -158,7 +159,7 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
    repeatedly, or scale the StatefulSet to 0 and back).
 4. Confirm lease holder and generation update.
 5. Confirm replica pods continue sync loop and freshness writes.
-6. Confirm `kubectl get endpoints sqlite-ha-writer` converges on the new
+6. Confirm `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get endpoints sqlite-ha-writer` converges on the new
    writer's pod IP within roughly one `LABEL_UPDATE_SLEEP_SECONDS` (2s)
    after step 3 — total time-to-new-endpoint is bound by lease-election
    timing, not by this step, which only adds the label-updater's poll
@@ -166,10 +167,11 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
 
 ## Related Files
 
-- [docs/ha-kubernetes.md](docs/ha-kubernetes.md)
-- [examples/k8s/k3s-ha-stack.yaml](examples/k8s/k3s-ha-stack.yaml)
-- [scripts/apply-k3s-ha-stack.sh](scripts/apply-k3s-ha-stack.sh)
-- [examples/k8s/client-pod.yaml](examples/k8s/client-pod.yaml) — debug/test client pod for querying the cluster
-- [examples/k8s/ha-deployment.yaml](examples/k8s/ha-deployment.yaml)
-- [examples/k8s/ha-deployment-readonly.yaml](examples/k8s/ha-deployment-readonly.yaml)
-- [examples/k8s/local-dev-file-lease.yaml](examples/k8s/local-dev-file-lease.yaml) — single-node local testing without Kubernetes Lease election
+- [docs/ha-kubernetes.md](ha-kubernetes.md)
+- [examples/k8s/k3s-ha-stack.yaml](../examples/k8s/k3s-ha-stack.yaml)
+- [scripts/apply-k3s-ha-stack.sh](../scripts/apply-k3s-ha-stack.sh)
+- [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) — debug/test client pod for querying the cluster
+- [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) — apply helper for client pod
+- [examples/k8s/ha-deployment.yaml](../examples/k8s/ha-deployment.yaml)
+- [examples/k8s/ha-deployment-readonly.yaml](../examples/k8s/ha-deployment-readonly.yaml)
+- [examples/k8s/local-dev-file-lease.yaml](../examples/k8s/local-dev-file-lease.yaml) — single-node local testing without Kubernetes Lease election
