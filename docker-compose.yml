@@ -1,0 +1,70 @@
+# Docker Compose manifest for standalone rsqlite-rsync client deployment.
+#
+# Supports two execution modes:
+#
+# 1. Standalone Local Mode (Default):
+#    Runs in-process SQLite execution directly against local database files
+#    stored in the mounted volume (/var/lib/sqlite), with no running daemon or
+#    network connection required.
+#
+# 2. HA Cluster Remote Mode:
+#    Connects over gRPC to an HA cluster / SQL Gateway by configuring
+#    RSQLITE_ENDPOINT (or RSQLITE_ENDPOINTS) and RSQLITE_TOKEN.
+#
+# Quick Start:
+#   docker compose up -d
+#
+# Usage Examples (Standalone Local Mode):
+#   # Execute DDL/DML
+#   docker compose exec rsqlite-client rsqlite-rsync sql -d app.db "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)"
+#   docker compose exec rsqlite-client rsqlite-rsync sql -d app.db "INSERT INTO items (label) VALUES ('sensor-1'), ('sensor-2')"
+#   docker compose exec rsqlite-client rsqlite-rsync sql -d app.db "SELECT * FROM items"
+#
+#   # Run interactive REPL
+#   docker compose exec -it rsqlite-client rsqlite-rsync client repl -d app.db
+#
+#   # Query status / list databases
+#   docker compose exec rsqlite-client rsqlite-rsync client status
+#
+# Usage Examples (Cluster Mode):
+#   RSQLITE_MODE=cluster RSQLITE_ENDPOINT=http://host.docker.internal:50051 RSQLITE_TOKEN=secret \
+#     docker compose up -d
+#   docker compose exec rsqlite-client rsqlite-rsync client status
+#
+# Teardown:
+#   docker compose down
+#   # To delete persistent volume data as well:
+#   docker compose down -v
+
+services:
+  rsqlite-client:
+    container_name: rsqlite-client
+    image: ${RSQLITE_RSYNC_IMAGE:-ghcr.io/sria91/rsqlite-rsync:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/bin/sh", "-c", "sleep infinity"]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    environment:
+      # Execution mode: 'local' (standalone in-process), 'cluster' (remote gRPC), or 'auto'
+      RSQLITE_MODE: ${RSQLITE_MODE:-local}
+      # Local SQLite database directory for standalone execution
+      RSQLITE_DATA_DIR: ${RSQLITE_DATA_DIR:-/var/lib/sqlite}
+      # Optional remote gRPC endpoint (e.g. http://gateway:50051)
+      RSQLITE_ENDPOINT: ${RSQLITE_ENDPOINT:-}
+      # Optional comma-separated candidate gRPC endpoints for leader discovery
+      RSQLITE_ENDPOINTS: ${RSQLITE_ENDPOINTS:-}
+      # Bearer token for gRPC SQL Gateway authentication
+      RSQLITE_TOKEN: ${RSQLITE_TOKEN:-}
+      # Log verbosity filter
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - sqlite-data:/var/lib/sqlite
+    # To mount a host directory instead, uncomment the line below:
+    # - ./data:/var/lib/sqlite
+
+volumes:
+  sqlite-data:
+    driver: local
