@@ -9,7 +9,7 @@ if [[ ! -f "$template" ]]; then
   exit 1
 fi
 
-: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:0.5.0 or @sha256:...)}"
+: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:0.5.0 or ghcr.io/sria91/rsqlite-rsync@sha256:<64-hex-digest>)}"
 
 RSQLITE_RSYNC_NAMESPACE="${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}"
 RSQLITE_RSYNC_CLIENT_POD_NAME="${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client}"
@@ -74,8 +74,8 @@ kubectl -n "$RSQLITE_RSYNC_NAMESPACE" create secret generic "$RSQLITE_RSYNC_AUTH
   --from-literal=token="$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" \
   --dry-run=client -o yaml | kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f -
 
-# If a custom auth secret is specified and the default sqlite-ha-grpc-auth secret exists, keep them in sync
-if [[ "$RSQLITE_RSYNC_AUTH_SECRET" != "sqlite-ha-grpc-auth" ]] && kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret sqlite-ha-grpc-auth >/dev/null 2>&1; then
+# If a custom auth secret is specified, also ensure the default sqlite-ha-grpc-auth secret exists and stays in sync
+if [[ "$RSQLITE_RSYNC_AUTH_SECRET" != "sqlite-ha-grpc-auth" ]]; then
   kubectl -n "$RSQLITE_RSYNC_NAMESPACE" create secret generic sqlite-ha-grpc-auth \
     --from-literal=token="$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" \
     --dry-run=client -o yaml | kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f -

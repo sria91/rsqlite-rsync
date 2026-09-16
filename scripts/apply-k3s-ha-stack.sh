@@ -9,7 +9,7 @@ if [[ ! -f "$template" ]]; then
   exit 1
 fi
 
-: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:latest)}"
+: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:0.5.0 or ghcr.io/sria91/rsqlite-rsync@sha256:<64-hex-digest>)}"
 # Defaults to the manifest's own SSH-based sync (default-replica-sync.sh,
 # using the sshd sidecar + sqlite-ha-ssh-keys Secret below) if unset. Set
 # this to plug in a real transport/auth model instead.
