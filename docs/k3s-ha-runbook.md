@@ -90,7 +90,7 @@ holds the role.
 ## Apply The Stack
 
 1. Apply with required variables:
-   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' scripts/apply-k3s-ha-stack.sh`
+   - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync user@<writer-host>:/var/lib/sqlite/app.db /var/lib/sqlite/app.db --ssh-opt StrictHostKeyChecking=no' ../scripts/apply-k3s-ha-stack.sh`
      — `<writer-host>` is a placeholder: `sqlite-ha-writer` (see
      Architecture above) only exposes the probe/gRPC ports, not SSH, so it
      can't resolve this SSH example either — resolve it in your real sync
@@ -139,7 +139,7 @@ This is a **manual, user-run, destructive step** — it wipes the entire existin
   - For production environments, multi-tenant clusters, or communication across untrusted network boundaries, this pattern should be enhanced to enforce transport encryption using a TLS/mTLS reverse proxy, Kubernetes ingress with TLS termination, or a service mesh (such as Istio, Linkerd, or Cilium Service Mesh). Configure matching secure endpoints (e.g. `https://...`) when doing so.
 - This pattern defaults to `--ha-startup-fence-mode=permissive`, so all pods start and pass Kubernetes readiness (`/healthz`) once their reconcile loop has ticked — writer or replica. `/ready` (writer-only status) still reflects role and is what `role_state.txt`/the audit log/`rsqlite-rsync client status` show.
 - If you use `require-writer`, non-writer pods can fail startup by design.
-- `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` is required by [scripts/apply-k3s-ha-stack.sh](../scripts/apply-k3s-ha-stack.sh) so you can plug in your real transport and auth model.
+- `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` defaults to `sh /scripts/default-replica-sync.sh` in [scripts/apply-k3s-ha-stack.sh](../scripts/apply-k3s-ha-stack.sh) when unset; set this variable to override the default for a production-specific transport and authentication model.
 - Freshness ledger is written by the sync sidecar to `/var/run/rsqlite-rsync/freshness.txt`, which HA mode consumes for promotion safety.
 - Keep lease renew interval shorter than lease duration (the example renews every 2s with 15s duration).
 

@@ -56,18 +56,15 @@ kubectl get namespace "$RSQLITE_RSYNC_NAMESPACE" >/dev/null 2>&1 || kubectl crea
 target_existing_token="$(kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret "$RSQLITE_RSYNC_AUTH_SECRET" \
   -o go-template='{{if .data.token}}{{.data.token | base64decode}}{{end}}' 2>/dev/null || true)"
 
+default_gateway_existing_token="$(kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret sqlite-ha-grpc-auth \
+  -o go-template='{{if .data.token}}{{.data.token | base64decode}}{{end}}' 2>/dev/null || true)"
+
 if [[ -z "$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" ]]; then
   if [[ -n "$target_existing_token" ]]; then
     RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$target_existing_token"
-  elif [[ "$RSQLITE_RSYNC_AUTH_SECRET" != "sqlite-ha-grpc-auth" ]]; then
+  elif [[ -n "$default_gateway_existing_token" ]]; then
     # Fallback: check if the default gateway secret exists to sync token from it
-    default_secret_token="$(kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get secret sqlite-ha-grpc-auth \
-      -o go-template='{{if .data.token}}{{.data.token | base64decode}}{{end}}' 2>/dev/null || true)"
-    if [[ -n "$default_secret_token" ]]; then
-      RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$default_secret_token"
-    else
-      RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$(generate_token)"
-    fi
+    RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$default_gateway_existing_token"
   else
     RSQLITE_RSYNC_GRPC_AUTH_TOKEN="$(generate_token)"
   fi
@@ -84,8 +81,17 @@ if [[ "$RSQLITE_RSYNC_AUTH_SECRET" != "sqlite-ha-grpc-auth" ]] && kubectl -n "$R
     --dry-run=client -o yaml | kubectl -n "$RSQLITE_RSYNC_NAMESPACE" apply -f -
 fi
 
-# If the auth token was explicitly rotated, restart the StatefulSet so the gateway loads the new token
+# If the auth token was explicitly rotated in the target Secret or the default gateway Secret,
+# restart the StatefulSet so existing gateway pods reload the new token into memory.
+token_rotated=0
 if [[ -n "$target_existing_token" && "$target_existing_token" != "$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" ]]; then
+  token_rotated=1
+fi
+if [[ -n "$default_gateway_existing_token" && "$default_gateway_existing_token" != "$RSQLITE_RSYNC_GRPC_AUTH_TOKEN" ]]; then
+  token_rotated=1
+fi
+
+if [[ "$token_rotated" -eq 1 ]]; then
   for ss in "$RSQLITE_RSYNC_NAMESPACE" sqlite-ha; do
     if kubectl -n "$RSQLITE_RSYNC_NAMESPACE" get statefulset "$ss" >/dev/null 2>&1; then
       echo "Rotating gateway auth token: restarting statefulset/$ss to load new token..."
