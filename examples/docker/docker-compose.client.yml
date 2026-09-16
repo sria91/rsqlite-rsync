@@ -1,0 +1,32 @@
+# Standalone client deployment example for Docker Compose.
+#
+# Usage:
+#   docker compose -f examples/docker/docker-compose.client.yml up -d
+#   docker compose -f examples/docker/docker-compose.client.yml exec rsqlite-client rsqlite-rsync client status
+#   docker compose -f examples/docker/docker-compose.client.yml exec rsqlite-client rsqlite-rsync sql -d demo.db "SELECT 1"
+#   docker compose -f examples/docker/docker-compose.client.yml down
+
+services:
+  rsqlite-client:
+    container_name: rsqlite-client
+    image: ${RSQLITE_RSYNC_IMAGE:-ghcr.io/sria91/rsqlite-rsync:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["/bin/sh", "-c", "sleep infinity"]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    environment:
+      RSQLITE_MODE: ${RSQLITE_MODE:-local}
+      RSQLITE_DATA_DIR: ${RSQLITE_DATA_DIR:-/var/lib/sqlite}
+      RSQLITE_ENDPOINT: ${RSQLITE_ENDPOINT:-}
+      RSQLITE_ENDPOINTS: ${RSQLITE_ENDPOINTS:-}
+      RSQLITE_TOKEN: ${RSQLITE_TOKEN:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - sqlite-client-data:/var/lib/sqlite
+
+volumes:
+  sqlite-client-data:
+    driver: local
