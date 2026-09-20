@@ -64,7 +64,7 @@ services:
       # Local SQLite database directory for standalone execution
       RSQLITE_DATA_DIR: ${RSQLITE_DATA_DIR:-/var/lib/sqlite}
       # Optional remote gRPC endpoint (e.g. http://gateway:50051 for trusted local/mesh networks, or https://... for remote)
-      RSQLITE_ENDPOINT:
+      RSQLITE_ENDPOINT: ${RSQLITE_ENDPOINT:-}
       # Optional comma-separated candidate gRPC endpoints for leader discovery
       RSQLITE_ENDPOINTS: ${RSQLITE_ENDPOINTS:-}
       # Bearer token for gRPC SQL Gateway authentication (transmit over https:// or a trusted local boundary)

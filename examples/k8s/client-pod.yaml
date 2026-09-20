@@ -4,18 +4,17 @@
 # sql ...` against the cluster over its internal headless-service DNS,
 # without needing a port-forward.
 #
-# RSQLITE_ENDPOINTS is pre-set to all three StatefulSet pods (candidate
-# discovery probes each and picks whichever reports itself as writer), so
-# most commands can omit --endpoint/--endpoints entirely. RSQLITE_TOKEN is
-# pre-set from the same sqlite-ha-grpc-auth Secret the stack provisions
-# (see scripts/apply-k3s-ha-stack.sh), since the gateway now requires
-# authentication on every RPC by default — so commands can omit --token
-# too. When passing --token explicitly instead, it's a connection option
-# and must come before the subcommand name (e.g. `rsqlite-rsync client
-# --token "$TOKEN" status`, not `... status --token "$TOKEN"`). Works
-# against any of the sqlite-ha StatefulSet variants in this directory,
-# since they all share the same pod-naming/headless-service shape and the
-# same auth Secret name.
+# RSQLITE_ENDPOINT is pre-set to the sqlite-ha-writer Service (http://sqlite-ha-writer:50051),
+# which routes to the active leader pod via the dynamic role=writer label. The client
+# automatically follows NOT_LEADER gRPC redirection headers if leadership transfers,
+# so commands can omit --endpoint entirely. RSQLITE_TOKEN is pre-set from the same
+# sqlite-ha-grpc-auth Secret the stack provisions (see scripts/apply-k3s-ha-stack.sh),
+# since the gateway now requires authentication on every RPC by default — so
+# commands can omit --token too. When passing --token explicitly instead, it's a
+# connection option and must come before the subcommand name (e.g. `rsqlite-rsync
+# client --token "$TOKEN" status`, not `... status --token "$TOKEN"`). Works
+# against any of the sqlite-ha StatefulSet variants in this directory, since they
+# all share the same pod-naming/headless-service shape and the same auth Secret name.
 #
 # Usage:
 #   RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh
@@ -51,8 +50,8 @@ spec:
           drop:
             - ALL
       env:
-        - name: RSQLITE_ENDPOINTS
-          value: "__RSQLITE_RSYNC_ENDPOINTS__"
+        - name: RSQLITE_ENDPOINT
+          value: "__RSQLITE_RSYNC_ENDPOINT__"
         - name: RSQLITE_TOKEN
           valueFrom:
             secretKeyRef:

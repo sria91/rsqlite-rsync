@@ -1965,4 +1965,35 @@ mod tests {
         if let Some(v) = old_endpoints { unsafe { std::env::set_var("RSQLITE_ENDPOINTS", v); } } else { unsafe { std::env::remove_var("RSQLITE_ENDPOINTS"); } }
         if let Some(v) = old_kube_lease { unsafe { std::env::set_var("RSQLITE_KUBE_LEASE", v); } } else { unsafe { std::env::remove_var("RSQLITE_KUBE_LEASE"); } }
     }
+
+    #[test]
+    fn test_single_endpoint_discovery_config() {
+        let args = ClientConnectionArgs {
+            mode: CliRuntimeMode::Cluster,
+            endpoint: Some("http://sqlite-ha-writer:50051".into()),
+            endpoints: vec![],
+            data_dir: None,
+            kube_lease: None,
+            kube_namespace: "default".into(),
+            kube_service: "".into(),
+            kube_context: None,
+            kubeconfig: None,
+            kubectl_path: "kubectl".into(),
+            grpc_port: 50051,
+            token: Some("secret-token".into()),
+            timeout: 10,
+            max_retries: 3,
+        };
+
+        let config = args.to_client_config();
+        match config.discovery {
+            DiscoveryMode::Direct(ep) => {
+                assert_eq!(ep, "http://sqlite-ha-writer:50051");
+            }
+            _ => panic!("expected DiscoveryMode::Direct"),
+        }
+        assert_eq!(config.auth_token, Some("secret-token".into()));
+        assert_eq!(config.timeout, Duration::from_secs(10));
+        assert_eq!(config.max_retries, 3);
+    }
 }

@@ -28,7 +28,7 @@ services:
       RSQLITE_MODE: ${RSQLITE_MODE:-local}
       RSQLITE_DATA_DIR: ${RSQLITE_DATA_DIR:-/var/lib/sqlite}
       # Remote endpoint (use https:// for remote/untrusted networks; http:// only for trusted local networks)
-      RSQLITE_ENDPOINT:
+      RSQLITE_ENDPOINT: ${RSQLITE_ENDPOINT:-}
       RSQLITE_ENDPOINTS: ${RSQLITE_ENDPOINTS:-}
       # Bearer token for SQL Gateway authentication
       RSQLITE_TOKEN: ${RSQLITE_TOKEN:-}

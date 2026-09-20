@@ -110,7 +110,7 @@ Run these commands from the repository root:
 6. Retrieve the gRPC SQL Gateway auth token (the script provisions this automatically — see [Security](../README.md#security) for why it's required):
    - `kubectl -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'`
    - also printed at the end of `apply-k3s-ha-stack.sh`'s own output
-7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) via [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) (`RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh`) — it's pre-wired with both the candidate endpoints and this token, so `kubectl exec -it -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" "${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client}" -- rsqlite-rsync client status` works with no extra flags.
+7. Query the cluster: deploy [examples/k8s/client-pod.yaml](../examples/k8s/client-pod.yaml) via [scripts/apply-client-pod.sh](../scripts/apply-client-pod.sh) (`RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-client-pod.sh`) — it's pre-wired with the `sqlite-ha-writer` service endpoint and auth token, so `kubectl exec -it -n "${RSQLITE_RSYNC_NAMESPACE:-sqlite-ha}" "${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client}" -- rsqlite-rsync client status` works with no extra flags.
 
 ## Node Storage
 
