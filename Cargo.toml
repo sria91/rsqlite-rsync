@@ -5,7 +5,7 @@ default-members = [".", "crates/rsqlite-rsync-proto", "crates/rsqlite-rsync-clie
 
 [package]
 name = "rsqlite-rsync"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Bandwidth-efficient SQLite database sync tool, inspired by sqlite3_rsync"
 license = "MIT OR Apache-2.0"
