@@ -200,10 +200,22 @@ impl ClientConnectionArgs {
                 config: self.to_client_config(),
             }),
             CliRuntimeMode::Auto => {
-                if self.endpoint.is_some()
-                    || !self.endpoints.is_empty()
-                    || self.kube_lease.is_some()
-                {
+                let has_endpoint = self
+                    .endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty());
+                let has_endpoints = self
+                    .endpoints
+                    .iter()
+                    .any(|s| !s.trim().is_empty());
+                let has_kube_lease = self
+                    .kube_lease
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty());
+
+                if has_endpoint || has_endpoints || has_kube_lease {
                     Ok(ClientTarget::Remote {
                         config: self.to_client_config(),
                     })
@@ -212,10 +224,20 @@ impl ClientConnectionArgs {
                         data_dir: data_dir.clone(),
                     })
                 } else if let Ok(dir) = std::env::var("RSQLITE_DATA_DIR") {
+                    let has_env_endpoint = std::env::var("RSQLITE_ENDPOINT")
+                        .ok()
+                        .is_some_and(|s| !s.trim().is_empty());
+                    let has_env_endpoints = std::env::var("RSQLITE_ENDPOINTS")
+                        .ok()
+                        .is_some_and(|s| !s.trim().is_empty());
+                    let has_env_kube_lease = std::env::var("RSQLITE_KUBE_LEASE")
+                        .ok()
+                        .is_some_and(|s| !s.trim().is_empty());
+
                     if !dir.trim().is_empty()
-                        && std::env::var("RSQLITE_ENDPOINT").is_err()
-                        && std::env::var("RSQLITE_ENDPOINTS").is_err()
-                        && std::env::var("RSQLITE_KUBE_LEASE").is_err()
+                        && !has_env_endpoint
+                        && !has_env_endpoints
+                        && !has_env_kube_lease
                     {
                         Ok(ClientTarget::Local {
                             data_dir: PathBuf::from(dir.trim()),
@@ -242,9 +264,32 @@ impl ClientConnectionArgs {
 
     /// Build client configuration from CLI arguments.
     pub fn to_client_config(&self) -> ClientConfig {
-        let discovery = if let Some(ref ep) = self.endpoint {
-            DiscoveryMode::Direct(ep.clone())
-        } else if let Some(ref lease_name) = self.kube_lease {
+        let valid_endpoint = self
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let valid_endpoints: Vec<String> = self
+            .endpoints
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let valid_kube_lease = self
+            .kube_lease
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let valid_token = self
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        let discovery = if let Some(ep) = valid_endpoint {
+            DiscoveryMode::Direct(ep.to_string())
+        } else if let Some(lease_name) = valid_kube_lease {
             let mut reader =
                 KubectlLeaseReader::new(&self.kubectl_path, &self.kube_namespace, lease_name);
             reader.set_kube_context(self.kube_context.clone());
@@ -254,8 +299,8 @@ impl ClientConnectionArgs {
                 service_name: self.kube_service.clone(),
                 grpc_port: self.grpc_port,
             }))
-        } else if !self.endpoints.is_empty() {
-            DiscoveryMode::Candidates(self.endpoints.clone())
+        } else if !valid_endpoints.is_empty() {
+            DiscoveryMode::Candidates(valid_endpoints)
         } else {
             // Default fallback to localhost
             DiscoveryMode::Direct("http://127.0.0.1:50051".to_string())
@@ -267,7 +312,7 @@ impl ClientConnectionArgs {
             initial_backoff_ms: 100,
             max_backoff_ms: 2000,
             timeout: Duration::from_secs(self.timeout),
-            auth_token: self.token.clone(),
+            auth_token: valid_token,
         }
     }
 }
@@ -1995,5 +2040,60 @@ mod tests {
         assert_eq!(config.auth_token, Some("secret-token".into()));
         assert_eq!(config.timeout, Duration::from_secs(10));
         assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn test_empty_and_whitespace_args_fallback() {
+        let args_empty_strings = ClientConnectionArgs {
+            mode: CliRuntimeMode::Auto,
+            endpoint: Some("   ".into()),
+            endpoints: vec!["".into(), "   ".into()],
+            data_dir: None,
+            kube_lease: Some("".into()),
+            kube_namespace: "default".into(),
+            kube_service: "".into(),
+            kube_context: None,
+            kubeconfig: None,
+            kubectl_path: "kubectl".into(),
+            grpc_port: 50051,
+            token: Some("   ".into()),
+            timeout: 15,
+            max_retries: 5,
+        };
+
+        let config = args_empty_strings.to_client_config();
+        match config.discovery {
+            DiscoveryMode::Direct(ref ep) => {
+                assert_eq!(ep, "http://127.0.0.1:50051");
+            }
+            _ => panic!("expected fallback to DiscoveryMode::Direct(http://127.0.0.1:50051)"),
+        }
+        assert_eq!(config.auth_token, None);
+
+        // When endpoint is empty but valid endpoints exist, candidates discovery should be selected
+        let args_empty_ep_with_candidates = ClientConnectionArgs {
+            mode: CliRuntimeMode::Auto,
+            endpoint: Some("".into()),
+            endpoints: vec!["http://node1:50051".into(), " http://node2:50051 ".into()],
+            data_dir: None,
+            kube_lease: None,
+            kube_namespace: "default".into(),
+            kube_service: "".into(),
+            kube_context: None,
+            kubeconfig: None,
+            kubectl_path: "kubectl".into(),
+            grpc_port: 50051,
+            token: None,
+            timeout: 15,
+            max_retries: 5,
+        };
+
+        let config_candidates = args_empty_ep_with_candidates.to_client_config();
+        match config_candidates.discovery {
+            DiscoveryMode::Candidates(ref list) => {
+                assert_eq!(list, &["http://node1:50051", "http://node2:50051"]);
+            }
+            _ => panic!("expected DiscoveryMode::Candidates"),
+        }
     }
 }

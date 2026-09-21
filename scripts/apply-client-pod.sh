@@ -17,9 +17,11 @@ RSQLITE_RSYNC_CLIENT_POD_NAME="${RSQLITE_RSYNC_CLIENT_POD_NAME:-sqlite-ha-client
 # on the assumption of a trusted cluster network (private node network/Service mesh boundary).
 # For untrusted network segments or external traffic, terminate TLS using an ingress/mTLS mesh
 # (e.g. Istio, Linkerd, Cilium) and configure secure HTTPS endpoints.
-# If RSQLITE_RSYNC_ENDPOINT is unset, fall back to RSQLITE_RSYNC_ENDPOINTS if provided,
-# otherwise default to the sqlite-ha-writer ClusterIP service.
-RSQLITE_RSYNC_ENDPOINT="${RSQLITE_RSYNC_ENDPOINT:-${RSQLITE_RSYNC_ENDPOINTS:-http://sqlite-ha-writer:50051}}"
+RSQLITE_RSYNC_ENDPOINT="${RSQLITE_RSYNC_ENDPOINT:-}"
+RSQLITE_RSYNC_ENDPOINTS="${RSQLITE_RSYNC_ENDPOINTS:-}"
+if [[ -z "$RSQLITE_RSYNC_ENDPOINT" && -z "$RSQLITE_RSYNC_ENDPOINTS" ]]; then
+  RSQLITE_RSYNC_ENDPOINT="http://sqlite-ha-writer:50051"
+fi
 RSQLITE_RSYNC_AUTH_SECRET="${RSQLITE_RSYNC_AUTH_SECRET:-sqlite-ha-grpc-auth}"
 # The gRPC SQL Gateway requires a bearer token (see `--ha-grpc-auth-token` /
 # README "Security"). If RSQLITE_RSYNC_GRPC_AUTH_TOKEN is unset, read the existing
@@ -44,13 +46,14 @@ escape_sed_replacement() {
 image_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_IMAGE")"
 pod_name_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_CLIENT_POD_NAME")"
 endpoint_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_ENDPOINT")"
+endpoints_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_ENDPOINTS")"
 auth_secret_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_AUTH_SECRET")"
 
 sed \
   -e "s|__RSQLITE_RSYNC_IMAGE__|$image_escaped|g" \
   -e "s|__RSQLITE_RSYNC_CLIENT_POD_NAME__|$pod_name_escaped|g" \
   -e "s|__RSQLITE_RSYNC_ENDPOINT__|$endpoint_escaped|g" \
-  -e "s|__RSQLITE_RSYNC_ENDPOINTS__|$endpoint_escaped|g" \
+  -e "s|__RSQLITE_RSYNC_ENDPOINTS__|$endpoints_escaped|g" \
   -e "s|__RSQLITE_RSYNC_AUTH_SECRET__|$auth_secret_escaped|g" \
   "$template" > "$rendered"
 
@@ -122,7 +125,12 @@ echo "Applied client pod"
 echo "namespace: $RSQLITE_RSYNC_NAMESPACE"
 echo "pod: $RSQLITE_RSYNC_CLIENT_POD_NAME"
 echo "image: $RSQLITE_RSYNC_IMAGE"
-echo "endpoint: $RSQLITE_RSYNC_ENDPOINT"
+if [[ -n "$RSQLITE_RSYNC_ENDPOINT" ]]; then
+  echo "endpoint: $RSQLITE_RSYNC_ENDPOINT"
+fi
+if [[ -n "$RSQLITE_RSYNC_ENDPOINTS" ]]; then
+  echo "endpoints: $RSQLITE_RSYNC_ENDPOINTS"
+fi
 echo "auth secret: $RSQLITE_RSYNC_AUTH_SECRET"
 echo "gRPC gateway token: kubectl -n $RSQLITE_RSYNC_NAMESPACE get secret $RSQLITE_RSYNC_AUTH_SECRET -o go-template='{{.data.token | base64decode}}'"
 echo ""
