@@ -1,0 +1,22 @@
+[package]
+name = "rsqlite-rsync-pool"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.76"
+description = "Async connection pool adapters (bb8, deadpool) for rsqlite-rsync-client"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sria91/rsqlite-rsync"
+readme = "README.md"
+
+[features]
+default = ["bb8"]
+bb8 = ["dep:bb8"]
+deadpool = ["dep:deadpool"]
+
+[dependencies]
+rsqlite-rsync-client = { path = "../rsqlite-rsync-client", version = "0.2.0" }
+bb8 = { version = "0.9", optional = true }
+deadpool = { version = "0.13", optional = true, features = ["managed"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
