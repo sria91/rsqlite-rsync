@@ -7,9 +7,9 @@
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! use rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
-//! use rsqlite_rsync_pool::SqlGatewayManager;
 //! use rsqlite_rsync_pool::pool_deadpool::Pool;
+//! use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
+//! use rsqlite_rsync_pool::SqlGatewayManager;
 //!
 //! let manager = SqlGatewayManager::new(ClientConfig::new(
 //!     DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
@@ -26,8 +26,6 @@
 //! # Ok(())
 //! # }
 //! ```
-
-use std::future::Future;
 
 use deadpool::managed::{Metrics, RecycleError, RecycleResult};
 use rsqlite_rsync_client::{ClientError, SqlGatewayClient};
@@ -48,30 +46,23 @@ impl deadpool::managed::Manager for SqlGatewayManager {
     type Type = SqlGatewayClient;
     type Error = ClientError;
 
-    fn create(
-        &self,
-    ) -> impl Future<Output = Result<Self::Type, Self::Error>> + Send {
-        let config = self.config.clone();
-        async move {
-            let mut client = SqlGatewayClient::new(config);
-            // Eagerly validate so the pool never hands out a client that
-            // cannot reach its cluster.
-            client.get_cluster_status().await?;
-            Ok(client)
-        }
+    async fn create(&self) -> Result<Self::Type, Self::Error> {
+        let mut client = SqlGatewayClient::new(self.config.clone());
+        // Eagerly validate so the pool never hands out a client that
+        // cannot reach its cluster.
+        client.get_cluster_status().await?;
+        Ok(client)
     }
 
-    fn recycle(
+    async fn recycle(
         &self,
         conn: &mut Self::Type,
         _metrics: &Metrics,
-    ) -> impl Future<Output = RecycleResult<Self::Error>> + Send {
-        async move {
-            conn.get_cluster_status()
-                .await
-                .map_err(|e| RecycleError::Backend(e))?;
-            Ok(())
-        }
+    ) -> RecycleResult<Self::Error> {
+        conn.get_cluster_status()
+            .await
+            .map_err(RecycleError::Backend)?;
+        Ok(())
     }
 }
 

@@ -7,14 +7,15 @@
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! use rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
+//! use rsqlite_rsync_pool::pool_bb8::Pool;
+//! use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
 //! use rsqlite_rsync_pool::SqlGatewayManager;
 //!
 //! let manager = SqlGatewayManager::new(ClientConfig::new(
 //!     DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
 //! ));
 //!
-//! let pool = bb8::Pool::builder()
+//! let pool = Pool::builder()
 //!     .max_size(8)
 //!     .build(manager)
 //!     .await?;
@@ -25,8 +26,6 @@
 //! # Ok(())
 //! # }
 //! ```
-
-use std::future::Future;
 
 use rsqlite_rsync_client::{ClientError, SqlGatewayClient};
 
@@ -46,27 +45,17 @@ impl bb8::ManageConnection for SqlGatewayManager {
     type Connection = SqlGatewayClient;
     type Error = ClientError;
 
-    fn connect(
-        &self,
-    ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        let config = self.config.clone();
-        async move {
-            let mut client = SqlGatewayClient::new(config);
-            // Eagerly validate so the pool never hands out a client that
-            // cannot reach its cluster.
-            client.get_cluster_status().await?;
-            Ok(client)
-        }
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let mut client = SqlGatewayClient::new(self.config.clone());
+        // Eagerly validate so the pool never hands out a client that
+        // cannot reach its cluster.
+        client.get_cluster_status().await?;
+        Ok(client)
     }
 
-    fn is_valid(
-        &self,
-        conn: &mut Self::Connection,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            conn.get_cluster_status().await?;
-            Ok(())
-        }
+    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        conn.get_cluster_status().await?;
+        Ok(())
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {

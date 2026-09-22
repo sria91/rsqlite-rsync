@@ -19,14 +19,15 @@
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! use rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
+//! use rsqlite_rsync_pool::pool_bb8::Pool;
+//! use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
 //! use rsqlite_rsync_pool::SqlGatewayManager;
 //!
 //! let manager = SqlGatewayManager::new(ClientConfig::new(
 //!     DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
 //! ));
 //!
-//! let pool = bb8::Pool::builder()
+//! let pool = Pool::builder()
 //!     .max_size(8)
 //!     .build(manager)
 //!     .await?;
@@ -57,9 +58,15 @@ use rsqlite_rsync_client::ClientConfig;
 /// Holds a [`ClientConfig`] that is cloned into each new client the pool
 /// creates. The same `SqlGatewayManager` works with every supported pool
 /// backend — just enable the corresponding Cargo feature.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SqlGatewayManager {
     config: ClientConfig,
+}
+
+impl std::fmt::Debug for SqlGatewayManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqlGatewayManager").finish()
+    }
 }
 
 impl SqlGatewayManager {
@@ -87,10 +94,12 @@ mod tests {
 
     #[test]
     fn manager_debug_output_is_stable() {
-        let manager = SqlGatewayManager::new(ClientConfig::new(DiscoveryMode::Direct(
-            "http://127.0.0.1:50051".to_string(),
-        )));
+        let manager = SqlGatewayManager::new(
+            ClientConfig::new(DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()))
+                .with_auth_token("secret-token-12345"),
+        );
         let dbg = format!("{manager:?}");
-        assert!(dbg.contains("SqlGatewayManager"));
+        assert_eq!(dbg, "SqlGatewayManager");
+        assert!(!dbg.contains("secret-token-12345"));
     }
 }

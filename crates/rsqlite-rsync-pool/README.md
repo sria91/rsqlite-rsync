@@ -22,18 +22,22 @@ and knows how to create and health-check `SqlGatewayClient` instances.
 [dependencies]
 # bb8 backend (default)
 rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # deadpool backend instead
 rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", default-features = false, features = ["deadpool"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # both
 rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", features = ["deadpool"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ## Quickstart (bb8)
 
 ```rust,no_run
-use rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
+use rsqlite_rsync_pool::pool_bb8::Pool;
+use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
 use rsqlite_rsync_pool::SqlGatewayManager;
 
 #[tokio::main]
@@ -43,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_auth_token(std::env::var("RSQLITE_TOKEN")?),
     );
 
-    let pool = bb8::Pool::builder()
+    let pool = Pool::builder()
         .max_size(8)
         .build(manager)
         .await?;
@@ -70,9 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Quickstart (deadpool)
 
 ```rust,no_run
-use rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
-use rsqlite_rsync_pool::SqlGatewayManager;
 use rsqlite_rsync_pool::pool_deadpool::Pool;
+use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
+use rsqlite_rsync_pool::SqlGatewayManager;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
