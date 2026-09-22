@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/rsqlite-rsync-proto", "crates/rsqlite-rsync-client"]
-default-members = [".", "crates/rsqlite-rsync-proto", "crates/rsqlite-rsync-client"]
+members = ["crates/rsqlite-rsync-proto", "crates/rsqlite-rsync-client", "crates/rsqlite-rsync-pool"]
+default-members = [".", "crates/rsqlite-rsync-proto", "crates/rsqlite-rsync-client", "crates/rsqlite-rsync-pool"]
 
 [package]
 name = "rsqlite-rsync"
