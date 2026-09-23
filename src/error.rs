@@ -87,25 +87,41 @@ mod tests {
     #[test]
     fn test_sync_error_display_and_constructors() {
         let sqlite_err = SyncError::sqlite(5, "database is locked");
-        assert_eq!(sqlite_err.to_string(), "SQLite error (code 5): database is locked");
+        assert_eq!(
+            sqlite_err.to_string(),
+            "SQLite error (code 5): database is locked"
+        );
 
-        let io_err: SyncError = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found").into();
+        let io_err: SyncError =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found").into();
         assert_eq!(io_err.to_string(), "I/O error: file not found");
 
         let proto_err = SyncError::Protocol("bad version".into());
         assert_eq!(proto_err.to_string(), "Protocol error: bad version");
 
         let remote_err = SyncError::RemoteLaunch("ssh died".into());
-        assert_eq!(remote_err.to_string(), "Failed to launch remote endpoint: ssh died");
+        assert_eq!(
+            remote_err.to_string(),
+            "Failed to launch remote endpoint: ssh died"
+        );
 
         let net_err = SyncError::Network("connection refused".into());
         assert_eq!(net_err.to_string(), "Network error: connection refused");
 
-        let page_mismatch = SyncError::PageSizeMismatch { origin: 4096, replica: 1024 };
-        assert_eq!(page_mismatch.to_string(), "Page-size mismatch: origin=4096, replica=1024");
+        let page_mismatch = SyncError::PageSizeMismatch {
+            origin: 4096,
+            replica: 1024,
+        };
+        assert_eq!(
+            page_mismatch.to_string(),
+            "Page-size mismatch: origin=4096, replica=1024"
+        );
 
         let busy_err = SyncError::Busy("locked by reader".into());
-        assert_eq!(busy_err.to_string(), "Database busy / locked: locked by reader");
+        assert_eq!(
+            busy_err.to_string(),
+            "Database busy / locked: locked by reader"
+        );
 
         let codec_err = SyncError::Codec("invalid frame".into());
         assert_eq!(codec_err.to_string(), "Codec error: invalid frame");

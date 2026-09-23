@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/sria91/rsqlite-rsync"
 readme = "README.md"
 
+[features]
+blocking = ["tokio/rt"]
+
 [dependencies]
 rsqlite-rsync-proto = { path = "../rsqlite-rsync-proto", version = "0.2.0" }
 tonic = "0.14"

@@ -521,7 +521,10 @@ mod tests {
                 .any(|w| w == ["-o".to_string(), "ControlPersist=60".to_string()])
         );
         assert!(rendered.windows(2).any(|w| w
-            == ["-o".to_string(), "ControlPath=/tmp/rrs-test.ctl".to_string()]));
+            == [
+                "-o".to_string(),
+                "ControlPath=/tmp/rrs-test.ctl".to_string()
+            ]));
     }
 
     #[test]

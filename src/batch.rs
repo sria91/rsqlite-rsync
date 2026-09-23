@@ -522,11 +522,8 @@ mod tests {
     /// set via `PRAGMA page_size` before the first table is created (SQLite
     /// only honours the pragma on an otherwise-empty database).
     fn seed_db(path: &Path, page_size: Option<u32>) {
-        let conn = Connection::open(
-            path,
-            ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
-        )
-        .expect("create db");
+        let conn = Connection::open(path, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE)
+            .expect("create db");
         if let Some(size) = page_size {
             conn.exec(&format!("PRAGMA page_size={size}")).unwrap();
         }
@@ -759,8 +756,16 @@ mod tests {
         let replica_b = dir.path().join("replica_b.db");
 
         let specs = vec![
-            spec(origin_a.to_str().unwrap(), replica_a.to_str().unwrap(), true),
-            spec(origin_b.to_str().unwrap(), replica_b.to_str().unwrap(), true),
+            spec(
+                origin_a.to_str().unwrap(),
+                replica_a.to_str().unwrap(),
+                true,
+            ),
+            spec(
+                origin_b.to_str().unwrap(),
+                replica_b.to_str().unwrap(),
+                true,
+            ),
         ];
         let mut options = default_runtime_options();
         // More job slots than pending entries exercises the "no more work
@@ -861,7 +866,11 @@ mod tests {
         let origin = dir.path().join("origin.db");
         seed_db(&origin, None);
 
-        let item_spec = spec(origin.to_str().unwrap(), "localhost:/tmp/rsqlite-rsync-batch-test-replica.db", false);
+        let item_spec = spec(
+            origin.to_str().unwrap(),
+            "localhost:/tmp/rsqlite-rsync-batch-test-replica.db",
+            false,
+        );
         let mut options = default_runtime_options();
         options.ssh_options.connect_timeout_secs = 2;
 
@@ -877,7 +886,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let replica = dir.path().join("replica.db");
 
-        let item_spec = spec("localhost:/tmp/rsqlite-rsync-batch-test-origin.db", replica.to_str().unwrap(), false);
+        let item_spec = spec(
+            "localhost:/tmp/rsqlite-rsync-batch-test-origin.db",
+            replica.to_str().unwrap(),
+            false,
+        );
         let mut options = default_runtime_options();
         options.ssh_options.connect_timeout_secs = 2;
 
@@ -1003,7 +1016,11 @@ mod tests {
         assert_eq!(m_yml.len(), 1);
 
         let toml_path = dir.path().join("manifest.toml");
-        std::fs::write(&toml_path, "[[syncs]]\norigin = \"a.db\"\nreplica = \"b.db\"\n").unwrap();
+        std::fs::write(
+            &toml_path,
+            "[[syncs]]\norigin = \"a.db\"\nreplica = \"b.db\"\n",
+        )
+        .unwrap();
         let m_toml = load_manifest(&toml_path, ManifestFormat::Auto).unwrap();
         assert_eq!(m_toml.len(), 1);
     }

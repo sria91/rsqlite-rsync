@@ -369,9 +369,15 @@ mod tests {
     #[test]
     fn test_sync_tuning_from_env() {
         let _guard = TUNING_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("RSQLITE_RSYNC_MAX_HASH_THREADS", "4"); }
-        unsafe { std::env::set_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES", "200"); }
-        unsafe { std::env::set_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS", "32"); }
+        unsafe {
+            std::env::set_var("RSQLITE_RSYNC_MAX_HASH_THREADS", "4");
+        }
+        unsafe {
+            std::env::set_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES", "200");
+        }
+        unsafe {
+            std::env::set_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS", "32");
+        }
 
         let tuning = SyncTuning::from_env();
         assert_eq!(tuning.max_hash_threads, Some(4));
@@ -379,9 +385,15 @@ mod tests {
         assert_eq!(tuning.hash_chunk_groups, 32);
 
         // cleanup
-        unsafe { std::env::remove_var("RSQLITE_RSYNC_MAX_HASH_THREADS"); }
-        unsafe { std::env::remove_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES"); }
-        unsafe { std::env::remove_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS"); }
+        unsafe {
+            std::env::remove_var("RSQLITE_RSYNC_MAX_HASH_THREADS");
+        }
+        unsafe {
+            std::env::remove_var("RSQLITE_RSYNC_PARALLEL_MIN_PAGES");
+        }
+        unsafe {
+            std::env::remove_var("RSQLITE_RSYNC_HASH_CHUNK_GROUPS");
+        }
     }
 
     #[tokio::test]

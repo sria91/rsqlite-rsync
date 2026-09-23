@@ -189,7 +189,10 @@ mod tests {
             "Direct(\"x\")"
         );
         assert_eq!(
-            format!("{:?}", DiscoveryMode::Candidates(vec!["http://a".to_string()])),
+            format!(
+                "{:?}",
+                DiscoveryMode::Candidates(vec!["http://a".to_string()])
+            ),
             "Candidates([\"http://a\"])"
         );
     }

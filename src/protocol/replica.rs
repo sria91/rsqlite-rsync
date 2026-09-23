@@ -544,11 +544,14 @@ mod tests {
         ]);
 
         let result = run(&conn, &mut transport).await;
-        assert!(matches!(
-            result,
-            Err(crate::error::SyncError::Protocol(ref message))
-                if message == "boom"
-        ), "expected protocol error with peer message, got {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::SyncError::Protocol(ref message))
+                    if message == "boom"
+            ),
+            "expected protocol error with peer message, got {result:?}"
+        );
     }
 
     #[tokio::test]

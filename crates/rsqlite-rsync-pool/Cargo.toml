@@ -3,7 +3,7 @@ name = "rsqlite-rsync-pool"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.76"
-description = "Async connection pool adapters (bb8, deadpool) for rsqlite-rsync-client"
+description = "Connection pool adapters (bb8, deadpool, r2d2) for rsqlite-rsync-client"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sria91/rsqlite-rsync"
 readme = "README.md"
@@ -12,11 +12,13 @@ readme = "README.md"
 default = ["bb8"]
 bb8 = ["dep:bb8"]
 deadpool = ["dep:deadpool"]
+r2d2 = ["dep:r2d2", "rsqlite-rsync-client/blocking"]
 
 [dependencies]
 rsqlite-rsync-client = { path = "../rsqlite-rsync-client", version = "0.2.0" }
 bb8 = { version = "0.9", optional = true }
 deadpool = { version = "0.13", optional = true, features = ["managed"] }
+r2d2 = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

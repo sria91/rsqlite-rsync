@@ -76,7 +76,10 @@ mod tests {
     fn deadpool_manager_impl_compiles() {
         // Type-level check: Manager is implemented and the associated
         // types resolve correctly.
-        fn assert_manager<T: deadpool::managed::Manager<Type = SqlGatewayClient, Error = ClientError>>() {}
+        fn assert_manager<
+            T: deadpool::managed::Manager<Type = SqlGatewayClient, Error = ClientError>,
+        >() {
+        }
         assert_manager::<SqlGatewayManager>();
     }
 

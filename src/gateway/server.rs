@@ -327,7 +327,10 @@ mod tests {
     use tempfile::tempdir;
     use tokio_stream::StreamExt;
 
-    fn create_test_server(is_writer: bool, allow_replica_reads: bool) -> (SqlGatewayServer, tempfile::TempDir) {
+    fn create_test_server(
+        is_writer: bool,
+        allow_replica_reads: bool,
+    ) -> (SqlGatewayServer, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let engine = DatabaseEngine::new(dir.path()).unwrap();
         let now = SqlGatewayServer::now_secs();
@@ -397,7 +400,10 @@ mod tests {
         let meta = err.metadata();
         assert_eq!(meta.get(HEADER_RSQLITE_CODE).unwrap(), CODE_NOT_LEADER);
         assert_eq!(meta.get(HEADER_RSQLITE_LEADER_ID).unwrap(), "node-writer");
-        assert_eq!(meta.get(HEADER_RSQLITE_LEADER_ENDPOINT).unwrap(), "http://127.0.0.1:9090");
+        assert_eq!(
+            meta.get(HEADER_RSQLITE_LEADER_ENDPOINT).unwrap(),
+            "http://127.0.0.1:9090"
+        );
         assert_eq!(meta.get(HEADER_RSQLITE_GENERATION).unwrap(), "42");
     }
 
@@ -434,21 +440,27 @@ mod tests {
     async fn query_strong_consistency_on_writer_succeeds() {
         let (server, _dir) = create_test_server(true, false);
 
-        server.execute(Request::new(ExecuteRequest {
-            database: "query.db".into(),
-            statement: Some(Statement {
-                sql: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);".into(),
-                parameters: None,
-            }),
-        })).await.unwrap();
+        server
+            .execute(Request::new(ExecuteRequest {
+                database: "query.db".into(),
+                statement: Some(Statement {
+                    sql: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);".into(),
+                    parameters: None,
+                }),
+            }))
+            .await
+            .unwrap();
 
-        server.execute(Request::new(ExecuteRequest {
-            database: "query.db".into(),
-            statement: Some(Statement {
-                sql: "INSERT INTO items VALUES (1, 'item1');".into(),
-                parameters: None,
-            }),
-        })).await.unwrap();
+        server
+            .execute(Request::new(ExecuteRequest {
+                database: "query.db".into(),
+                statement: Some(Statement {
+                    sql: "INSERT INTO items VALUES (1, 'item1');".into(),
+                    parameters: None,
+                }),
+            }))
+            .await
+            .unwrap();
 
         let req = Request::new(QueryRequest {
             database: "query.db".into(),
@@ -538,7 +550,10 @@ mod tests {
             consistency: ConsistencyLevel::Strong as i32,
             chunk_size: 0,
         });
-        assert_eq!(server.query(req_missing).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            server.query(req_missing).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
 
         let req_invalid = Request::new(QueryRequest {
             database: "q.db".into(),
@@ -550,29 +565,38 @@ mod tests {
             consistency: ConsistencyLevel::Strong as i32,
             chunk_size: 0,
         });
-        assert_eq!(server.query(req_invalid).await.unwrap_err().code(), tonic::Code::Internal);
+        assert_eq!(
+            server.query(req_invalid).await.unwrap_err().code(),
+            tonic::Code::Internal
+        );
     }
 
     #[tokio::test]
     async fn stream_query_on_writer_and_replica() {
         let (server, _dir) = create_test_server(true, false);
 
-        server.execute(Request::new(ExecuteRequest {
-            database: "stream.db".into(),
-            statement: Some(Statement {
-                sql: "CREATE TABLE nums (n INT);".into(),
-                parameters: None,
-            }),
-        })).await.unwrap();
-
-        for i in 1..=5 {
-            server.execute(Request::new(ExecuteRequest {
+        server
+            .execute(Request::new(ExecuteRequest {
                 database: "stream.db".into(),
                 statement: Some(Statement {
-                    sql: format!("INSERT INTO nums VALUES ({i});"),
+                    sql: "CREATE TABLE nums (n INT);".into(),
                     parameters: None,
                 }),
-            })).await.unwrap();
+            }))
+            .await
+            .unwrap();
+
+        for i in 1..=5 {
+            server
+                .execute(Request::new(ExecuteRequest {
+                    database: "stream.db".into(),
+                    statement: Some(Statement {
+                        sql: format!("INSERT INTO nums VALUES ({i});"),
+                        parameters: None,
+                    }),
+                }))
+                .await
+                .unwrap();
         }
 
         // Query with chunk_size 2
@@ -627,7 +651,11 @@ mod tests {
             consistency: ConsistencyLevel::Strong as i32,
             chunk_size: 0,
         });
-        let replica_err = replica_server.stream_query(req_replica).await.err().unwrap();
+        let replica_err = replica_server
+            .stream_query(req_replica)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(replica_err.code(), tonic::Code::FailedPrecondition);
     }
 
@@ -670,7 +698,10 @@ mod tests {
             transaction_mode: BatchTransactionMode::None as i32,
             stop_on_error: false,
         });
-        assert_eq!(replica_server.batch(rep_req).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            replica_server.batch(rep_req).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     #[tokio::test]
@@ -678,13 +709,16 @@ mod tests {
         let (server, _dir) = create_test_server(true, false);
 
         // Create db first
-        server.execute(Request::new(ExecuteRequest {
-            database: "dropme.db".into(),
-            statement: Some(Statement {
-                sql: "CREATE TABLE t (x INT);".into(),
-                parameters: None,
-            }),
-        })).await.unwrap();
+        server
+            .execute(Request::new(ExecuteRequest {
+                database: "dropme.db".into(),
+                statement: Some(Statement {
+                    sql: "CREATE TABLE t (x INT);".into(),
+                    parameters: None,
+                }),
+            }))
+            .await
+            .unwrap();
 
         let req = Request::new(DropDatabaseRequest {
             database: "dropme.db".into(),
@@ -697,7 +731,11 @@ mod tests {
         let req_missing = Request::new(DropDatabaseRequest {
             database: "nonexistent.db".into(),
         });
-        let resp_missing = server.drop_database(req_missing).await.unwrap().into_inner();
+        let resp_missing = server
+            .drop_database(req_missing)
+            .await
+            .unwrap()
+            .into_inner();
         assert!(!resp_missing.existed);
 
         // Replica rejects drop
@@ -705,23 +743,37 @@ mod tests {
         let rep_req = Request::new(DropDatabaseRequest {
             database: "dropme.db".into(),
         });
-        assert_eq!(replica_server.drop_database(rep_req).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            replica_server
+                .drop_database(rep_req)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     #[tokio::test]
     async fn get_cluster_status_writer_and_replica() {
         let (writer_server, _dir) = create_test_server(true, false);
 
-        writer_server.execute(Request::new(ExecuteRequest {
-            database: "stat.db".into(),
-            statement: Some(Statement {
-                sql: "CREATE TABLE s (id INT);".into(),
-                parameters: None,
-            }),
-        })).await.unwrap();
+        writer_server
+            .execute(Request::new(ExecuteRequest {
+                database: "stat.db".into(),
+                statement: Some(Statement {
+                    sql: "CREATE TABLE s (id INT);".into(),
+                    parameters: None,
+                }),
+            }))
+            .await
+            .unwrap();
 
         let req = Request::new(ClusterStatusRequest {});
-        let resp = writer_server.get_cluster_status(req).await.unwrap().into_inner();
+        let resp = writer_server
+            .get_cluster_status(req)
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.node_id, "node-1");
         assert_eq!(resp.role, NodeRole::Writer as i32);
         assert_eq!(resp.local_generation, 42);
@@ -733,7 +785,11 @@ mod tests {
         assert!(!resp.version.is_empty());
 
         let (replica_server, _dir2) = create_test_server(false, false);
-        let rep_resp = replica_server.get_cluster_status(Request::new(ClusterStatusRequest {})).await.unwrap().into_inner();
+        let rep_resp = replica_server
+            .get_cluster_status(Request::new(ClusterStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(rep_resp.role, NodeRole::Replica as i32);
         assert_eq!(rep_resp.current_leader_id, "node-writer");
         assert_eq!(rep_resp.current_leader_endpoint, "http://127.0.0.1:9090");
@@ -747,13 +803,16 @@ mod tests {
         // `allow_replica_reads` check).
         let (server, _dir) = create_test_server(true, false);
 
-        server.execute(Request::new(ExecuteRequest {
-            database: "eventual_writer.db".into(),
-            statement: Some(Statement {
-                sql: "CREATE TABLE t (id INT);".into(),
-                parameters: None,
-            }),
-        })).await.unwrap();
+        server
+            .execute(Request::new(ExecuteRequest {
+                database: "eventual_writer.db".into(),
+                statement: Some(Statement {
+                    sql: "CREATE TABLE t (id INT);".into(),
+                    parameters: None,
+                }),
+            }))
+            .await
+            .unwrap();
 
         let req = Request::new(QueryRequest {
             database: "eventual_writer.db".into(),
@@ -777,7 +836,10 @@ mod tests {
         let (server, _dir) = create_test_server(true, false);
         // `query` always opens the database read-only, so the file must
         // already exist even for a query that doesn't touch a table.
-        server.engine.open_connection("consistency_fallback.db", false).unwrap();
+        server
+            .engine
+            .open_connection("consistency_fallback.db", false)
+            .unwrap();
 
         let req = Request::new(QueryRequest {
             database: "consistency_fallback.db".into(),
@@ -838,22 +900,28 @@ mod tests {
         // the closed channel and exit cleanly instead of panicking or hanging.
         let (server, _dir) = create_test_server(true, false);
 
-        server.execute(Request::new(ExecuteRequest {
-            database: "dropped.db".into(),
-            statement: Some(Statement {
-                sql: "CREATE TABLE nums (n INT);".into(),
-                parameters: None,
-            }),
-        })).await.unwrap();
-
-        for i in 1..=3 {
-            server.execute(Request::new(ExecuteRequest {
+        server
+            .execute(Request::new(ExecuteRequest {
                 database: "dropped.db".into(),
                 statement: Some(Statement {
-                    sql: format!("INSERT INTO nums VALUES ({i});"),
+                    sql: "CREATE TABLE nums (n INT);".into(),
                     parameters: None,
                 }),
-            })).await.unwrap();
+            }))
+            .await
+            .unwrap();
+
+        for i in 1..=3 {
+            server
+                .execute(Request::new(ExecuteRequest {
+                    database: "dropped.db".into(),
+                    statement: Some(Statement {
+                        sql: format!("INSERT INTO nums VALUES ({i});"),
+                        parameters: None,
+                    }),
+                }))
+                .await
+                .unwrap();
         }
 
         let req = Request::new(QueryRequest {

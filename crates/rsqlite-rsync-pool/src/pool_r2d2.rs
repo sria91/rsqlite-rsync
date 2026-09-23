@@ -1,13 +1,13 @@
-//! [`bb8::ManageConnection`] implementation for
-//! [`rsqlite_rsync_client::SqlGatewayClient`].
+//! [`r2d2::ManageConnection`] implementation for
+//! [`rsqlite_rsync_client::blocking::SqlGatewayClient`].
 //!
-//! Enable with `features = ["bb8"]` (on by default).
+//! Enable with `features = ["r2d2"]`.
 //!
 //! # Example
 //!
 //! ```no_run
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! use rsqlite_rsync_pool::pool_bb8::Pool;
+//! # fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! use rsqlite_rsync_pool::pool_r2d2::Pool;
 //! use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
 //! use rsqlite_rsync_pool::SqlGatewayManager;
 //!
@@ -17,44 +17,44 @@
 //!
 //! let pool = Pool::builder()
 //!     .max_size(8)
-//!     .build(manager)
-//!     .await?;
+//!     .build(manager)?;
 //!
-//! let mut conn = pool.get().await?;
-//! conn.execute("app.db", "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)", None)
-//!     .await?;
+//! let mut conn = pool.get()?;
+//! conn.execute("app.db", "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)", None)?;
 //! # Ok(())
 //! # }
 //! ```
 
-use rsqlite_rsync_client::{ClientError, SqlGatewayClient};
+use r2d2::ManageConnection;
+use rsqlite_rsync_client::blocking::SqlGatewayClient;
+use rsqlite_rsync_client::ClientError;
 
 use crate::SqlGatewayManager;
 
-/// Convenience alias for a bb8 pool of [`SqlGatewayClient`] connections.
-pub type Pool = bb8::Pool<SqlGatewayManager>;
+/// Convenience alias for an r2d2 pool of [`SqlGatewayClient`] connections.
+pub type Pool = r2d2::Pool<SqlGatewayManager>;
 
 /// Convenience alias for a pooled [`SqlGatewayClient`] connection.
-pub type PooledConnection<'a> = bb8::PooledConnection<'a, SqlGatewayManager>;
+pub type PooledConnection = r2d2::PooledConnection<SqlGatewayManager>;
 
-/// Convenience alias for the bb8 pool builder configured with
+/// Convenience alias for the r2d2 pool builder configured with
 /// [`SqlGatewayManager`].
-pub type Builder = bb8::Builder<SqlGatewayManager>;
+pub type Builder = r2d2::Builder<SqlGatewayManager>;
 
-impl bb8::ManageConnection for SqlGatewayManager {
+impl ManageConnection for SqlGatewayManager {
     type Connection = SqlGatewayClient;
     type Error = ClientError;
 
-    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
         let mut client = SqlGatewayClient::new(self.config.clone());
         // Eagerly validate so the pool never hands out a client that
         // cannot reach its cluster.
-        client.get_cluster_status().await?;
+        client.get_cluster_status()?;
         Ok(client)
     }
 
-    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        conn.get_cluster_status().await?;
+    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        conn.get_cluster_status()?;
         Ok(())
     }
 
@@ -69,15 +69,15 @@ impl bb8::ManageConnection for SqlGatewayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bb8::ManageConnection;
+    use r2d2::ManageConnection;
     use rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
 
     #[test]
-    fn bb8_manage_connection_impl_compiles() {
+    fn r2d2_manage_connection_impl_compiles() {
         // Type-level check: ManageConnection is implemented and the
         // associated types resolve correctly.
         fn assert_manage<
-            T: bb8::ManageConnection<Connection = SqlGatewayClient, Error = ClientError>,
+            T: ManageConnection<Connection = SqlGatewayClient, Error = ClientError>,
         >() {
         }
         assert_manage::<SqlGatewayManager>();
@@ -87,7 +87,7 @@ mod tests {
     fn pool_type_aliases_resolve() {
         // Verify the convenience type aliases are well-formed.
         fn _accept_pool(_p: Pool) {}
-        fn _accept_conn(_c: PooledConnection<'_>) {}
+        fn _accept_conn(_c: PooledConnection) {}
         fn _accept_builder(_b: Builder) {}
     }
 

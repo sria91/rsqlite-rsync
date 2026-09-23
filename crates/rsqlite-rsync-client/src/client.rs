@@ -439,11 +439,17 @@ mod tests {
 
         let req_some = authorized_request(&Some("token123".to_string()), ());
         assert_eq!(
-            req_some.metadata().get("authorization").unwrap().to_str().unwrap(),
+            req_some
+                .metadata()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer token123"
         );
 
-        let req_invalid = authorized_request(&Some("token\nwith\ninvalid\x00chars".to_string()), ());
+        let req_invalid =
+            authorized_request(&Some("token\nwith\ninvalid\x00chars".to_string()), ());
         assert!(req_invalid.metadata().get("authorization").is_none());
     }
 
@@ -454,20 +460,24 @@ mod tests {
         ));
         client.current_endpoint = Some("http://old.endpoint".to_string());
         // connect_lazy() still requires a tokio runtime to construct the channel
-        let channel = Endpoint::from_shared("http://dummy").unwrap().connect_lazy();
+        let channel = Endpoint::from_shared("http://dummy")
+            .unwrap()
+            .connect_lazy();
         client.tonic_client = Some(TonicSqlGatewayClient::new(channel));
 
         // Create a status with a non-empty leader endpoint header
         let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert(HEADER_RSQLITE_LEADER_ENDPOINT, "http://new.endpoint".parse().unwrap());
-        let status = Status::with_metadata(
-            Code::Unknown,
-            "test",
-            metadata,
+        metadata.insert(
+            HEADER_RSQLITE_LEADER_ENDPOINT,
+            "http://new.endpoint".parse().unwrap(),
         );
+        let status = Status::with_metadata(Code::Unknown, "test", metadata);
 
         client.process_leader_header(&status);
-        assert_eq!(client.current_endpoint, Some("http://new.endpoint".to_string()));
+        assert_eq!(
+            client.current_endpoint,
+            Some("http://new.endpoint".to_string())
+        );
         assert!(client.tonic_client.is_none());
     }
 
@@ -478,17 +488,15 @@ mod tests {
         ));
         client.current_endpoint = Some("http://old.endpoint".to_string());
         // connect_lazy() still requires a tokio runtime to construct the channel
-        let channel = Endpoint::from_shared("http://dummy").unwrap().connect_lazy();
+        let channel = Endpoint::from_shared("http://dummy")
+            .unwrap()
+            .connect_lazy();
         client.tonic_client = Some(TonicSqlGatewayClient::new(channel));
 
         // Create a status with an empty leader endpoint header
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert(HEADER_RSQLITE_LEADER_ENDPOINT, "".parse().unwrap());
-        let status = Status::with_metadata(
-            Code::Unknown,
-            "test",
-            metadata,
-        );
+        let status = Status::with_metadata(Code::Unknown, "test", metadata);
 
         client.process_leader_header(&status);
         // Should reset the connection because the header value is empty
@@ -503,16 +511,14 @@ mod tests {
         ));
         client.current_endpoint = Some("http://old.endpoint".to_string());
         // connect_lazy() still requires a tokio runtime to construct the channel
-        let channel = Endpoint::from_shared("http://dummy").unwrap().connect_lazy();
+        let channel = Endpoint::from_shared("http://dummy")
+            .unwrap()
+            .connect_lazy();
         client.tonic_client = Some(TonicSqlGatewayClient::new(channel));
 
         // Create a status without the leader endpoint header
         let metadata = tonic::metadata::MetadataMap::new();
-        let status = Status::with_metadata(
-            Code::Unknown,
-            "test",
-            metadata,
-        );
+        let status = Status::with_metadata(Code::Unknown, "test", metadata);
 
         client.process_leader_header(&status);
         // Should reset the connection

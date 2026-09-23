@@ -205,10 +205,7 @@ impl ClientConnectionArgs {
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|s| !s.is_empty());
-                let has_endpoints = self
-                    .endpoints
-                    .iter()
-                    .any(|s| !s.trim().is_empty());
+                let has_endpoints = self.endpoints.iter().any(|s| !s.trim().is_empty());
                 let has_kube_lease = self
                     .kube_lease
                     .as_deref()
@@ -1176,10 +1173,10 @@ fn is_query_sql(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use rsqlite_rsync::proto::rsqlite::v1::{
-        statement_result, ColumnHeader, DatabaseInfo, LeaseStatus, Row, StatementResult,
+        ColumnHeader, DatabaseInfo, LeaseStatus, Row, StatementResult, statement_result,
     };
+    use std::path::Path;
 
     fn default_test_args() -> ClientConnectionArgs {
         ClientConnectionArgs {
@@ -1220,62 +1217,61 @@ mod tests {
 
         // Wrap the assertions in a closure so restoration always runs.
         let result = std::panic::catch_unwind(|| {
+            // Explicit Local Mode with data_dir
+            let mut args = default_test_args();
+            args.mode = CliRuntimeMode::Local;
+            args.data_dir = Some(PathBuf::from("/tmp/edge-data"));
+            let target = args.to_client_target().unwrap();
+            assert!(
+                matches!(target, ClientTarget::Local { data_dir } if data_dir == Path::new("/tmp/edge-data"))
+            );
 
-        // Explicit Local Mode with data_dir
-        let mut args = default_test_args();
-        args.mode = CliRuntimeMode::Local;
-        args.data_dir = Some(PathBuf::from("/tmp/edge-data"));
-        let target = args.to_client_target().unwrap();
-        assert!(
-            matches!(target, ClientTarget::Local { data_dir } if data_dir == Path::new("/tmp/edge-data"))
-        );
+            // Explicit Local Mode without data_dir should fail
+            let mut args_no_dir = default_test_args();
+            args_no_dir.mode = CliRuntimeMode::Local;
+            args_no_dir.data_dir = None;
+            assert!(args_no_dir.to_client_target().is_err());
 
-        // Explicit Local Mode without data_dir should fail
-        let mut args_no_dir = default_test_args();
-        args_no_dir.mode = CliRuntimeMode::Local;
-        args_no_dir.data_dir = None;
-        assert!(args_no_dir.to_client_target().is_err());
+            // Auto Mode with data_dir -> Local
+            let mut args_auto_local = default_test_args();
+            args_auto_local.mode = CliRuntimeMode::Auto;
+            args_auto_local.data_dir = Some(PathBuf::from("/var/data"));
+            let target = args_auto_local.to_client_target().unwrap();
+            assert!(
+                matches!(target, ClientTarget::Local { data_dir } if data_dir == Path::new("/var/data"))
+            );
 
-        // Auto Mode with data_dir -> Local
-        let mut args_auto_local = default_test_args();
-        args_auto_local.mode = CliRuntimeMode::Auto;
-        args_auto_local.data_dir = Some(PathBuf::from("/var/data"));
-        let target = args_auto_local.to_client_target().unwrap();
-        assert!(
-            matches!(target, ClientTarget::Local { data_dir } if data_dir == Path::new("/var/data"))
-        );
+            // Auto Mode with both endpoint and data_dir -> Remote takes precedence
+            let mut args_auto_both = default_test_args();
+            args_auto_both.mode = CliRuntimeMode::Auto;
+            args_auto_both.endpoint = Some("http://127.0.0.1:50051".to_string());
+            args_auto_both.data_dir = Some(PathBuf::from("/var/data"));
+            let target = args_auto_both.to_client_target().unwrap();
+            assert!(matches!(target, ClientTarget::Remote { .. }));
 
-        // Auto Mode with both endpoint and data_dir -> Remote takes precedence
-        let mut args_auto_both = default_test_args();
-        args_auto_both.mode = CliRuntimeMode::Auto;
-        args_auto_both.endpoint = Some("http://127.0.0.1:50051".to_string());
-        args_auto_both.data_dir = Some(PathBuf::from("/var/data"));
-        let target = args_auto_both.to_client_target().unwrap();
-        assert!(matches!(target, ClientTarget::Remote { .. }));
-
-        // Explicit Cluster Mode with endpoint -> Remote
-        let mut args_cluster = default_test_args();
-        args_cluster.mode = CliRuntimeMode::Cluster;
-        args_cluster.endpoint = Some("http://10.0.0.1:50051".to_string());
-        args_cluster.token = Some("secret".to_string());
-        args_cluster.timeout = 10;
-        args_cluster.max_retries = 3;
-        let target = args_cluster.to_client_target().unwrap();
-        match target {
-            ClientTarget::Remote { config } => {
-                assert!(
-                    matches!(config.discovery, DiscoveryMode::Direct(ref ep) if ep == "http://10.0.0.1:50051")
-                );
-                assert_eq!(config.auth_token.as_deref(), Some("secret"));
-                assert_eq!(config.max_retries, 3);
+            // Explicit Cluster Mode with endpoint -> Remote
+            let mut args_cluster = default_test_args();
+            args_cluster.mode = CliRuntimeMode::Cluster;
+            args_cluster.endpoint = Some("http://10.0.0.1:50051".to_string());
+            args_cluster.token = Some("secret".to_string());
+            args_cluster.timeout = 10;
+            args_cluster.max_retries = 3;
+            let target = args_cluster.to_client_target().unwrap();
+            match target {
+                ClientTarget::Remote { config } => {
+                    assert!(
+                        matches!(config.discovery, DiscoveryMode::Direct(ref ep) if ep == "http://10.0.0.1:50051")
+                    );
+                    assert_eq!(config.auth_token.as_deref(), Some("secret"));
+                    assert_eq!(config.max_retries, 3);
+                }
+                ClientTarget::Local { .. } => panic!("expected Remote target"),
             }
-            ClientTarget::Local { .. } => panic!("expected Remote target"),
-        }
 
-        // Auto Mode with defaults -> Remote (default direct discovery)
-        let args_default = default_test_args();
-        let target = args_default.to_client_target().unwrap();
-        assert!(matches!(target, ClientTarget::Remote { .. }));
+            // Auto Mode with defaults -> Remote (default direct discovery)
+            let args_default = default_test_args();
+            let target = args_default.to_client_target().unwrap();
+            assert!(matches!(target, ClientTarget::Remote { .. }));
         });
 
         // Restore original env vars regardless of test outcome.
@@ -1379,19 +1375,25 @@ mod tests {
         let v_null = parse_string_to_value("null").unwrap();
         assert!(matches!(
             v_null.value,
-            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true))
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(
+                true
+            ))
         ));
 
         let v_null_upper = parse_string_to_value("NULL").unwrap();
         assert!(matches!(
             v_null_upper.value,
-            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true))
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(
+                true
+            ))
         ));
 
         let v_int = parse_string_to_value("12345").unwrap();
         assert!(matches!(
             v_int.value,
-            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(12345))
+            Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(
+                12345
+            ))
         ));
 
         let v_float = parse_string_to_value("12.34").unwrap();
@@ -1552,22 +1554,30 @@ mod tests {
                 Row {
                     values: vec![
                         Value {
-                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(1)),
+                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(
+                                1,
+                            )),
                         },
                         Value {
-                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
-                                "val,with\"comma\nand newline".to_string(),
-                            )),
+                            value: Some(
+                                rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
+                                    "val,with\"comma\nand newline".to_string(),
+                                ),
+                            ),
                         },
                     ],
                 },
                 Row {
                     values: vec![
                         Value {
-                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true)),
+                            value: Some(
+                                rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true),
+                            ),
                         },
                         Value {
-                            value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true)),
+                            value: Some(
+                                rsqlite_rsync::proto::rsqlite::v1::value::Value::NullValue(true),
+                            ),
                         },
                     ],
                 },
@@ -1655,16 +1665,22 @@ mod tests {
     fn test_dirs_next_history_path() {
         let _guard = CLIENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let orig_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", "/tmp/mockhome"); }
+        unsafe {
+            std::env::set_var("HOME", "/tmp/mockhome");
+        }
         let p = dirs_next_history_path();
         assert_eq!(p, Some(PathBuf::from("/tmp/mockhome/.rsqlite_history")));
 
-        unsafe { std::env::remove_var("HOME"); }
+        unsafe {
+            std::env::remove_var("HOME");
+        }
         let p2 = dirs_next_history_path();
         assert_eq!(p2, None);
 
         if let Some(h) = orig_home {
-            unsafe { std::env::set_var("HOME", h); }
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
         }
     }
 
@@ -1706,7 +1722,10 @@ mod tests {
         let batch_cmd = ClientCommand::Batch {
             database: "app.db".to_string(),
             file: None,
-            sql: Some("INSERT INTO users VALUES (2, 'bob'); INSERT INTO users VALUES (3, 'charlie');".to_string()),
+            sql: Some(
+                "INSERT INTO users VALUES (2, 'bob'); INSERT INTO users VALUES (3, 'charlie');"
+                    .to_string(),
+            ),
             tx_mode: CliTxMode::Deferred,
             stop_on_error: true,
         };
@@ -1773,36 +1792,180 @@ mod tests {
         let mut current_db = "app.db".to_string();
         let mut current_format = OutputFormat::Table;
 
-        assert!(handle_metacommand(&mut client, ".quit", &mut current_db, &mut current_format).await.unwrap());
-        assert!(handle_metacommand(&mut client, ".exit", &mut current_db, &mut current_format).await.unwrap());
-        assert!(handle_metacommand(&mut client, ".q", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".help", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".tables", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".schema", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".schema users", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".database", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".database new.db", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            handle_metacommand(&mut client, ".quit", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            handle_metacommand(&mut client, ".exit", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            handle_metacommand(&mut client, ".q", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle_metacommand(&mut client, ".help", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle_metacommand(&mut client, ".tables", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle_metacommand(&mut client, ".schema", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".schema users",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".database",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".database new.db",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(current_db, "new.db");
 
-        assert!(!handle_metacommand(&mut client, ".mode", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".mode json", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(&mut client, ".mode", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".mode json",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(current_format, OutputFormat::Json);
-        assert!(!handle_metacommand(&mut client, ".mode csv", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".mode csv",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(current_format, OutputFormat::Csv);
-        assert!(!handle_metacommand(&mut client, ".mode tsv", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".mode tsv",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(current_format, OutputFormat::Tsv);
-        assert!(!handle_metacommand(&mut client, ".mode raw", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".mode raw",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(current_format, OutputFormat::Raw);
-        assert!(!handle_metacommand(&mut client, ".mode table", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".mode table",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(current_format, OutputFormat::Table);
-        assert!(!handle_metacommand(&mut client, ".mode invalid", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".mode invalid",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
 
-        assert!(!handle_metacommand(&mut client, ".status", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(&mut client, ".status", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
 
-        assert!(!handle_metacommand(&mut client, &format!(".read {}", batch_file.display()), &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".read non_existent.sql", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".read", &mut current_db, &mut current_format).await.unwrap());
-        assert!(!handle_metacommand(&mut client, ".unknown", &mut current_db, &mut current_format).await.unwrap());
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                &format!(".read {}", batch_file.display()),
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".read non_existent.sql",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !handle_metacommand(&mut client, ".read", &mut current_db, &mut current_format)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle_metacommand(
+                &mut client,
+                ".unknown",
+                &mut current_db,
+                &mut current_format
+            )
+            .await
+            .unwrap()
+        );
 
         // 10. Drop database
         let drop_cmd = ClientCommand::DropDatabase {
@@ -1816,7 +1979,9 @@ mod tests {
             database: "app.db".to_string(),
             yes: true,
         };
-        run_client_command(&args, &drop_cmd_nonexistent).await.unwrap();
+        run_client_command(&args, &drop_cmd_nonexistent)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1826,7 +1991,9 @@ mod tests {
             rows: vec![rsqlite_rsync::proto::rsqlite::v1::Row {
                 values: vec![
                     Value {
-                        value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(42)),
+                        value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::IntValue(
+                            42,
+                        )),
                     },
                     Value {
                         value: Some(rsqlite_rsync::proto::rsqlite::v1::value::Value::TextValue(
@@ -2005,10 +2172,42 @@ mod tests {
         assert!(args_empty.to_client_target().is_err());
 
         // Cleanup
-        if let Some(v) = old_data_dir { unsafe { std::env::set_var("RSQLITE_DATA_DIR", v); } } else { unsafe { std::env::remove_var("RSQLITE_DATA_DIR"); } }
-        if let Some(v) = old_endpoint { unsafe { std::env::set_var("RSQLITE_ENDPOINT", v); } } else { unsafe { std::env::remove_var("RSQLITE_ENDPOINT"); } }
-        if let Some(v) = old_endpoints { unsafe { std::env::set_var("RSQLITE_ENDPOINTS", v); } } else { unsafe { std::env::remove_var("RSQLITE_ENDPOINTS"); } }
-        if let Some(v) = old_kube_lease { unsafe { std::env::set_var("RSQLITE_KUBE_LEASE", v); } } else { unsafe { std::env::remove_var("RSQLITE_KUBE_LEASE"); } }
+        if let Some(v) = old_data_dir {
+            unsafe {
+                std::env::set_var("RSQLITE_DATA_DIR", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("RSQLITE_DATA_DIR");
+            }
+        }
+        if let Some(v) = old_endpoint {
+            unsafe {
+                std::env::set_var("RSQLITE_ENDPOINT", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("RSQLITE_ENDPOINT");
+            }
+        }
+        if let Some(v) = old_endpoints {
+            unsafe {
+                std::env::set_var("RSQLITE_ENDPOINTS", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("RSQLITE_ENDPOINTS");
+            }
+        }
+        if let Some(v) = old_kube_lease {
+            unsafe {
+                std::env::set_var("RSQLITE_KUBE_LEASE", v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("RSQLITE_KUBE_LEASE");
+            }
+        }
     }
 
     #[test]

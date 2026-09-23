@@ -1531,8 +1531,8 @@ mod tests {
     #[test]
     fn test_readiness_aware_executor_lifecycle() {
         use rsqlite_rsync::ha::{
-            DemotionReason, FileActionExecutor, HaActionExecutor, HaSharedState, PromotionViolation,
-            TracingExecutor, WriteFenceViolation,
+            DemotionReason, FileActionExecutor, HaActionExecutor, HaSharedState,
+            PromotionViolation, TracingExecutor, WriteFenceViolation,
         };
 
         let tmp = tempdir().unwrap();
@@ -1555,7 +1555,10 @@ mod tests {
 
         executor.initialize_not_ready().unwrap();
         assert!(!readiness_state.load(Ordering::SeqCst));
-        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+        assert_eq!(
+            std::fs::read_to_string(&readiness_file).unwrap(),
+            "not-ready\n"
+        );
 
         // enable_writer
         executor.enable_writer(5).unwrap();
@@ -1572,16 +1575,24 @@ mod tests {
 
         // disable_writer
         executor
-            .disable_writer(&DemotionReason::FenceViolation(WriteFenceViolation::LeaseExpired))
+            .disable_writer(&DemotionReason::FenceViolation(
+                WriteFenceViolation::LeaseExpired,
+            ))
             .unwrap();
         assert!(!readiness_state.load(Ordering::SeqCst));
-        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+        assert_eq!(
+            std::fs::read_to_string(&readiness_file).unwrap(),
+            "not-ready\n"
+        );
         assert_eq!(ha_state.read().unwrap().role, NodeRole::Replica);
 
         // ensure_replica
         executor.ensure_replica().unwrap();
         assert!(!readiness_state.load(Ordering::SeqCst));
-        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+        assert_eq!(
+            std::fs::read_to_string(&readiness_file).unwrap(),
+            "not-ready\n"
+        );
         assert_eq!(ha_state.read().unwrap().role, NodeRole::Replica);
 
         // record_promotion_denied
@@ -1592,7 +1603,10 @@ mod tests {
             })
             .unwrap();
         assert!(!readiness_state.load(Ordering::SeqCst));
-        assert_eq!(std::fs::read_to_string(&readiness_file).unwrap(), "not-ready\n");
+        assert_eq!(
+            std::fs::read_to_string(&readiness_file).unwrap(),
+            "not-ready\n"
+        );
         assert_eq!(ha_state.read().unwrap().role, NodeRole::Replica);
     }
 
@@ -1651,7 +1665,10 @@ mod tests {
         assert_eq!(body, "initializing\n");
 
         // /healthz when healthy
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         last_tick.store(now, Ordering::SeqCst);
         let (head, body) = get_endpoint(addr, "/healthz").await;
         assert!(head.starts_with("HTTP/1.1 200 OK"));
@@ -1678,48 +1695,85 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         // batch with HA
-        let args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json", "--ha"]).unwrap();
+        let args =
+            Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json", "--ha"])
+                .unwrap();
         let err = rt.block_on(run_batch_mode(args)).unwrap_err();
-        assert!(err.to_string().contains("--batch-manifest cannot be used with --ha"));
+        assert!(
+            err.to_string()
+                .contains("--batch-manifest cannot be used with --ha")
+        );
 
         // batch with server
-        let args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json", "--server"]).unwrap();
+        let args = Args::try_parse_from([
+            "rsqlite-rsync",
+            "--batch-manifest",
+            "manifest.json",
+            "--server",
+        ])
+        .unwrap();
         let err = rt.block_on(run_batch_mode(args)).unwrap_err();
-        assert!(err.to_string().contains("--batch-manifest cannot be used with --server"));
+        assert!(
+            err.to_string()
+                .contains("--batch-manifest cannot be used with --server")
+        );
 
         // batch with origin positional
-        let args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json", "origin.db"]).unwrap();
+        let args = Args::try_parse_from([
+            "rsqlite-rsync",
+            "--batch-manifest",
+            "manifest.json",
+            "origin.db",
+        ])
+        .unwrap();
         let err = rt.block_on(run_batch_mode(args)).unwrap_err();
-        assert!(err.to_string().contains("batch mode does not accept ORIGIN/REPLICA"));
+        assert!(
+            err.to_string()
+                .contains("batch mode does not accept ORIGIN/REPLICA")
+        );
 
         // batch jobs = 0
-        let mut args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
+        let mut args =
+            Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
         args.batch_jobs = 0;
         let err = rt.block_on(run_batch_mode(args)).unwrap_err();
-        assert!(err.to_string().contains("--batch-jobs must be greater than 0"));
+        assert!(
+            err.to_string()
+                .contains("--batch-jobs must be greater than 0")
+        );
 
         // batch jitter > 100
-        let mut args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
+        let mut args =
+            Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
         args.batch_retry_jitter_pct = 150;
         let err = rt.block_on(run_batch_mode(args)).unwrap_err();
-        assert!(err.to_string().contains("--batch-retry-jitter-pct must be between 0 and 100"));
+        assert!(
+            err.to_string()
+                .contains("--batch-retry-jitter-pct must be between 0 and 100")
+        );
 
         // batch backoff max < backoff
-        let mut args = Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
+        let mut args =
+            Args::try_parse_from(["rsqlite-rsync", "--batch-manifest", "manifest.json"]).unwrap();
         args.batch_retry_backoff_ms = 500;
         args.batch_retry_backoff_max_ms = 100;
         let err = rt.block_on(run_batch_mode(args)).unwrap_err();
-        assert!(err.to_string().contains("--batch-retry-backoff-max-ms must be >= --batch-retry-backoff-ms"));
+        assert!(
+            err.to_string()
+                .contains("--batch-retry-backoff-max-ms must be >= --batch-retry-backoff-ms")
+        );
     }
 
     #[test]
     fn test_batch_mode_execution_success() {
-        use rsqlite_rsync::db::{ffi, Connection};
+        use rsqlite_rsync::db::{Connection, ffi};
         let tmp = tempdir().unwrap();
         let db1 = tmp.path().join("db1.db");
         let db1_rep = tmp.path().join("db1_rep.db");
-        let conn = Connection::open(&db1, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE).unwrap();
-        conn.exec("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);").unwrap();
+        let conn =
+            Connection::open(&db1, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE).unwrap();
+        conn.exec("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
         drop(conn);
 
         let manifest_content = format!(
@@ -1734,7 +1788,8 @@ mod tests {
             "rsqlite-rsync",
             "--batch-manifest",
             manifest_file.to_str().unwrap(),
-        ]).unwrap();
+        ])
+        .unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(run_batch_mode(args)).unwrap();
@@ -1743,13 +1798,19 @@ mod tests {
 
     #[test]
     fn test_dry_run_local_execution() {
-        use rsqlite_rsync::db::{ffi, Connection};
+        use rsqlite_rsync::db::{Connection, ffi};
         let tmp = tempdir().unwrap();
         let o_path = tmp.path().join("orig.db");
         let r_path = tmp.path().join("repl.db");
 
-        let o_conn = Connection::open(&o_path, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE).unwrap();
-        o_conn.exec("CREATE TABLE t (x); INSERT INTO t VALUES (42);").unwrap();
+        let o_conn = Connection::open(
+            &o_path,
+            ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+        o_conn
+            .exec("CREATE TABLE t (x); INSERT INTO t VALUES (42);")
+            .unwrap();
         drop(o_conn);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1757,7 +1818,11 @@ mod tests {
         rt.block_on(dry_run_local(&o_path, &r_path)).unwrap();
 
         // Create replica
-        let r_conn = Connection::open(&r_path, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE).unwrap();
+        let r_conn = Connection::open(
+            &r_path,
+            ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
         drop(r_conn);
 
         // Dry run when replica exists
