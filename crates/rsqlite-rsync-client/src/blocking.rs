@@ -7,11 +7,13 @@
 //!
 //! # Panics
 //!
-//! [`SqlGatewayClient::new`] will **panic** if called from within an
-//! active tokio runtime (i.e. inside `#[tokio::main]`, `#[tokio::test]`,
-//! or a spawned task).  If you are already inside an async context, use
-//! [`crate::SqlGatewayClient`] directly or run the blocking code on a
-//! dedicated thread via [`tokio::task::spawn_blocking`].
+//! Every blocking method (and [`BlockingStreaming::message`]) will **panic**
+//! if called from within an active async execution context — i.e. inside
+//! `#[tokio::main]`, `#[tokio::test]`, or a spawned async task.
+//!
+//! The client **can** be constructed and used on a
+//! [`tokio::task::spawn_blocking`] thread; however, it must not be moved
+//! back into an async task afterwards.
 //!
 //! # Example
 //!
@@ -41,6 +43,45 @@ use crate::proto::{
 };
 use crate::ClientConfig;
 
+/// Panic if called from within an active async execution context.
+///
+/// `tokio::runtime::Handle::try_current()` succeeds both inside async
+/// tasks **and** on `spawn_blocking` threads.  To distinguish the two we
+/// attempt to build a *new* current-thread runtime — this succeeds on
+/// `spawn_blocking` threads (where `block_on` is allowed) but panics
+/// inside an async task (where `block_on` would deadlock).
+///
+/// The temporary runtime is dropped immediately; it only exists to
+/// validate the execution context.
+fn assert_not_in_async_context() {
+    // If there is no handle at all we are definitely not in an async
+    // context — skip the heavier check.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+
+    // A handle exists.  Try building + entering a throw-away runtime.
+    // Inside an async task this panics with Tokio's own
+    // "Cannot start a runtime from within a runtime" message, but we
+    // surface a more domain-specific message first.
+    let probe = std::panic::catch_unwind(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("probe runtime");
+        // `block_on` is what actually triggers the nested-runtime
+        // panic when called from an async task.
+        rt.block_on(async {});
+    });
+
+    if probe.is_err() {
+        panic!(
+            "Cannot use a blocking SqlGatewayClient from within an async runtime. \
+             Use the async `SqlGatewayClient` directly, or run blocking code on a \
+             dedicated thread via `tokio::task::spawn_blocking`."
+        );
+    }
+}
+
 // Re-export commonly used types so callers can pull everything from
 // `rsqlite_rsync_client::blocking::*`.
 pub use crate::config::{ClientTarget, RuntimeMode};
@@ -66,15 +107,11 @@ impl SqlGatewayClient {
     ///
     /// # Panics
     ///
-    /// Panics when called from within an active tokio runtime.
+    /// Panics when called from within an active async execution context
+    /// (e.g. inside `#[tokio::main]` or a spawned async task).
+    /// Construction inside [`tokio::task::spawn_blocking`] is allowed.
     pub fn new(config: ClientConfig) -> Self {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            panic!(
-                "Cannot create a blocking SqlGatewayClient from within an async runtime. \
-                 Use the async `SqlGatewayClient` directly, or run blocking code on a \
-                 dedicated thread via `tokio::task::spawn_blocking`."
-            );
-        }
+        assert_not_in_async_context();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -95,23 +132,37 @@ impl SqlGatewayClient {
 
     /// Discover the current active writer endpoint using the configured
     /// [`DiscoveryMode`], without connecting.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn discover_leader(&mut self) -> ClientResult<String> {
+        assert_not_in_async_context();
         self.rt.block_on(self.inner.discover_leader())
     }
 
     /// Execute a write statement (DML/DDL) with transparent failover and
     /// retry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn execute(
         &mut self,
         database: &str,
         sql: &str,
         parameters: Option<Parameters>,
     ) -> ClientResult<ExecuteResponse> {
+        assert_not_in_async_context();
         self.rt
             .block_on(self.inner.execute(database, sql, parameters))
     }
 
     /// Execute a read query with transparent failover and retry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn query(
         &mut self,
         database: &str,
@@ -120,6 +171,7 @@ impl SqlGatewayClient {
         max_rows: u32,
         consistency: ConsistencyLevel,
     ) -> ClientResult<QueryResponse> {
+        assert_not_in_async_context();
         self.rt.block_on(
             self.inner
                 .query(database, sql, parameters, max_rows, consistency),
@@ -130,6 +182,10 @@ impl SqlGatewayClient {
     ///
     /// Returns a [`BlockingStreaming`] handle that implements [`Iterator`],
     /// yielding one [`QueryChunk`] per iteration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn stream_query(
         &mut self,
         database: &str,
@@ -139,6 +195,7 @@ impl SqlGatewayClient {
         chunk_size: u32,
         consistency: ConsistencyLevel,
     ) -> ClientResult<BlockingStreaming<QueryChunk>> {
+        assert_not_in_async_context();
         let stream = self.rt.block_on(self.inner.stream_query(
             database,
             sql,
@@ -154,6 +211,10 @@ impl SqlGatewayClient {
     }
 
     /// Execute a batch of statements with transparent failover and retry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn batch(
         &mut self,
         database: &str,
@@ -161,6 +222,7 @@ impl SqlGatewayClient {
         tx_mode: BatchTransactionMode,
         stop_on_error: bool,
     ) -> ClientResult<BatchResponse> {
+        assert_not_in_async_context();
         self.rt.block_on(
             self.inner
                 .batch(database, statements, tx_mode, stop_on_error),
@@ -168,12 +230,22 @@ impl SqlGatewayClient {
     }
 
     /// Delete a database file (and its WAL/SHM sidecars).
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn drop_database(&mut self, database: &str) -> ClientResult<DropDatabaseResponse> {
+        assert_not_in_async_context();
         self.rt.block_on(self.inner.drop_database(database))
     }
 
     /// Get cluster status (role, generation, lease, known databases).
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn get_cluster_status(&mut self) -> ClientResult<ClusterStatusResponse> {
+        assert_not_in_async_context();
         self.rt.block_on(self.inner.get_cluster_status())
     }
 }
@@ -193,7 +265,12 @@ impl<T> BlockingStreaming<T> {
     ///
     /// Returns `Ok(Some(item))` for each chunk, `Ok(None)` when the
     /// stream ends, or `Err(status)` on a gRPC error.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async execution context.
     pub fn message(&mut self) -> std::result::Result<Option<T>, tonic::Status> {
+        assert_not_in_async_context();
         self.rt.block_on(self.inner.message())
     }
 }
@@ -246,10 +323,24 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Cannot create a blocking SqlGatewayClient")]
+    #[should_panic(expected = "Cannot use a blocking SqlGatewayClient")]
     async fn blocking_client_panics_inside_async_runtime() {
         let _client = SqlGatewayClient::new(ClientConfig::new(DiscoveryMode::Direct(
             "http://127.0.0.1:50051".to_string(),
         )));
+    }
+
+    #[tokio::test]
+    async fn blocking_client_works_inside_spawn_blocking() {
+        let result = tokio::task::spawn_blocking(|| {
+            let mut client = SqlGatewayClient::new(ClientConfig::new(DiscoveryMode::Direct(
+                "127.0.0.1:50051".to_string(),
+            )));
+            // discover_leader is an in-memory operation for Direct mode.
+            client.discover_leader().unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "http://127.0.0.1:50051");
     }
 }

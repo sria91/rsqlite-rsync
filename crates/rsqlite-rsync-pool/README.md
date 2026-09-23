@@ -20,17 +20,28 @@ and knows how to create and health-check `SqlGatewayClient` instances.
 
 ## Installation
 
+Pick **one** backend and add the corresponding dependency.
+
+### bb8 (default, async)
+
 ```toml
 [dependencies]
-# bb8 backend (default, async)
 rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
 
-# deadpool backend (async)
+### deadpool (async)
+
+```toml
+[dependencies]
 rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", default-features = false, features = ["deadpool"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
 
-# r2d2 backend (sync / blocking)
+### r2d2 (sync / blocking)
+
+```toml
+[dependencies]
 rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", default-features = false, features = ["r2d2"] }
 ```
 

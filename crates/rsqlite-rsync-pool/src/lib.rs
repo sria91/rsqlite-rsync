@@ -45,26 +45,8 @@
 //!
 //! # Example (r2d2 - Sync)
 //!
-//! ```no_run
-//! # fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! use rsqlite_rsync_pool::pool_r2d2::Pool;
-//! use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
-//! use rsqlite_rsync_pool::SqlGatewayManager;
-//!
-//! let manager = SqlGatewayManager::new(ClientConfig::new(
-//!     DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
-//! ));
-//!
-//! let pool = Pool::builder()
-//!     .max_size(8)
-//!     .build(manager)?;
-//!
-//! let mut conn = pool.get()?;
-//! let rows = conn.query("app.db", "SELECT 1", None, 0, Default::default())?;
-//! println!("{} rows", rows.total_rows);
-//! # Ok(())
-//! # }
-//! ```
+//! Requires `features = ["r2d2"]`. See [`pool_r2d2`] module docs for a
+//! complete example.
 
 #[cfg(feature = "bb8")]
 pub mod pool_bb8;
