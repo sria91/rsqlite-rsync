@@ -1,39 +1,51 @@
 # rsqlite-rsync-pool
 
-Async connection pool adapters for the
+Connection pool adapters for the
 [rsqlite-rsync-client](../rsqlite-rsync-client) gRPC SQL Gateway client.
 
-Two pool backends are supported behind Cargo feature flags:
+Three pool backends are supported behind Cargo feature flags:
 
-| Feature      | Pool crate   | Default |
-|--------------|--------------|---------|
-| **`bb8`**    | [bb8][]      | ✓       |
-| `deadpool`   | [deadpool][] |         |
+| Feature      | Pool crate   | Mode   | Default |
+|--------------|--------------|--------|---------|
+| **`bb8`**    | [bb8][]      | Async  | ✓       |
+| `deadpool`   | [deadpool][] | Async  |         |
+| `r2d2`       | [r2d2][]     | Sync   |         |
 
 [bb8]: https://crates.io/crates/bb8
 [deadpool]: https://crates.io/crates/deadpool
+[r2d2]: https://crates.io/crates/r2d2
 
-Both backends share the same `SqlGatewayManager`, which holds a `ClientConfig`
+All backends share the same `SqlGatewayManager`, which holds a `ClientConfig`
 and knows how to create and health-check `SqlGatewayClient` instances.
 
 ## Installation
 
+Pick **one** backend and add the corresponding dependency.
+
+### bb8 (default, async)
+
 ```toml
 [dependencies]
-# bb8 backend (default)
 rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-# deadpool backend instead
-rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", default-features = false, features = ["deadpool"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-# both
-rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", features = ["deadpool"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-## Quickstart (bb8)
+### deadpool (async)
+
+```toml
+[dependencies]
+rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", default-features = false, features = ["deadpool"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+### r2d2 (sync / blocking)
+
+```toml
+[dependencies]
+rsqlite-rsync-pool = { path = "crates/rsqlite-rsync-pool", default-features = false, features = ["r2d2"] }
+```
+
+## Quickstart (bb8 - Async)
 
 ```rust,no_run
 use rsqlite_rsync_pool::pool_bb8::Pool;
@@ -71,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Quickstart (deadpool)
+## Quickstart (deadpool - Async)
 
 ```rust,no_run
 use rsqlite_rsync_pool::pool_deadpool::Pool;
@@ -92,6 +104,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = pool.get().await?;
     conn.execute("app.db", "INSERT INTO users (name) VALUES ('Alice')", None)
         .await?;
+
+    Ok(())
+}
+```
+
+## Quickstart (r2d2 - Sync / Blocking)
+
+```rust,no_run
+use rsqlite_rsync_pool::pool_r2d2::Pool;
+use rsqlite_rsync_pool::rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
+use rsqlite_rsync_pool::SqlGatewayManager;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manager = SqlGatewayManager::new(
+        ClientConfig::new(DiscoveryMode::Direct("http://127.0.0.1:50051".to_string())),
+    );
+
+    let pool = Pool::builder()
+        .max_size(8)
+        .build(manager)?;
+
+    let mut conn = pool.get()?;
+    conn.execute("app.db", "INSERT INTO users (name) VALUES ('Alice')", None)?;
+
+    let rows = conn.query("app.db", "SELECT * FROM users", None, 100, Default::default())?;
+    println!("Fetched {} rows", rows.total_rows);
 
     Ok(())
 }

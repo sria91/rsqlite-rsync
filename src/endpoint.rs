@@ -195,7 +195,10 @@ mod tests {
         // must NOT fire; parsing falls through to the later branches, which
         // in these two cases end up treating the whole string as a local
         // path since nothing else recognizes it as remote either.
-        assert!(matches!(Endpoint::parse("[]:/data/db.sqlite"), Endpoint::Local(_)));
+        assert!(matches!(
+            Endpoint::parse("[]:/data/db.sqlite"),
+            Endpoint::Local(_)
+        ));
         assert!(matches!(Endpoint::parse("[fe80::1]:"), Endpoint::Local(_)));
     }
 

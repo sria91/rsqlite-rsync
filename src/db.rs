@@ -922,7 +922,9 @@ mod tests {
         assert_eq!(stmt_named.bind_parameter_index("nonexistent"), None);
 
         // 9. Column decltype
-        conn_rw2.exec("CREATE TABLE types_t (i INTEGER, s TEXT, b BLOB)").unwrap();
+        conn_rw2
+            .exec("CREATE TABLE types_t (i INTEGER, s TEXT, b BLOB)")
+            .unwrap();
         let query_types = conn_rw2.prepare("SELECT i, s, b FROM types_t").unwrap();
         assert_eq!(query_types.column_decltype(0), Some("INTEGER".to_string()));
         assert_eq!(query_types.column_decltype(1), Some("TEXT".to_string()));

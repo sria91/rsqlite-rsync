@@ -353,8 +353,13 @@ mod tests {
             }))
         }
 
-        type StreamQueryStream =
-            Pin<Box<dyn tokio_stream::Stream<Item = std::result::Result<QueryChunk, Status>> + Send + 'static>>;
+        type StreamQueryStream = Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = std::result::Result<QueryChunk, Status>>
+                    + Send
+                    + 'static,
+            >,
+        >;
 
         async fn stream_query(
             &self,
@@ -370,8 +375,9 @@ mod tests {
                 total_rows: 0,
                 execution_time_us: 0,
             };
-            Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(chunk)]))
-                as Self::StreamQueryStream))
+            Ok(Response::new(
+                Box::pin(tokio_stream::iter(vec![Ok(chunk)])) as Self::StreamQueryStream
+            ))
         }
 
         async fn batch(
@@ -540,26 +546,32 @@ mod tests {
         })
         .unwrap();
 
-        assert!(client
-            .execute("test.db", "INSERT INTO t VALUES (1);", None)
-            .await
-            .is_err());
-        assert!(client
-            .query("test.db", "SELECT 1;", None, 10, ConsistencyLevel::Strong)
-            .await
-            .is_err());
-        assert!(client
-            .batch(
-                "test.db",
-                vec![Statement {
-                    sql: "INSERT INTO t VALUES (2);".to_string(),
-                    parameters: None,
-                }],
-                BatchTransactionMode::Immediate,
-                true,
-            )
-            .await
-            .is_err());
+        assert!(
+            client
+                .execute("test.db", "INSERT INTO t VALUES (1);", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .query("test.db", "SELECT 1;", None, 10, ConsistencyLevel::Strong)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .batch(
+                    "test.db",
+                    vec![Statement {
+                        sql: "INSERT INTO t VALUES (2);".to_string(),
+                        parameters: None,
+                    }],
+                    BatchTransactionMode::Immediate,
+                    true,
+                )
+                .await
+                .is_err()
+        );
         assert!(client.get_cluster_status().await.is_err());
         assert!(client.drop_database("test.db").await.is_err());
     }

@@ -942,8 +942,12 @@ mod tests {
         let snap = Snapshot::begin(&conn).unwrap();
         let page_size = snap.page_size();
 
-        let group0_hash =
-            origin_group_hash_for_pages(snap.all_bytes(), page_size as usize, 1..=8, HashAlgorithm::Blake3V2);
+        let group0_hash = origin_group_hash_for_pages(
+            snap.all_bytes(),
+            page_size as usize,
+            1..=8,
+            HashAlgorithm::Blake3V2,
+        );
 
         // Use the default (non-tuning) entry point so the small page count
         // stays under the default parallel threshold and exercises the

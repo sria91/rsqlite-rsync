@@ -2239,8 +2239,7 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).unwrap();
 
-        let mut reader =
-            KubectlLeaseReader::new(&script_path, "prod", "sqlite-writer-lease");
+        let mut reader = KubectlLeaseReader::new(&script_path, "prod", "sqlite-writer-lease");
         reader.set_kube_context(Some("my-context".to_owned()));
         reader.set_kubeconfig(Some(PathBuf::from("/etc/kube/config")));
 
@@ -2295,10 +2294,7 @@ mod tests {
 
         let mut failing_executor =
             TracingExecutor::new(MockExecutor::with_fail_on_call(0), "test-component");
-        assert_eq!(
-            failing_executor.enable_writer(1),
-            Err("enable failed")
-        );
+        assert_eq!(failing_executor.enable_writer(1), Err("enable failed"));
         let mut failing_executor =
             TracingExecutor::new(MockExecutor::with_fail_on_call(0), "test-component");
         assert_eq!(
@@ -2342,11 +2338,17 @@ mod tests {
         let same_lease = lease("node-a", 1, 99, 10);
 
         let first = runtime.reconcile_with_outcome(100, Some(same_lease.clone()), 1, &cfg);
-        assert_eq!(first.decision, ReconcileDecision::PromoteToWriter { generation: 1 });
+        assert_eq!(
+            first.decision,
+            ReconcileDecision::PromoteToWriter { generation: 1 }
+        );
 
         let second = runtime.reconcile_with_outcome(101, Some(same_lease.clone()), 1, &cfg);
         assert_eq!(second.decision, ReconcileDecision::KeepWriter);
-        assert_eq!(second.lease_observation, LeaseObservation::Unchanged(same_lease));
+        assert_eq!(
+            second.lease_observation,
+            LeaseObservation::Unchanged(same_lease)
+        );
     }
 
     #[test]

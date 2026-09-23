@@ -66,6 +66,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Synchronous / Blocking Usage
+
+For non-async environments (CLI tools, scripts, or legacy codebases), enable the `blocking` feature:
+
+```toml
+[dependencies]
+rsqlite-rsync-client = { version = "0.2", features = ["blocking"] }
+```
+
+```rust,no_run
+use rsqlite_rsync_client::blocking::SqlGatewayClient;
+use rsqlite_rsync_client::{ClientConfig, DiscoveryMode};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = SqlGatewayClient::new(ClientConfig::new(
+        DiscoveryMode::Direct("http://127.0.0.1:50051".to_string()),
+    ));
+
+    // 1. Execute DDL / DML writes
+    client.execute(
+        "app.db",
+        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        None,
+    )?;
+
+    // 2. Query records
+    let rows = client.query("app.db", "SELECT id, name FROM users", None, 100, Default::default())?;
+    println!("Fetched {} rows", rows.total_rows);
+
+    // 3. Stream large result sets (implements Iterator)
+    let stream = client.stream_query("app.db", "SELECT * FROM users", None, 0, 50, Default::default())?;
+    for chunk in stream {
+        let chunk = chunk?;
+        println!("Received chunk with {} rows", chunk.rows.len());
+    }
+
+    Ok(())
+}
+```
+
+> **Warning**: Do not create a `blocking::SqlGatewayClient` from inside an active tokio runtime (e.g. within `#[tokio::main]` or a spawned async task) — it will panic. Use the async client directly or use [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html).
+
 ## Discovery Modes
 
 The client supports three discovery strategies via `DiscoveryMode`:

@@ -1,21 +1,23 @@
-//! Async connection pool adapters for [`rsqlite_rsync_client::SqlGatewayClient`].
+//! Connection pool adapters for [`rsqlite_rsync_client::SqlGatewayClient`].
 //!
 //! This crate provides pool-manager implementations that let you use
-//! [`rsqlite_rsync_client::SqlGatewayClient`] with popular async connection pools instead of
-//! managing individual client instances by hand.
+//! [`rsqlite_rsync_client::SqlGatewayClient`] (async) or
+//! [`rsqlite_rsync_client::blocking::SqlGatewayClient`] (sync) with popular connection pools
+//! instead of managing individual client instances by hand.
 //!
-//! Two backends are supported behind Cargo feature flags (the `bb8` feature
+//! Three backends are supported behind Cargo feature flags (the `bb8` feature
 //! is enabled by default):
 //!
-//! | Feature    | Pool crate                | Module              |
-//! |------------|---------------------------|---------------------|
-//! | **`bb8`**  | [`bb8`]                   | [`pool_bb8`]        |
-//! | `deadpool` | [`deadpool::managed`]     | [`pool_deadpool`]   |
+//! | Feature    | Pool crate                | Mode   | Module              |
+//! |------------|---------------------------|--------|---------------------|
+//! | **`bb8`**  | [`bb8`]                   | Async  | [`pool_bb8`]        |
+//! | `deadpool` | [`deadpool::managed`]     | Async  | [`pool_deadpool`]   |
+//! | `r2d2`     | [`r2d2`]                  | Sync   | [`pool_r2d2`]       |
 //!
-//! Both backends share the same [`SqlGatewayManager`], which holds a
+//! All backends share the same [`SqlGatewayManager`], which holds a
 //! [`ClientConfig`] and knows how to create and health-check clients.
 //!
-//! # Example (bb8)
+//! # Example (bb8 - Async)
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,12 +42,20 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Example (r2d2 - Sync)
+//!
+//! Requires `features = ["r2d2"]`. See [`pool_r2d2`] module docs for a
+//! complete example.
 
 #[cfg(feature = "bb8")]
 pub mod pool_bb8;
 
 #[cfg(feature = "deadpool")]
 pub mod pool_deadpool;
+
+#[cfg(feature = "r2d2")]
+pub mod pool_r2d2;
 
 // Re-export the client crate so users don't need to pin it independently.
 pub use rsqlite_rsync_client;

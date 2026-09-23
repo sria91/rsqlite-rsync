@@ -1,6 +1,8 @@
 //! Stdio-backed transport for `rsqlite-rsync --server`.
 
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin, Stdout};
+use tokio::io::{
+    self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin, Stdout,
+};
 
 use crate::error::{Result, SyncError};
 use crate::protocol::messages::{Message, encode};

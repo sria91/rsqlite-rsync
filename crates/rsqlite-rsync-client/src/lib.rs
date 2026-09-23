@@ -46,6 +46,9 @@ mod config;
 mod discovery;
 mod error;
 
+#[cfg(feature = "blocking")]
+pub mod blocking;
+
 pub use client::SqlGatewayClient;
 pub use config::{ClientConfig, ClientTarget, RuntimeMode};
 pub use discovery::{DiscoveryMode, LeaderResolver};

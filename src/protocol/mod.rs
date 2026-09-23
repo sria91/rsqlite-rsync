@@ -99,8 +99,7 @@ mod tests {
         };
 
         // Parallel branch: item_count >= 100
-        let res_par =
-            compute_with_parallelism(&tuning, 150, parallel_result, serial_result).await;
+        let res_par = compute_with_parallelism(&tuning, 150, parallel_result, serial_result).await;
         assert_eq!(res_par, vec![1, 2, 3]);
 
         // Serial branch: item_count < 100
