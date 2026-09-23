@@ -1,6 +1,6 @@
 [package]
 name = "rsqlite-rsync-client"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.76"
 description = "Async gRPC client for the rsqlite-rsync HA SQL Gateway, with leader discovery and automatic failover"
@@ -12,7 +12,7 @@ readme = "README.md"
 blocking = ["tokio/rt"]
 
 [dependencies]
-rsqlite-rsync-proto = { path = "../rsqlite-rsync-proto", version = "0.2.0" }
+rsqlite-rsync-proto = { path = "../rsqlite-rsync-proto", version = "0.3.0" }
 tonic = "0.14"
 tokio = { version = "1", features = ["time"] }
 thiserror = "2"

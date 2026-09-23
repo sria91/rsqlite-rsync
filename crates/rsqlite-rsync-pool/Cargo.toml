@@ -1,6 +1,6 @@
 [package]
 name = "rsqlite-rsync-pool"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.76"
 description = "Connection pool adapters (bb8, deadpool, r2d2) for rsqlite-rsync-client"
@@ -15,7 +15,7 @@ deadpool = ["dep:deadpool"]
 r2d2 = ["dep:r2d2", "rsqlite-rsync-client/blocking"]
 
 [dependencies]
-rsqlite-rsync-client = { path = "../rsqlite-rsync-client", version = "0.2.0" }
+rsqlite-rsync-client = { path = "../rsqlite-rsync-client", version = "0.3.0" }
 bb8 = { version = "0.9", optional = true }
 deadpool = { version = "0.13", optional = true, features = ["managed"] }
 r2d2 = { version = "0.8", optional = true }
