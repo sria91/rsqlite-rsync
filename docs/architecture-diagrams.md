@@ -4,7 +4,110 @@ High-level block diagrams for the `rsqlite-rsync` repository using Mermaid forma
 
 ---
 
-## 1. Workspace & Crate Structure
+## 1. Complete End-to-End System Architecture
+
+Comprehensive system map unifying application clients, connection pooling, gRPC request dispatching, distributed HA consensus, and the rsync delta-sync data plane.
+
+```mermaid
+flowchart TB
+    %% =========================================================
+    %% Application & Client Layer
+    %% =========================================================
+    subgraph ClientLayer["1. Applications & Client Layer"]
+        direction TB
+        AppAsync["Async Application (Tokio)"]
+        AppSync["Sync Application (Threads)"]
+        CLIRepl["CLI REPL / sql command"]
+
+        subgraph Pools["Connection Pooling (rsqlite-rsync-pool)"]
+            PoolMgr["SqlGatewayManager<br/>(bb8 / deadpool / r2d2)"]
+        end
+
+        subgraph ClientCrate["rsqlite-rsync-client"]
+            Client["SqlGatewayClient<br/>• Leader Discovery Cache<br/>• Transparent Retry Loop"]
+        end
+
+        AppAsync --> PoolMgr
+        AppSync --> PoolMgr
+        PoolMgr --> Client
+        CLIRepl --> Client
+    end
+
+    %% =========================================================
+    %% Control Plane: Lease & Consensus Store
+    %% =========================================================
+    subgraph ControlPlane["2. Control Plane (Consensus & Lease Store)"]
+        LeaseStore[("Distributed Lease Store<br/>• Kubernetes Lease Object OR<br/>• POSIX Shared File Lock<br/>(Single-Writer Fencing)")]
+    end
+
+    %% =========================================================
+    %% Cluster Nodes
+    %% =========================================================
+    subgraph Cluster["3. Distributed Node Cluster (High Availability)"]
+        direction TB
+
+        %% --- Node A (Leader) ---
+        subgraph NodeLeader["Node A (Active Leader / Writer)"]
+            direction TB
+            L_GW["SqlGatewayServer (gRPC :50051)<br/>• Auth Token Validator<br/>• Write Access Gate: ALLOWED"]
+            L_Engine["DatabaseEngine & rusqlite<br/>• Snapshot Isolation<br/>• WAL Mode Read/Write"]
+            L_DB[("SQLite Database<br/>Primary WAL file")]
+            L_HA["HaController (Role: Writer)<br/>• Renews Lease Heartbeat<br/>• Tracks Freshness Ledger"]
+
+            L_GW -->|"Dispatches Query/Execute"| L_Engine
+            L_Engine -->|"Reads & Writes"| L_DB
+            L_HA -->|"Updates Freshness"| L_Engine
+        end
+
+        %% --- Node B (Replica) ---
+        subgraph NodeReplica["Node B (Standby Replica)"]
+            direction TB
+            R_GW["SqlGatewayServer (gRPC :50051)<br/>• Auth Token Validator<br/>• Write Access Gate: REJECTED"]
+            R_Engine["DatabaseEngine & rusqlite<br/>• Read-Only Snapshot Engine"]
+            R_DB[("SQLite Database<br/>Replicated WAL file")]
+            R_HA["HaController (Role: Replica)<br/>• Observes Lease Expiration<br/>• Fencing & Lineage Safety Check"]
+
+            R_GW -->|"Optional Reads"| R_Engine
+            R_Engine -->|"Reads Only"| R_DB
+            R_HA -->|"Monitors Lag"| R_Engine
+        end
+    end
+
+    %% =========================================================
+    %% Data Plane: Replication Engine & Transports
+    %% =========================================================
+    subgraph DataPlane["4. Data Plane (Delta-Sync Replication Engine)"]
+        direction LR
+        SidecarOrigin["Origin Sync Agent<br/>(rsqlite-rsync snapshot::begin)"]
+        SidecarReplica["Replica Sync Agent<br/>(rsqlite-rsync page applicator)"]
+        
+        subgraph TransportLayer["Pluggable Transport Layer"]
+            Trans["Transport Trait<br/>• SshTransport (SSH Tunnel)<br/>• StdioTransport (Pipes)<br/>• LocalTransport (Memory)"]
+        end
+
+        SidecarReplica -->|"1. Send Page Hash Table"| Trans
+        Trans -->|"2. Forward Hashes"| SidecarOrigin
+        SidecarOrigin -->|"3. Stream Delta Chunks (BLAKE3/SHA-256)"| Trans
+        Trans -->|"4. Deliver Modified Pages"| SidecarReplica
+    end
+
+    %% =========================================================
+    %% Cross-Subsystem Interactions & Routing
+    %% =========================================================
+    Client -->|"1. gRPC Read / Write (TLS/mTLS Boundary)"| L_GW
+    Client -.->|"2. Stale Write on Replica"| R_GW
+    R_GW --x|"3. FAILED_PRECONDITION (Header: x-rsqlite-leader-endpoint)"| Client
+
+    L_HA -.->|"Heartbeat Lease Renewal"| LeaseStore
+    R_HA -.->|"Poll Lease / Observe Expiry & Promote"| LeaseStore
+
+    L_DB ===|"Consistent Snapshot Source"| SidecarOrigin
+    SidecarReplica ===|"Apply Verified Pages & Update Ledger"| R_DB
+```
+
+---
+
+## 2. Workspace & Crate Structure
 
 ```mermaid
 graph TD
@@ -22,7 +125,7 @@ graph TD
 
 ---
 
-## 2. Server Architecture & Request Routing
+## 3. Server Architecture & Request Routing
 
 ```mermaid
 flowchart TD
@@ -32,14 +135,14 @@ flowchart TD
 
     RoleGate -->|Write on Replica| ErrorResp["Return gRPC FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint (optional)"]
     RoleGate -->|Read OR Authorized Leader Write| Engine[DatabaseEngine<br/>Request Dispatcher]
-    Engine --> SQLiteConn["rsqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control"]
+    Engine --> SQLiteConn["rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control"]
 
     SQLiteConn --> Disk[("SQLite DB File<br/>db.sqlite + WAL")]
 ```
 
 ---
 
-## 3. rsync-Style Delta Replication Flow
+## 4. rsync-Style Delta Replication Flow
 
 ```mermaid
 sequenceDiagram
@@ -69,7 +172,7 @@ sequenceDiagram
 
 ---
 
-## 4. High Availability (HA) & Lease Management
+## 5. High Availability (HA) & Lease Management
 
 ```mermaid
 flowchart TB
@@ -103,7 +206,7 @@ flowchart TB
 
 ---
 
-## 5. Client Library & Connection Pooling Architecture
+## 6. Client Library & Connection Pooling Architecture
 
 ```mermaid
 graph TD
@@ -148,7 +251,7 @@ graph TD
 
 ---
 
-## 6. Modes of Operation
+## 7. Modes of Operation
 
 `rsqlite-rsync` operates in four distinct execution modes depending on CLI flags and subcommands:
 
@@ -187,7 +290,7 @@ flowchart TD
 
 ---
 
-## 7. High Availability (HA) vs. Standalone (SA) Modes
+## 8. High Availability (HA) vs. Standalone (SA) Modes
 
 Comparison between running `rsqlite-rsync` in Standalone (SA) local mode vs. a distributed High Availability (HA) cluster.
 
@@ -241,7 +344,7 @@ flowchart TB
 
 ---
 
-## 8. HA Controller State Machine & Reconcile FSM
+## 9. HA Controller State Machine & Reconcile FSM
 
 Node lifecycle, reconciliation decisions, and safety fencing (lease expiration, freshness lag, and lineage checks).
 
@@ -273,7 +376,7 @@ stateDiagram-v2
 
 ---
 
-## 9. Client Transparent Leader Redirection & Failover Flow
+## 10. Client Transparent Leader Redirection & Failover Flow
 
 How `rsqlite-rsync-client` and the CLI REPL intercept `NOT_LEADER` (`FAILED_PRECONDITION`) responses to transparently follow `x-rsqlite-leader-endpoint` redirection headers.
 
@@ -298,7 +401,7 @@ sequenceDiagram
 
 ---
 
-## 10. Pluggable Transport Layer Architecture
+## 11. Pluggable Transport Layer Architecture
 
 Abstraction hierarchy for data-plane sync transfers across in-memory buffers, local files, and secure SSH tunnels.
 
@@ -337,7 +440,7 @@ classDiagram
 
 ---
 
-## 11. Batch Multi-Database Sync Pipeline
+## 12. Batch Multi-Database Sync Pipeline
 
 Manifest-driven parallel sync execution with thread-pool concurrency, exponential backoff with jitter, and structured run reporting.
 
