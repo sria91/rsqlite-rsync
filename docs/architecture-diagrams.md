@@ -32,7 +32,7 @@ flowchart TD
 
     RoleGate -->|Write on Replica| ErrorResp["Return gRPC FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint (optional)"]
     RoleGate -->|Read OR Authorized Leader Write| Engine[DatabaseEngine<br/>Request Dispatcher]
-    Engine --> SQLiteConn["rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control"]
+    Engine --> SQLiteConn["rsqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control"]
 
     SQLiteConn --> Disk[("SQLite DB File<br/>db.sqlite + WAL")]
 ```
