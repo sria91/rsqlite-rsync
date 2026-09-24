@@ -28,10 +28,11 @@ graph TD
 flowchart TD
     ClientReq([Incoming gRPC Request<br/>Query / Execute / Batch]) --> Server[SqlGatewayServer<br/>Tonic gRPC Service Dispatcher]
     Server --> Auth[Auth Middleware<br/>Bearer Token Validation]
-    Auth --> Engine[DatabaseEngine<br/>Role & Route Handler]
+    Auth --> RoleGate{Write Access Gate<br/>SqlGatewayServer::check_write_access}
 
-    Engine -->|Write on Replica| ErrorResp[Return gRPC FAILED_PRECONDITION<br/>Header: x-leader-endpoint]
-    Engine -->|Read OR Leader Write| SQLiteConn[rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control]
+    RoleGate -->|Write on Replica| ErrorResp[Return gRPC FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint optional]
+    RoleGate -->|Read OR Authorized Leader Write| Engine[DatabaseEngine<br/>Request Dispatcher]
+    Engine --> SQLiteConn[rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control]
 
     SQLiteConn --> Disk[(SQLite DB File<br/>db.sqlite + WAL)]
 ```
@@ -61,7 +62,7 @@ sequenceDiagram
     Origin->>Transport: Stream modified pages only (PageData chunks)
     Transport->>Replica: Deliver Delta Pages
     
-    Replica->>Replica: Apply pages & verify SHA256
+    Replica->>Replica: Apply pages & verify negotiated hash (BLAKE3 / SHA-256)
     Replica->>Transport: Send Sync ACK & Ledger Update
     Transport->>Origin: Sync Complete
 ```
@@ -96,8 +97,8 @@ flowchart TB
         B_HA -->|Monitors Lag| B_Ledger[FreshnessLedger]
     end
 
-    A_DB -.->|Background Page Delta Sync| B_DB
-    Lease -.->|3. On Expiry: Promotes & Claims Lease| B_HA
+    A_DB -.->|External replica-sync sidecar: rsqlite-rsync (outside HA daemon)| B_DB
+    Lease -.->|3. Lease Store supplies valid lease; B_HA validates & promotes| B_HA
 ```
 
 ---
@@ -143,7 +144,6 @@ graph TD
     BlockingClient --> AsyncClient
     AsyncClient --> Discovery
     Discovery -->|"Writes & Reads"| Leader
-    Discovery -.->|"Reads (Optional)"| Replica
 ```
 
 ---
@@ -173,7 +173,7 @@ flowchart TD
     %% Mode 3: HA Mode
     Switch -->|"--ha"| M3["3. High Availability Daemon Mode"]
     subgraph Mode3["Long-Running Cluster Daemon"]
-        M3 --> M3_HA["HA Controller Loop<br/>• Lease acquisition/renewal<br/>• Role: Leader vs Replica<br/>• Freshness ledger & health probes"]
+        M3 --> M3_HA["HA Controller Loop<br/>• Lease observation/validation<br/>• Role: Leader vs Replica<br/>• Freshness ledger & health probes"]
         M3 --> M3_GW["Embedded gRPC SQL Gateway<br/>• Optional --ha-grpc-bind<br/>• Bearer token auth<br/>• NOT_LEADER write redirection"]
     end
 
@@ -190,6 +190,8 @@ flowchart TD
 ## 7. High Availability (HA) vs. Standalone (SA) Modes
 
 Comparison between running `rsqlite-rsync` in Standalone (SA) local mode vs. a distributed High Availability (HA) cluster.
+
+> **Security Note on Transports:** The gRPC SQL Gateway does not terminate TLS internally. Plaintext HTTP endpoints (such as `http://node-a:50051`) are suitable only within trusted network perimeters or behind TLS/mTLS termination proxies; untrusted networks must terminate TLS in front of the gateway.
 
 ```mermaid
 flowchart TB
@@ -227,14 +229,13 @@ flowchart TB
             R_DB[("SQLite Database<br/>(Replicated Snapshot)")]
             
             R_Ctrl -.->|"Polls Lease Expiry"| HA_Lease
-            R_GW -->|"Allows Reads Only"| R_DB
+            R_GW -->|"Allows Reads Only (if enabled)"| R_DB
         end
 
         HA_App -->|"1. Reads & Writes"| L_GW
-        HA_App -.->|"2. Reads (Optional)"| R_GW
-        R_GW --x|"3. Rejects Writes (NOT_LEADER + Redirect Header)"| HA_App
+        R_GW --x|"2. Rejects Writes (NOT_LEADER + Optional x-rsqlite-leader-endpoint)"| HA_App
 
-        L_DB ==>|"4. Background rsync Delta Sync (Continuous/Periodic)"| R_DB
+        L_DB ==>|"3. External replica-sync sidecar (rsqlite-rsync)"| R_DB
     end
 ```
 
@@ -253,10 +254,11 @@ stateDiagram-v2
         PollingLease --> CheckFreshness: Lease Expired / Missing
         CheckFreshness --> PromotionDenied: Lag > max_freshness_age OR Clock Skew
         PromotionDenied --> PollingLease: Wait for Delta Sync
-        CheckFreshness --> ClaimLease: Freshness Valid & Lineage Verified
+        CheckFreshness --> AwaitValidLease: Freshness Valid & Lineage Verified
+        AwaitValidLease --> PollingLease: Stale / Missing Lease
     }
 
-    Replica --> Writer: Lease Acquired (PromoteToWriter + Generation++)
+    Replica --> Writer: Valid Lease Observed (PromoteToWriter + Adopt Lease Generation)
     
     state Writer {
         [*] --> HeartbeatRenew: Authoritative Writer
@@ -273,7 +275,7 @@ stateDiagram-v2
 
 ## 9. Client Transparent Leader Redirection & Failover Flow
 
-How `rsqlite-rsync-client` and the CLI REPL intercept `NOT_LEADER` (`FAILED_PRECONDITION`) responses to transparently follow `x-leader-endpoint` redirection headers.
+How `rsqlite-rsync-client` and the CLI REPL intercept `NOT_LEADER` (`FAILED_PRECONDITION`) responses to transparently follow `x-rsqlite-leader-endpoint` redirection headers.
 
 ```mermaid
 sequenceDiagram
@@ -286,7 +288,7 @@ sequenceDiagram
     App->>Client: execute("INSERT INTO logs ...")
     Note over Client: Cached Endpoint = Node B
     Client->>Replica: gRPC ExecuteRequest
-    Replica-->>Client: gRPC Status: FAILED_PRECONDITION<br/>Header: x-leader-endpoint: http://node-a:50051
+    Replica-->>Client: gRPC Status: FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint: http://node-a:50051<br/>(Plaintext shown for trusted networks/mTLS; use TLS for untrusted)
     
     Note over Client: Intercept NOT_LEADER<br/>Update Leader Cache -> Node A
     Client->>Leader: Retry gRPC ExecuteRequest
@@ -304,9 +306,9 @@ Abstraction hierarchy for data-plane sync transfers across in-memory buffers, lo
 classDiagram
     class Transport {
         <<interface>>
-        +send(msg: ProtocolMessage) Result
-        +recv() Result~ProtocolMessage~
-        +close() Result
+        +send(msg: Message) Result~()~
+        +recv() Result~Message~
+        +close() Result~()~
     }
 
     class LocalTransport {
@@ -363,6 +365,3 @@ flowchart LR
     
     Aggregator --> Report["BatchRunReport<br/>• summary JSON / text<br/>• per-DB sync duration & status<br/>• exit code 0 or partial error"]
 ```
-
-
-
