@@ -6,7 +6,7 @@ High-level block diagrams for the `rsqlite-rsync` repository using Mermaid forma
 
 ## 1. Complete End-to-End System Architecture
 
-Comprehensive system map unifying application clients, connection pooling, gRPC request dispatching, distributed HA consensus, and the rsync delta-sync data plane.
+Comprehensive system map unifying application clients, connection pooling, gRPC request dispatching, distributed HA lease coordination, and the rsync delta-sync data plane.
 
 ```mermaid
 flowchart TB
@@ -34,10 +34,10 @@ flowchart TB
     end
 
     %% =========================================================
-    %% Control Plane: Lease & Consensus Store
+    %% Control Plane: Lease Store & Coordination
     %% =========================================================
-    subgraph ControlPlane["2. Control Plane (Consensus & Lease Store)"]
-        LeaseStore[("Distributed Lease Store<br/>• Kubernetes Lease Object OR<br/>• POSIX Shared File Lock<br/>(Single-Writer Fencing)")]
+    subgraph ControlPlane["2. Control Plane (Lease Store & Coordination)"]
+        LeaseStore[("Lease Store<br/>• Kubernetes Lease API (Coordination)<br/>• File Lease Record (External Coordination)<br/>• Generation-based Write Fencing")]
     end
 
     %% =========================================================
@@ -99,7 +99,7 @@ flowchart TB
     R_GW --x|"3. FAILED_PRECONDITION (Header: x-rsqlite-leader-endpoint)"| Client
 
     L_HA -.->|"Heartbeat Lease Renewal"| LeaseStore
-    R_HA -.->|"Poll Lease / Observe Expiry & Promote"| LeaseStore
+    LeaseStore -.->|"Observe & Validate Lease Record (Promote)"| R_HA
 
     L_DB ===|"Consistent Snapshot Source"| SidecarOrigin
     SidecarReplica ===|"Apply Verified Pages & Update Ledger"| R_DB
@@ -177,7 +177,7 @@ sequenceDiagram
 ```mermaid
 flowchart TB
     subgraph LeaseStore["Shared Lease Store"]
-        Lease["File Lock OR Kubernetes Lease Object"]
+        Lease["Kubernetes Lease API (Coordination) OR<br/>File Lease Record (External Coordination)<br/>(Generation-based Fencing)"]
     end
 
     subgraph NodeA["Node A (Leader)"]
@@ -303,7 +303,7 @@ flowchart TB
         SA_User["Local Process / CLI / App"] -->|"Direct FFI / In-Process"| SA_Engine["Local SQLite Engine<br/>(Single Process)"]
         SA_Engine --> SA_DB[("Local SQLite DB File<br/>(Exclusive write lock)")]
         
-        SA_Note["• No network overhead<br/>• No lease / consensus dependency<br/>• Single point of failure<br/>• Direct POSIX file locking"]
+        SA_Note["• No network overhead<br/>• No lease / coordination dependency<br/>• Single point of failure<br/>• Direct SQLite file locking (single-node)"]
     end
 
     subgraph HA["High Availability (HA) Mode (Distributed Cluster)"]
@@ -313,8 +313,8 @@ flowchart TB
             HA_App["Application / Client"]
         end
 
-        subgraph HA_LeaseStore["Distributed Consensus / Lease"]
-            HA_Lease[("K8s Lease / Shared File Lease<br/>(Heartbeat / Fencing)")]
+        subgraph HA_LeaseStore["Distributed Coordination / Lease Store"]
+            HA_Lease[("K8s Lease / File Lease Record<br/>(Heartbeat / Generation-based Fencing)")]
         end
 
         subgraph HA_Leader["Node A (Leader)"]
@@ -331,7 +331,7 @@ flowchart TB
             R_Ctrl["HaController<br/>• Role: Replica<br/>• Monitors Lease & Lag"]
             R_DB[("SQLite Database<br/>(Replicated Snapshot)")]
             
-            R_Ctrl -.->|"Polls Lease Expiry"| HA_Lease
+            HA_Lease -.->|"Supplies Lease Record (Observe & Validate)"| R_Ctrl
             R_GW -->|"Allows Reads Only (if enabled)"| R_DB
         end
 
