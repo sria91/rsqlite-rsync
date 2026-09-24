@@ -1,0 +1,368 @@
+# Architecture & Component Block Diagrams
+
+High-level block diagrams for the `rsqlite-rsync` repository using Mermaid format.
+
+---
+
+## 1. Workspace & Crate Structure
+
+```mermaid
+graph TD
+    subgraph CargoWorkspace["Cargo Workspace"]
+        Proto["crates/rsqlite-rsync-proto<br/>• Protobuf schema (v1)<br/>• Generated Tonic traits & structs"]
+        Client["crates/rsqlite-rsync-client<br/>• Async client (tokio/tonic)<br/>• Blocking sync wrapper<br/>• Leader discovery & retry"]
+        Pool["crates/rsqlite-rsync-pool<br/>• bb8 manager<br/>• deadpool manager<br/>• r2d2 manager"]
+        ServerBin["rsqlite-rsync (Binary / src/)<br/>• CLI daemon & REPL<br/>• Gateway gRPC server<br/>• HA controller<br/>• Delta-sync engine"]
+    end
+
+    Client -->|uses stubs| Proto
+    Pool -->|manages| Client
+    ServerBin -->|implements service| Proto
+```
+
+---
+
+## 2. Server Architecture & Request Routing
+
+```mermaid
+flowchart TD
+    ClientReq([Incoming gRPC Request<br/>Query / Execute / Batch]) --> Server[SqlGatewayServer<br/>Tonic gRPC Service Dispatcher]
+    Server --> Auth[Auth Middleware<br/>Bearer Token Validation]
+    Auth --> Engine[DatabaseEngine<br/>Role & Route Handler]
+
+    Engine -->|Write on Replica| ErrorResp[Return gRPC FAILED_PRECONDITION<br/>Header: x-leader-endpoint]
+    Engine -->|Read OR Leader Write| SQLiteConn[rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control]
+
+    SQLiteConn --> Disk[(SQLite DB File<br/>db.sqlite + WAL)]
+```
+
+---
+
+## 3. rsync-Style Delta Replication Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Replica as Replica Node
+    participant Transport as Transport Layer (SSH / Stdio / Local)
+    participant Origin as Origin (Leader Node)
+    participant SQLite as SQLite Database (WAL)
+
+    Replica->>Transport: Initiate Sync Session
+    Transport->>Origin: Forward Sync Request
+    
+    Replica->>Replica: Hash local database pages
+    Replica->>Transport: Send Page Hash Table
+    Transport->>Origin: Deliver Replica Hashes
+
+    Origin->>SQLite: Snapshot::begin() (Consistent Read)
+    Origin->>Origin: Hash Origin pages & compute diff delta
+    
+    Origin->>Transport: Stream modified pages only (PageData chunks)
+    Transport->>Replica: Deliver Delta Pages
+    
+    Replica->>Replica: Apply pages & verify SHA256
+    Replica->>Transport: Send Sync ACK & Ledger Update
+    Transport->>Origin: Sync Complete
+```
+
+---
+
+## 4. High Availability (HA) & Lease Management
+
+```mermaid
+flowchart TB
+    subgraph LeaseStore["Shared Lease Store"]
+        Lease[File Lock OR Kubernetes Lease Object]
+    end
+
+    subgraph NodeA["Node A (Leader)"]
+        A_HA[HaController]
+        A_GW[Gateway Server]
+        A_DB[(SQLite Leader)]
+        
+        A_HA -->|1. Heartbeat Renew| Lease
+        A_GW -->|Accepts Writes| A_DB
+        A_HA -->|Updates| A_Ledger[FreshnessLedger]
+    end
+
+    subgraph NodeB["Node B (Replica)"]
+        B_HA[HaController]
+        B_GW[Gateway Server]
+        B_DB[(SQLite Replica)]
+        
+        B_HA -->|2. Watch / Poll| Lease
+        B_GW -->|Rejects Writes / NOT_LEADER| B_DB
+        B_HA -->|Monitors Lag| B_Ledger[FreshnessLedger]
+    end
+
+    A_DB -.->|Background Page Delta Sync| B_DB
+    Lease -.->|3. On Expiry: Promotes & Claims Lease| B_HA
+```
+
+---
+
+## 5. Client Library & Connection Pooling Architecture
+
+```mermaid
+graph TD
+    subgraph Consumer["Application Code"]
+        AsyncApp["Async Application (Tokio)"]
+        SyncApp["Sync Application (Threads)"]
+    end
+
+    subgraph PoolCrate["rsqlite-rsync-pool"]
+        BB8Pool["bb8::Pool"]
+        DeadPool["deadpool::managed::Pool"]
+        R2D2Pool["r2d2::Pool"]
+        Manager["SqlGatewayManager"]
+    end
+
+    subgraph ClientCrate["rsqlite-rsync-client"]
+        AsyncClient["SqlGatewayClient (Async)"]
+        BlockingClient["SqlGatewayClient (Blocking)"]
+        Discovery["Discovery & Failover Handler<br/>• Tracks active leader<br/>• Intercepts NOT_LEADER<br/>• Auto-retries next endpoint"]
+    end
+
+    subgraph Cluster["rsqlite-rsync Cluster"]
+        Leader["gRPC Gateway (Leader Node)"]
+        Replica["gRPC Gateway (Replica Node)"]
+    end
+
+    AsyncApp --> BB8Pool
+    AsyncApp --> DeadPool
+    SyncApp --> R2D2Pool
+    AsyncApp -->|Direct usage| AsyncClient
+    SyncApp -->|Direct usage| BlockingClient
+
+    BB8Pool --> Manager
+    DeadPool --> Manager
+    R2D2Pool --> Manager
+    Manager --> AsyncClient
+
+    BlockingClient --> AsyncClient
+    AsyncClient --> Discovery
+    Discovery -->|"Writes & Reads"| Leader
+    Discovery -.->|"Reads (Optional)"| Replica
+```
+
+---
+
+## 6. Modes of Operation
+
+`rsqlite-rsync` operates in four distinct execution modes depending on CLI flags and subcommands:
+
+```mermaid
+flowchart TD
+    CLI(["rsqlite-rsync CLI Entrypoint"]) --> Switch{"Mode Selector"}
+
+    %% Mode 1: One-Shot Sync
+    Switch -->|"rsqlite-rsync <origin> <replica>"| M1["1. One-Shot Sync Mode"]
+    subgraph Mode1["Direct Point-to-Point Sync"]
+        M1 --> M1_Core["Sync Engine<br/>• Local or SSH Transport<br/>• Single database pair<br/>• Optional --dry-run"]
+        M1_Core --> M1_Exit(["Sync completed & exits"])
+    end
+
+    %% Mode 2: Batch Sync
+    Switch -->|"--batch-manifest <file>"| M2["2. Batch Sync Mode"]
+    subgraph Mode2["Multi-Database Batch Sync"]
+        M2 --> M2_Pool["Parallel Worker Pool<br/>• --batch-jobs N<br/>• Retry policies with backoff/jitter<br/>• Structured JSON/Text reporting"]
+        M2_Pool --> M2_Exit(["All jobs finished & exits"])
+    end
+
+    %% Mode 3: HA Mode
+    Switch -->|"--ha"| M3["3. High Availability Daemon Mode"]
+    subgraph Mode3["Long-Running Cluster Daemon"]
+        M3 --> M3_HA["HA Controller Loop<br/>• Lease acquisition/renewal<br/>• Role: Leader vs Replica<br/>• Freshness ledger & health probes"]
+        M3 --> M3_GW["Embedded gRPC SQL Gateway<br/>• Optional --ha-grpc-bind<br/>• Bearer token auth<br/>• NOT_LEADER write redirection"]
+    end
+
+    %% Mode 4: Client & SQL REPL
+    Switch -->|"client / sql subcommand"| M4["4. Client CLI & SQL REPL Mode"]
+    subgraph Mode4["Cluster Client & Query Tool"]
+        M4 --> M4_Disc["Discovery & Routing<br/>• DNS / K8s Lease / Endpoints<br/>• Interactive SQL REPL<br/>• Scriptable 'sql' command"]
+        M4_Disc --> M4_Target[("Target SQLite Cluster")]
+    end
+```
+
+---
+
+## 7. High Availability (HA) vs. Standalone (SA) Modes
+
+Comparison between running `rsqlite-rsync` in Standalone (SA) local mode vs. a distributed High Availability (HA) cluster.
+
+```mermaid
+flowchart TB
+    subgraph SA["Standalone (SA) Mode (Local / Embedded)"]
+        direction TB
+        SA_User["Local Process / CLI / App"] -->|"Direct FFI / In-Process"| SA_Engine["Local SQLite Engine<br/>(Single Process)"]
+        SA_Engine --> SA_DB[("Local SQLite DB File<br/>(Exclusive write lock)")]
+        
+        SA_Note["• No network overhead<br/>• No lease / consensus dependency<br/>• Single point of failure<br/>• Direct POSIX file locking"]
+    end
+
+    subgraph HA["High Availability (HA) Mode (Distributed Cluster)"]
+        direction TB
+        
+        subgraph HA_Clients["Clients & Apps"]
+            HA_App["Application / Client"]
+        end
+
+        subgraph HA_LeaseStore["Distributed Consensus / Lease"]
+            HA_Lease[("K8s Lease / Shared File Lease<br/>(Heartbeat / Fencing)")]
+        end
+
+        subgraph HA_Leader["Node A (Leader)"]
+            L_GW["SqlGatewayServer (gRPC)<br/>• Port 50051<br/>• Bearer Token Auth"]
+            L_Ctrl["HaController<br/>• Role: Leader<br/>• Renews Lease"]
+            L_DB[("SQLite Database<br/>(WAL Mode - Read/Write)")]
+            
+            L_Ctrl -.->|"Heartbeat (Renew)"| HA_Lease
+            L_GW -->|"Executes Writes & Reads"| L_DB
+        end
+
+        subgraph HA_Replica["Node B (Replica / Standby)"]
+            R_GW["SqlGatewayServer (gRPC)<br/>• Port 50051<br/>• Bearer Token Auth"]
+            R_Ctrl["HaController<br/>• Role: Replica<br/>• Monitors Lease & Lag"]
+            R_DB[("SQLite Database<br/>(Replicated Snapshot)")]
+            
+            R_Ctrl -.->|"Polls Lease Expiry"| HA_Lease
+            R_GW -->|"Allows Reads Only"| R_DB
+        end
+
+        HA_App -->|"1. Reads & Writes"| L_GW
+        HA_App -.->|"2. Reads (Optional)"| R_GW
+        R_GW --x|"3. Rejects Writes (NOT_LEADER + Redirect Header)"| HA_App
+
+        L_DB ==>|"4. Background rsync Delta Sync (Continuous/Periodic)"| R_DB
+    end
+```
+
+---
+
+## 8. HA Controller State Machine & Reconcile FSM
+
+Node lifecycle, reconciliation decisions, and safety fencing (lease expiration, freshness lag, and lineage checks).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Replica: Daemon Start
+
+    state Replica {
+        [*] --> PollingLease: Monitor Lease Store
+        PollingLease --> CheckFreshness: Lease Expired / Missing
+        CheckFreshness --> PromotionDenied: Lag > max_freshness_age OR Clock Skew
+        PromotionDenied --> PollingLease: Wait for Delta Sync
+        CheckFreshness --> ClaimLease: Freshness Valid & Lineage Verified
+    }
+
+    Replica --> Writer: Lease Acquired (PromoteToWriter + Generation++)
+    
+    state Writer {
+        [*] --> HeartbeatRenew: Authoritative Writer
+        HeartbeatRenew --> HeartbeatRenew: Heartbeat OK (KeepWriter)
+        HeartbeatRenew --> FenceDetected: WriteFenceViolation
+        HeartbeatRenew --> LeaseLost: TTL Expired / Network Partition
+    }
+
+    Writer --> Replica: DemoteToReplica (DisableWriter)
+    Writer --> [*]: Shutdown / Graceful Stepdown
+```
+
+---
+
+## 9. Client Transparent Leader Redirection & Failover Flow
+
+How `rsqlite-rsync-client` and the CLI REPL intercept `NOT_LEADER` (`FAILED_PRECONDITION`) responses to transparently follow `x-leader-endpoint` redirection headers.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor App as Application Code
+    participant Client as SqlGatewayClient
+    participant Replica as Node B (Replica Gateway)
+    participant Leader as Node A (Leader Gateway)
+
+    App->>Client: execute("INSERT INTO logs ...")
+    Note over Client: Cached Endpoint = Node B
+    Client->>Replica: gRPC ExecuteRequest
+    Replica-->>Client: gRPC Status: FAILED_PRECONDITION<br/>Header: x-leader-endpoint: http://node-a:50051
+    
+    Note over Client: Intercept NOT_LEADER<br/>Update Leader Cache -> Node A
+    Client->>Leader: Retry gRPC ExecuteRequest
+    Leader-->>Client: gRPC ExecuteResponse (rows_affected = 1)
+    Client-->>App: Ok(ExecuteResult { rows_affected: 1 })
+```
+
+---
+
+## 10. Pluggable Transport Layer Architecture
+
+Abstraction hierarchy for data-plane sync transfers across in-memory buffers, local files, and secure SSH tunnels.
+
+```mermaid
+classDiagram
+    class Transport {
+        <<interface>>
+        +send(msg: ProtocolMessage) Result
+        +recv() Result~ProtocolMessage~
+        +close() Result
+    }
+
+    class LocalTransport {
+        -buf: VecDeque~u8~
+        +pair() (LocalTransport, LocalTransport)
+    }
+
+    class StdioTransport {
+        -stdin: Stdin
+        -stdout: Stdout
+        +from_io(read, write)
+    }
+
+    class SshTransport {
+        -child: ChildProcess
+        -control_path: PathBuf
+        -auth_mode: SshAuthMode
+        +connect(host, opts)
+        +cleanup_control_path()
+    }
+
+    Transport <|.. LocalTransport : implements
+    Transport <|.. StdioTransport : implements
+    Transport <|.. SshTransport : implements
+```
+
+---
+
+## 11. Batch Multi-Database Sync Pipeline
+
+Manifest-driven parallel sync execution with thread-pool concurrency, exponential backoff with jitter, and structured run reporting.
+
+```mermaid
+flowchart LR
+    Manifest["batch_manifest.json<br/>• db1.sqlite -> node2<br/>• db2.sqlite -> node3<br/>• db3.sqlite -> node4"] --> Parser[Manifest Parser]
+    
+    Parser --> Pool["Worker Pool (--batch-jobs N)"]
+    
+    subgraph Workers["Concurrent Worker Threads"]
+        W1["Worker 1 (Sync db1)"]
+        W2["Worker 2 (Sync db2)"]
+        WN["Worker N (Sync dbN)"]
+    end
+    
+    Pool --> W1
+    Pool --> W2
+    Pool --> WN
+    
+    W1 -.->|"On Error: Retry (Backoff + Jitter)"| W1
+    
+    W1 --> Aggregator[Results Aggregator]
+    W2 --> Aggregator
+    WN --> Aggregator
+    
+    Aggregator --> Report["BatchRunReport<br/>• summary JSON / text<br/>• per-DB sync duration & status<br/>• exit code 0 or partial error"]
+```
+
+
+
