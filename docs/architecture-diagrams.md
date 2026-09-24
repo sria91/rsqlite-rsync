@@ -30,11 +30,11 @@ flowchart TD
     Server --> Auth[Auth Middleware<br/>Bearer Token Validation]
     Auth --> RoleGate{Write Access Gate<br/>SqlGatewayServer::check_write_access}
 
-    RoleGate -->|Write on Replica| ErrorResp[Return gRPC FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint optional]
+    RoleGate -->|Write on Replica| ErrorResp["Return gRPC FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint (optional)"]
     RoleGate -->|Read OR Authorized Leader Write| Engine[DatabaseEngine<br/>Request Dispatcher]
-    Engine --> SQLiteConn[rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control]
+    Engine --> SQLiteConn["rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control"]
 
-    SQLiteConn --> Disk[(SQLite DB File<br/>db.sqlite + WAL)]
+    SQLiteConn --> Disk[("SQLite DB File<br/>db.sqlite + WAL")]
 ```
 
 ---
@@ -74,31 +74,31 @@ sequenceDiagram
 ```mermaid
 flowchart TB
     subgraph LeaseStore["Shared Lease Store"]
-        Lease[File Lock OR Kubernetes Lease Object]
+        Lease["File Lock OR Kubernetes Lease Object"]
     end
 
     subgraph NodeA["Node A (Leader)"]
-        A_HA[HaController]
-        A_GW[Gateway Server]
-        A_DB[(SQLite Leader)]
+        A_HA["HaController"]
+        A_GW["Gateway Server"]
+        A_DB[("SQLite Leader")]
         
-        A_HA -->|1. Heartbeat Renew| Lease
-        A_GW -->|Accepts Writes| A_DB
-        A_HA -->|Updates| A_Ledger[FreshnessLedger]
+        A_HA -->|"1. Heartbeat Renew"| Lease
+        A_GW -->|"Accepts Writes"| A_DB
+        A_HA -->|"Updates"| A_Ledger["FreshnessLedger"]
     end
 
     subgraph NodeB["Node B (Replica)"]
-        B_HA[HaController]
-        B_GW[Gateway Server]
-        B_DB[(SQLite Replica)]
+        B_HA["HaController"]
+        B_GW["Gateway Server"]
+        B_DB[("SQLite Replica")]
         
-        B_HA -->|2. Watch / Poll| Lease
-        B_GW -->|Rejects Writes / NOT_LEADER| B_DB
-        B_HA -->|Monitors Lag| B_Ledger[FreshnessLedger]
+        B_HA -->|"2. Watch / Poll"| Lease
+        B_GW -->|"Rejects Writes / NOT_LEADER"| B_DB
+        B_HA -->|"Monitors Lag"| B_Ledger["FreshnessLedger"]
     end
 
-    A_DB -.->|External replica-sync sidecar: rsqlite-rsync (outside HA daemon)| B_DB
-    Lease -.->|3. Lease Store supplies valid lease; B_HA validates & promotes| B_HA
+    A_DB -.->|"External replica-sync sidecar: rsqlite-rsync (outside HA daemon)"| B_DB
+    Lease -.->|"3. Lease Store supplies valid lease, B_HA validates & promotes"| B_HA
 ```
 
 ---
@@ -288,7 +288,7 @@ sequenceDiagram
     App->>Client: execute("INSERT INTO logs ...")
     Note over Client: Cached Endpoint = Node B
     Client->>Replica: gRPC ExecuteRequest
-    Replica-->>Client: gRPC Status: FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint: http://node-a:50051<br/>(Plaintext shown for trusted networks/mTLS; use TLS for untrusted)
+    Replica-->>Client: gRPC Status: FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint: http://node-a:50051<br/>(Plaintext for trusted/mTLS networks, TLS for untrusted)
     
     Note over Client: Intercept NOT_LEADER<br/>Update Leader Cache -> Node A
     Client->>Leader: Retry gRPC ExecuteRequest
