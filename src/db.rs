@@ -64,7 +64,7 @@ fn validate_page_no(page_no: u32) -> Result<()> {
 ///
 /// The connection is closed automatically when this value is dropped.
 pub struct Connection {
-    db: *mut ffi::sqlite3,
+    db: Mutex<*mut ffi::sqlite3>,
     /// Cached page size in bytes (set once on open).
     page_size: u32,
     /// Cached read file handle — reused across all `read_page` calls.
@@ -73,8 +73,8 @@ pub struct Connection {
     write_fd: Option<Mutex<File>>,
 }
 
-// SAFETY: `sqlite3` can be used from a single thread at a time. We never
-// share a `Connection` across threads without synchronisation.
+// SAFETY: All accesses to the raw SQLite handle and file descriptors are synchronized
+// via Mutex, making it safe to send and share `Connection` across threads.
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
@@ -137,7 +137,7 @@ impl Connection {
         // All setup succeeded — disarm the guard and hand ownership to Connection.
         std::mem::forget(guard);
         Ok(Connection {
-            db,
+            db: Mutex::new(db),
             page_size,
             read_fd,
             write_fd,
@@ -155,7 +155,8 @@ impl Connection {
     ///
     /// Returns [`SyncError::Sqlite`] if the query fails.
     pub fn page_count(&self) -> Result<u32> {
-        Self::query_pragma_u32(self.db, "page_count")
+        let db = *self.db.lock().unwrap();
+        Self::query_pragma_u32(db, "page_count")
     }
 
     /// Serialise the entire `main` database to a byte vector.
@@ -165,8 +166,9 @@ impl Connection {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let main = CString::new("main").unwrap();
         let mut size: i64 = 0;
+        let db = *self.db.lock().unwrap();
         unsafe {
-            let ptr = ffi::sqlite3_serialize(self.db, main.as_ptr(), &mut size, 0);
+            let ptr = ffi::sqlite3_serialize(db, main.as_ptr(), &mut size, 0);
             if ptr.is_null() {
                 return Err(SyncError::sqlite(
                     ffi::SQLITE_NOMEM,
@@ -246,33 +248,30 @@ impl Connection {
     /// Execute a SQL statement that returns no rows.
     pub fn exec(&self, sql: &str) -> Result<()> {
         let c_sql = CString::new(sql).map_err(|e| SyncError::Protocol(e.to_string()))?;
+        let db = *self.db.lock().unwrap();
         unsafe {
             check(
-                self.db,
-                ffi::sqlite3_exec(
-                    self.db,
-                    c_sql.as_ptr(),
-                    None,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                ),
+                db,
+                ffi::sqlite3_exec(db, c_sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
             )
         }
     }
 
     /// Return the raw `*mut sqlite3` pointer.
     pub fn as_ptr(&self) -> *mut ffi::sqlite3 {
-        self.db
+        *self.db.lock().unwrap()
     }
 
     /// Number of rows modified, inserted or deleted by the most recent statement.
     pub fn changes(&self) -> u64 {
-        unsafe { ffi::sqlite3_changes(self.db) as u64 }
+        let db = *self.db.lock().unwrap();
+        unsafe { ffi::sqlite3_changes(db) as u64 }
     }
 
     /// Rowid of the most recent successful INSERT into a rowid table.
     pub fn last_insert_rowid(&self) -> i64 {
-        unsafe { ffi::sqlite3_last_insert_rowid(self.db) }
+        let db = *self.db.lock().unwrap();
+        unsafe { ffi::sqlite3_last_insert_rowid(db) }
     }
 
     /// Prepare a SQL statement for execution and parameter binding.
@@ -327,14 +326,15 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if !self.db.is_null() {
+        let mut db = self.db.lock().unwrap();
+        if !db.is_null() {
             unsafe {
-                let rc = ffi::sqlite3_close(self.db);
+                let rc = ffi::sqlite3_close(*db);
                 if rc != ffi::SQLITE_OK {
                     eprintln!("warning: sqlite3_close returned non-OK status {rc}");
                 }
             }
-            self.db = ptr::null_mut();
+            *db = ptr::null_mut();
         }
     }
 }

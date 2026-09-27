@@ -214,7 +214,7 @@ struct Args {
     /// gateway executes arbitrary SQL (including dropping databases) for
     /// any caller that reaches it, so it refuses to start unauthenticated
     /// by accident.
-    #[arg(long, env = "RSQLITE_GRPC_AUTH_TOKEN", requires = "ha")]
+    #[arg(long, env = "RSQLITE_GRPC_AUTH_TOKEN")]
     ha_grpc_auth_token: Option<String>,
 
     /// Explicitly disable gRPC SQL Gateway authentication.
@@ -1002,8 +1002,12 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         let svc = TonicSqlGatewayServer::with_interceptor(gateway_server, move |req| {
             auth_for_interceptor.check(req)
         });
-        let repl_server =
-            ReplicationServer::new(engine, auth_config.clone(), SyncTuning::from_env());
+        let repl_server = ReplicationServer::new(
+            engine,
+            auth_config.clone(),
+            SyncTuning::from_env(),
+            Some(ha_shared_state.clone()),
+        );
         let repl_svc = TonicReplicationServiceServer::new(repl_server);
         let mut shutdown_rx_grpc = shutdown_tx.subscribe();
 

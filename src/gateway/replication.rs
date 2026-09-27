@@ -4,6 +4,8 @@
 //! providing streaming SQLite delta synchronization over HTTP/2.
 
 use std::pin::Pin;
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use libsqlite3_sys as ffi;
 use tokio::sync::mpsc;
@@ -16,6 +18,7 @@ use crate::SyncTuning;
 use crate::db::Connection;
 use crate::gateway::auth::AuthConfig;
 use crate::gateway::engine::DatabaseEngine;
+use crate::ha::HaSharedState;
 use crate::proto::rsqlite::v1::replication_service_server::ReplicationService;
 use crate::proto::rsqlite::v1::sync_init::ClientRole;
 use crate::proto::rsqlite::v1::{SyncMessage, sync_message};
@@ -31,15 +34,22 @@ pub struct ReplicationServer {
     engine: DatabaseEngine,
     auth: AuthConfig,
     tuning: SyncTuning,
+    ha_state: Option<Arc<RwLock<HaSharedState>>>,
 }
 
 impl ReplicationServer {
     /// Create a new `ReplicationServer`.
-    pub fn new(engine: DatabaseEngine, auth: AuthConfig, tuning: SyncTuning) -> Self {
+    pub fn new(
+        engine: DatabaseEngine,
+        auth: AuthConfig,
+        tuning: SyncTuning,
+        ha_state: Option<Arc<RwLock<HaSharedState>>>,
+    ) -> Self {
         Self {
             engine,
             auth,
             tuning,
+            ha_state,
         }
     }
 }
@@ -92,6 +102,19 @@ impl ReplicationService for ReplicationServer {
                 ));
             }
         };
+
+        if let (ClientRole::Origin, Some(ha_state)) = (client_role, &self.ha_state) {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let state = ha_state.read().unwrap_or_else(|p| p.into_inner());
+            if state.is_writer(now_secs) {
+                return Err(Status::failed_precondition(
+                    "cannot push replication to an active writer node",
+                ));
+            }
+        }
 
         let (outgoing_tx, outgoing_rx) =
             mpsc::channel::<SyncMessage>(DEFAULT_GRPC_CHANNEL_CAPACITY);

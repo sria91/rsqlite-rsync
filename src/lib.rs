@@ -84,7 +84,7 @@ use crate::transport::Transport;
 use crate::transport::local::LocalTransport;
 use crate::transport::ssh::SshConnectOptions;
 use tokio::sync::mpsc;
-use tonic::transport::Channel;
+use tonic::transport::{ClientTlsConfig, Endpoint};
 
 const LOCAL_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -354,8 +354,14 @@ pub async fn grpc_push_sync_with_tuning(
     let origin_conn = Connection::open(origin_path, ffi::SQLITE_OPEN_READONLY)?;
     let snap = Snapshot::begin(&origin_conn)?;
 
-    let channel = Channel::from_shared(url.to_string())
-        .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?
+    let mut endpoint = Endpoint::from_shared(url.to_string())
+        .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?;
+    if url.starts_with("https://") || url.starts_with("grpcs://") {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new())
+            .map_err(|e| SyncError::Network(format!("failed to configure TLS: {e}")))?;
+    }
+    let channel = endpoint
         .connect()
         .await
         .map_err(|e| SyncError::Network(format!("failed to connect to gRPC server: {e}")))?;
@@ -433,8 +439,14 @@ pub async fn grpc_pull_sync_with_tuning(
         ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
     )?;
 
-    let channel = Channel::from_shared(url.to_string())
-        .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?
+    let mut endpoint = Endpoint::from_shared(url.to_string())
+        .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?;
+    if url.starts_with("https://") || url.starts_with("grpcs://") {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new())
+            .map_err(|e| SyncError::Network(format!("failed to configure TLS: {e}")))?;
+    }
+    let channel = endpoint
         .connect()
         .await
         .map_err(|e| SyncError::Network(format!("failed to connect to gRPC server: {e}")))?;

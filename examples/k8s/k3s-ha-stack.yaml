@@ -275,19 +275,25 @@ data:
     fi
 
     writer_host="${holder}.sqlite-ha.${POD_NAMESPACE}.svc.cluster.local"
+    writer_endpoint="http://${writer_host}:50051"
 
-    # Pull all databases from the writer over gRPC.
-    # Note: `rsqlite-rsync grpc://...` triggers the gRPC replication logic.
-    # We iterate over the writer's databases via a gRPC-based client check
-    # if supported, but for now we list local files and pull them from the writer.
-    # This assumes the set of databases is identical on writer and replica.
+    # Dynamically discover databases hosted on the active writer using client status.
+    discovered_dbs="$(rsqlite-rsync client --endpoint "${writer_endpoint}" --token "${grpc_token}" status --format json 2>/dev/null | jq -r '.databases[].name' 2>/dev/null || true)"
+
+    # Fall back to existing local databases if discovery fails or jq is not available.
+    if [ -z "$discovered_dbs" ]; then
+      for local_path in "${data_dir}"/*.db; do
+        [ -e "$local_path" ] || continue
+        discovered_dbs="${discovered_dbs:+${discovered_dbs}
+}$(basename "$local_path")"
+      done
+    fi
 
     sync_failed=0
-    for local_path in "${data_dir}"/*.db; do
-      [ -e "$local_path" ] || continue
-      name="$(basename "$local_path")"
+    for name in $discovered_dbs; do
+      [ -n "$name" ] || continue
 
-      if ! rsqlite-rsync grpc://${writer_host}:50051/${name} \
+      if ! rsqlite-rsync "grpc://${writer_host}:50051/${name}" \
              "${data_dir}/${name}" \
              --grpc-auth-token "${grpc_token}"; then
         echo "default-replica-sync: failed to sync ${name} from ${writer_host}" >&2

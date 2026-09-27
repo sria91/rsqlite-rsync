@@ -38,6 +38,13 @@ struct TestServer {
 
 impl TestServer {
     async fn start(auth: AuthConfig) -> Self {
+        Self::start_with_ha(auth, None).await
+    }
+
+    async fn start_with_ha(
+        auth: AuthConfig,
+        ha_state: Option<std::sync::Arc<std::sync::RwLock<rsqlite_rsync::ha::HaSharedState>>>,
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("databases");
         fs::create_dir_all(&data_dir).unwrap();
@@ -47,7 +54,7 @@ impl TestServer {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let engine = DatabaseEngine::new(data_dir.clone()).unwrap();
-        let repl_server = ReplicationServer::new(engine, auth, SyncTuning::default());
+        let repl_server = ReplicationServer::new(engine, auth, SyncTuning::default(), ha_state);
         let svc = TonicReplicationServiceServer::new(repl_server);
 
         tokio::spawn(async move {
@@ -263,6 +270,47 @@ async fn grpc_invalid_database_name_rejected() {
     );
 }
 
+#[tokio::test]
+async fn grpc_push_sync_rejected_on_active_writer_node() {
+    use rsqlite_rsync::ha::{HaSharedState, LeaseRecord, NodeRole};
+    use std::sync::{Arc, RwLock};
+
+    let ha_state = Arc::new(RwLock::new(HaSharedState {
+        node_id: "writer-node".to_string(),
+        role: NodeRole::Writer,
+        generation: 1,
+        active_leader_id: Some("writer-node".to_string()),
+        active_leader_endpoint: None,
+        lease_record: Some(LeaseRecord {
+            holder_node_id: "writer-node".to_string(),
+            generation: 1,
+            renewed_at_secs: now_secs(),
+            ttl_secs: 60,
+        }),
+        allow_replica_reads: false,
+    }));
+
+    let server =
+        TestServer::start_with_ha(AuthConfig::required(TEST_TOKEN.to_string()), Some(ha_state))
+            .await;
+
+    let local_db = NamedTempFile::new().unwrap();
+    fixtures::seed(local_db.path(), 50);
+
+    let res = grpc_push_sync(local_db.path(), &server.url, "fenced.db", Some(TEST_TOKEN)).await;
+
+    assert!(
+        res.is_err(),
+        "push sync to active writer node must be rejected"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("cannot push replication to an active writer node")
+            || err_msg.contains("failed_precondition"),
+        "error message should indicate active writer rejection, got: {err_msg}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI Integration Tests (exercising CLI argument parsing and gRPC dispatch)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -332,7 +380,7 @@ struct HaDaemonNode {
 }
 
 impl HaDaemonNode {
-    fn start(auth_token: Option<&str>) -> Self {
+    fn start(auth_token: Option<&str>, is_writer: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let lease_path = temp.path().join("lease.txt");
         let freshness_path = temp.path().join("freshness.txt");
@@ -347,13 +395,19 @@ impl HaDaemonNode {
         let grpc_bind = format!("127.0.0.1:{grpc_port}");
 
         let now = now_secs();
-        write_lease(&lease_path, "writer-node", 1, now, 60);
-        write_freshness(&freshness_path, "writer-node", 1, now);
+        let node_id = if is_writer {
+            "writer-node"
+        } else {
+            "replica-node"
+        };
+        let holder_id = "writer-node";
+        write_lease(&lease_path, holder_id, 1, now, 60);
+        write_freshness(&freshness_path, holder_id, 1, now);
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rsqlite-rsync"));
         cmd.arg("--ha")
             .arg("--ha-node-id")
-            .arg("writer-node")
+            .arg(node_id)
             .arg("--ha-lease-file")
             .arg(&lease_path)
             .arg("--ha-freshness-file")
@@ -398,7 +452,7 @@ impl HaDaemonNode {
 
 #[test]
 fn cli_grpc_push_and_pull_sync() {
-    let daemon = HaDaemonNode::start(Some(TEST_TOKEN));
+    let daemon = HaDaemonNode::start(Some(TEST_TOKEN), false);
 
     // 1. Push sync via CLI: local DB -> grpc://...
     let local_origin = NamedTempFile::new().unwrap();
@@ -441,7 +495,7 @@ fn cli_grpc_push_and_pull_sync() {
 
 #[test]
 fn cli_grpc_batch_manifest_sync() {
-    let daemon = HaDaemonNode::start(Some(TEST_TOKEN));
+    let daemon = HaDaemonNode::start(Some(TEST_TOKEN), false);
 
     let local_db1 = NamedTempFile::new().unwrap();
     let local_db2 = NamedTempFile::new().unwrap();

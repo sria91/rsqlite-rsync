@@ -342,7 +342,7 @@ containers:
 **Replica sync**:
 
 - Reads role state file every 5 seconds
-- When role is `replica`, executes sync command (`rsqlite-rsync grpc://${writer_host}:50051/<db> <local-db-path> --grpc-auth-token "$TOKEN"` by default)
+- When role is `replica`, executes sync command (`rsqlite-rsync grpc://${writer_host}:50051/<db> <local-db-path>` by default; the auth token is read from `RSQLITE_GRPC_AUTH_TOKEN`)
 - On success, writes freshness ledger with source node and generation from lease
 
 ## Failover Behavior
@@ -440,7 +440,7 @@ Complete working examples are in the repository:
 
 ```bash
 RSQLITE_RSYNC_IMAGE=your-registry/rsqlite-rsync:latest \
-RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync grpc://<writer-host>:50051/app.db /var/lib/sqlite/app.db --grpc-auth-token "$RSQLITE_TOKEN"' \
+RSQLITE_RSYNC_REPLICA_SYNC_COMMAND='rsqlite-rsync grpc://<writer-host>:50051/app.db /var/lib/sqlite/app.db' \
 ./scripts/apply-k3s-ha-stack.sh
 ```
 
