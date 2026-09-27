@@ -277,19 +277,26 @@ data:
     writer_host="${holder}.sqlite-ha.${POD_NAMESPACE}.svc.cluster.local"
     writer_endpoint="http://${writer_host}:50051"
 
-    # Dynamically discover databases hosted on the active writer using client status.
-    discovered_dbs="$(rsqlite-rsync client --endpoint "${writer_endpoint}" --token "${grpc_token}" status --format json 2>/dev/null | jq -r '.databases[].name' 2>/dev/null || true)"
+    # Obtain database list from RSQLITE_DATABASES or query writer via status RPC.
+    databases="${RSQLITE_DATABASES:-}"
+    if [ -z "$databases" ]; then
+      status_json="$(rsqlite-rsync client --endpoint "${writer_endpoint}" --token "${grpc_token}" status --format json 2>/dev/null)" || {
+        echo "default-replica-sync: failed to query database list from writer ${writer_endpoint}" >&2
+        exit 1
+      }
+      if command -v jq >/dev/null 2>&1; then
+        databases="$(printf '%s' "$status_json" | jq -r '.databases[].name' 2>/dev/null || true)"
+      else
+        databases="$(printf '%s' "$status_json" | grep '"name":' | sed -e 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/' || true)"
+      fi
+    fi
 
-    # Fall back to existing local databases if discovery fails or jq is not available.
-    if [ -z "$discovered_dbs" ]; then
-      for local_path in "${data_dir}"/*.db; do
-        [ -e "$local_path" ] || continue
-        discovered_dbs="${discovered_dbs}${discovered_dbs:+ }$(basename "$local_path")"
-      done
+    if [ -z "$databases" ]; then
+      exit 0
     fi
 
     sync_failed=0
-    for name in $discovered_dbs; do
+    for name in $databases; do
       [ -n "$name" ] || continue
 
       if ! rsqlite-rsync "grpc://${writer_host}:50051/${name}" \
@@ -301,7 +308,7 @@ data:
     done
 
     # Remove local databases the writer no longer has if discovery and sync succeeded
-    if [ "$sync_failed" -eq 0 ] && [ -n "$discovered_dbs" ]; then
+    if [ "$sync_failed" -eq 0 ] && [ -n "$databases" ]; then
       for local_path in "${data_dir}"/*.db; do
         [ -e "$local_path" ] || continue
         if is_writer_or_promoted; then
@@ -310,7 +317,7 @@ data:
         fi
         local_name="$(basename "$local_path")"
         found=0
-        for name in $discovered_dbs; do
+        for name in $databases; do
           if [ "$name" = "$local_name" ]; then
             found=1
             break

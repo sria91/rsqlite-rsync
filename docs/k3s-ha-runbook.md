@@ -33,13 +33,15 @@ Each pod in a `StatefulSet` runs four containers:
   - writes freshness ledger after successful sync
   - **default command** (`default-replica-sync.sh`, used unless you set
     `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` on `apply-k3s-ha-stack.sh`):
-    resolves the current writer from the Lease, then pulls every `*.db`
-    file it finds via `rsqlite-rsync`'s native gRPC streaming replication
+    resolves the current writer from the Lease, discovers the writer's
+    databases dynamically via status RPC (or `RSQLITE_DATABASES`), and
+    pulls each database via `rsqlite-rsync`'s native gRPC streaming replication
     transport (`grpc://${writer_host}:50051/${db}`) authenticated with the
-    shared `sqlite-ha-grpc-auth` bearer token, no hardcoded database name.
-    This is what makes the reference manifest replicate data efficiently over
-    HTTP/2 rather than requiring an external SSH daemon sidecar — override the
-    command if plugging in a custom transport or external sync mechanism
+    shared `sqlite-ha-grpc-auth` bearer token, syncing even when the replica's
+    local data directory starts empty. This is what makes the reference
+    manifest replicate data efficiently over HTTP/2 rather than requiring an
+    external SSH daemon sidecar — override the command if plugging in a custom
+    transport or external sync mechanism
 - label-updater sidecar:
   - patches this pod's own `role=writer`/`role=replica` label from its
     local `role_state.txt`
