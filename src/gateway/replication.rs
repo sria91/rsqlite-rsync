@@ -169,7 +169,11 @@ impl ReplicationService for ReplicationServer {
             }
             ClientRole::Origin => {
                 // Client is Origin -> Server is Replica (Push Sync)
+                let engine = self.engine.clone();
                 tokio::spawn(async move {
+                    let lock = engine.get_db_lock(&db_name);
+                    let _guard = lock.lock().await;
+
                     let replica_conn = match Connection::open(
                         &db_path,
                         ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,

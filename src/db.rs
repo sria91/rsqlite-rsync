@@ -155,8 +155,8 @@ impl Connection {
     ///
     /// Returns [`SyncError::Sqlite`] if the query fails.
     pub fn page_count(&self) -> Result<u32> {
-        let db = *self.db.lock().unwrap();
-        Self::query_pragma_u32(db, "page_count")
+        let db_guard = self.db.lock().unwrap();
+        Self::query_pragma_u32(*db_guard, "page_count")
     }
 
     /// Serialise the entire `main` database to a byte vector.
@@ -166,7 +166,8 @@ impl Connection {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let main = CString::new("main").unwrap();
         let mut size: i64 = 0;
-        let db = *self.db.lock().unwrap();
+        let db_guard = self.db.lock().unwrap();
+        let db = *db_guard;
         unsafe {
             let ptr = ffi::sqlite3_serialize(db, main.as_ptr(), &mut size, 0);
             if ptr.is_null() {
@@ -248,7 +249,8 @@ impl Connection {
     /// Execute a SQL statement that returns no rows.
     pub fn exec(&self, sql: &str) -> Result<()> {
         let c_sql = CString::new(sql).map_err(|e| SyncError::Protocol(e.to_string()))?;
-        let db = *self.db.lock().unwrap();
+        let db_guard = self.db.lock().unwrap();
+        let db = *db_guard;
         unsafe {
             check(
                 db,
@@ -264,14 +266,14 @@ impl Connection {
 
     /// Number of rows modified, inserted or deleted by the most recent statement.
     pub fn changes(&self) -> u64 {
-        let db = *self.db.lock().unwrap();
-        unsafe { ffi::sqlite3_changes(db) as u64 }
+        let db_guard = self.db.lock().unwrap();
+        unsafe { ffi::sqlite3_changes(*db_guard) as u64 }
     }
 
     /// Rowid of the most recent successful INSERT into a rowid table.
     pub fn last_insert_rowid(&self) -> i64 {
-        let db = *self.db.lock().unwrap();
-        unsafe { ffi::sqlite3_last_insert_rowid(db) }
+        let db_guard = self.db.lock().unwrap();
+        unsafe { ffi::sqlite3_last_insert_rowid(*db_guard) }
     }
 
     /// Prepare a SQL statement for execution and parameter binding.
@@ -366,19 +368,22 @@ impl Backup {
     /// Returns [`SyncError::Sqlite`] if `sqlite3_backup_init` fails.
     pub fn new(dst: &Connection, src: &Connection) -> Result<Self> {
         let main = CString::new("main").unwrap();
-        let inner = unsafe {
-            ffi::sqlite3_backup_init(dst.as_ptr(), main.as_ptr(), src.as_ptr(), main.as_ptr())
-        };
+        let dst_guard = dst.db.lock().unwrap();
+        let src_guard = src.db.lock().unwrap();
+        let dst_db = *dst_guard;
+        let src_db = *src_guard;
+        let inner =
+            unsafe { ffi::sqlite3_backup_init(dst_db, main.as_ptr(), src_db, main.as_ptr()) };
         if inner.is_null() {
             let msg = unsafe {
-                let ptr = ffi::sqlite3_errmsg(dst.as_ptr());
+                let ptr = ffi::sqlite3_errmsg(dst_db);
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             };
             return Err(SyncError::sqlite(ffi::SQLITE_ERROR, msg));
         }
         Ok(Backup {
             inner,
-            _dst: dst.as_ptr(),
+            _dst: dst_db,
         })
     }
 
@@ -472,22 +477,15 @@ impl PreparedStatement {
     pub fn new(conn: &Connection, sql: &str) -> Result<Self> {
         let c_sql = CString::new(sql).map_err(|e| SyncError::Protocol(e.to_string()))?;
         let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
+        let db_guard = conn.db.lock().unwrap();
+        let db = *db_guard;
         unsafe {
             check(
-                conn.as_ptr(),
-                ffi::sqlite3_prepare_v2(
-                    conn.as_ptr(),
-                    c_sql.as_ptr(),
-                    -1,
-                    &mut stmt,
-                    ptr::null_mut(),
-                ),
+                db,
+                ffi::sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
             )?;
         }
-        Ok(PreparedStatement {
-            stmt,
-            db: conn.as_ptr(),
-        })
+        Ok(PreparedStatement { stmt, db })
     }
 
     /// Returns `true` if this statement is guaranteed to not change the database.

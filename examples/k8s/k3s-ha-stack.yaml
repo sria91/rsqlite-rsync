@@ -284,8 +284,7 @@ data:
     if [ -z "$discovered_dbs" ]; then
       for local_path in "${data_dir}"/*.db; do
         [ -e "$local_path" ] || continue
-        discovered_dbs="${discovered_dbs:+${discovered_dbs}
-}$(basename "$local_path")"
+        discovered_dbs="${discovered_dbs}${discovered_dbs:+ }$(basename "$local_path")"
       done
     fi
 
@@ -301,10 +300,27 @@ data:
       fi
     done
 
-    # Remove local databases the writer no longer has
-    if is_writer_or_promoted; then
-      echo "default-replica-sync: pod is now writer — skipping stale-file cleanup" >&2
-      exit "$sync_failed"
+    # Remove local databases the writer no longer has if discovery and sync succeeded
+    if [ "$sync_failed" -eq 0 ] && [ -n "$discovered_dbs" ]; then
+      if is_writer_or_promoted; then
+        echo "default-replica-sync: pod is now writer — skipping stale-file cleanup" >&2
+      else
+        for local_path in "${data_dir}"/*.db; do
+          [ -e "$local_path" ] || continue
+          local_name="$(basename "$local_path")"
+          found=0
+          for name in $discovered_dbs; do
+            if [ "$name" = "$local_name" ]; then
+              found=1
+              break
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "default-replica-sync: removing stale database ${local_name}" >&2
+            rm -f "${local_path}" "${local_path}-wal" "${local_path}-shm"
+          fi
+        done
+      fi
     fi
 
     exit "$sync_failed"

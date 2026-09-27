@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::Mutex as TokioMutex;
 
 use libsqlite3_sys as ffi;
 
@@ -20,7 +21,7 @@ use crate::proto::rsqlite::v1::{
 #[derive(Clone)]
 pub struct DatabaseEngine {
     data_dir: PathBuf,
-    db_mutexes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    db_mutexes: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 }
 
 impl DatabaseEngine {
@@ -61,11 +62,12 @@ impl DatabaseEngine {
         Ok(full_path)
     }
 
-    fn get_db_lock(&self, db_name: &str) -> Arc<Mutex<()>> {
+    /// Get the database mutex lock for coordinating concurrent writes or replications.
+    pub fn get_db_lock(&self, db_name: &str) -> Arc<TokioMutex<()>> {
         let trimmed = db_name.trim();
         let mut map = self.db_mutexes.lock().unwrap();
         map.entry(trimmed.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone()
     }
 
@@ -96,7 +98,7 @@ impl DatabaseEngine {
         generation: u64,
     ) -> Result<ExecuteResponse> {
         let lock = self.get_db_lock(db_name);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.blocking_lock();
 
         let start = Instant::now();
         let conn = self.open_connection(db_name, false)?;
@@ -259,7 +261,7 @@ impl DatabaseEngine {
         generation: u64,
     ) -> Result<BatchResponse> {
         let lock = self.get_db_lock(db_name);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.blocking_lock();
 
         let start = Instant::now();
         let conn = self.open_connection(db_name, false)?;
@@ -419,7 +421,7 @@ impl DatabaseEngine {
     /// Returns whether the primary database file existed prior to deletion.
     pub fn drop_database(&self, db_name: &str) -> Result<bool> {
         let lock = self.get_db_lock(db_name);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.blocking_lock();
 
         let path = self.resolve_db_path(db_name)?;
         let existed = path.exists();
