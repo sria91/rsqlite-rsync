@@ -5,7 +5,7 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libsqlite3_sys as ffi;
 use tokio::sync::mpsc;
@@ -27,6 +27,9 @@ use crate::protocol::{origin, replica};
 use crate::snapshot::Snapshot;
 use crate::transport::Transport;
 use crate::transport::grpc::{DEFAULT_GRPC_CHANNEL_CAPACITY, GrpcTransport};
+
+/// Default timeout for individual replication sessions (120 seconds).
+pub const DEFAULT_REPLICATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// gRPC Replication Service server handler.
 #[derive(Clone)]
@@ -154,14 +157,30 @@ impl ReplicationService for ReplicationServer {
                         }
                     };
 
-                    let run_res = origin::run_with_tuning(&snap, &mut transport, &tuning).await;
-                    if let Err(ref e) = run_res {
-                        tracing::error!(database = %db_name, error = %e, "server origin sync failed");
-                        let _ = transport
-                            .send(&Message::Error {
-                                message: e.to_string(),
-                            })
-                            .await;
+                    let run_res = tokio::time::timeout(
+                        DEFAULT_REPLICATION_TIMEOUT,
+                        origin::run_with_tuning(&snap, &mut transport, &tuning),
+                    )
+                    .await;
+
+                    match run_res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(ref e)) => {
+                            tracing::error!(database = %db_name, error = %e, "server origin sync failed");
+                            let _ = transport
+                                .send(&Message::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                        Err(_) => {
+                            tracing::error!(database = %db_name, "server origin sync timed out");
+                            let _ = transport
+                                .send(&Message::Error {
+                                    message: "replication session timed out".to_string(),
+                                })
+                                .await;
+                        }
                     }
                     let _ = snap.commit();
                     let _ = transport.close().await;
@@ -172,7 +191,7 @@ impl ReplicationService for ReplicationServer {
                 let engine = self.engine.clone();
                 tokio::spawn(async move {
                     let lock = engine.get_db_lock(&db_name);
-                    let _guard = lock.lock().await;
+                    let guard = lock.lock().await;
 
                     let replica_conn = match Connection::open(
                         &db_path,
@@ -180,6 +199,7 @@ impl ReplicationService for ReplicationServer {
                     ) {
                         Ok(conn) => conn,
                         Err(e) => {
+                            drop(guard);
                             tracing::error!(database = %db_name, error = %e, "failed to open/create replica database");
                             let _ = transport
                                 .send(&Message::Error {
@@ -191,15 +211,33 @@ impl ReplicationService for ReplicationServer {
                         }
                     };
 
-                    let run_res =
-                        replica::run_with_tuning(&replica_conn, &mut transport, &tuning).await;
-                    if let Err(ref e) = run_res {
-                        tracing::error!(database = %db_name, error = %e, "server replica sync failed");
-                        let _ = transport
-                            .send(&Message::Error {
-                                message: e.to_string(),
-                            })
-                            .await;
+                    let run_res = tokio::time::timeout(
+                        DEFAULT_REPLICATION_TIMEOUT,
+                        replica::run_with_tuning(&replica_conn, &mut transport, &tuning),
+                    )
+                    .await;
+
+                    // Release database lock immediately after replication attempt completes/times out
+                    drop(guard);
+
+                    match run_res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(ref e)) => {
+                            tracing::error!(database = %db_name, error = %e, "server replica sync failed");
+                            let _ = transport
+                                .send(&Message::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                        Err(_) => {
+                            tracing::error!(database = %db_name, "server replica sync timed out");
+                            let _ = transport
+                                .send(&Message::Error {
+                                    message: "replication session timed out".to_string(),
+                                })
+                                .await;
+                        }
                     }
                     let _ = transport.close().await;
                 });
