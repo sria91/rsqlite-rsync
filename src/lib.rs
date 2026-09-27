@@ -77,12 +77,14 @@ use std::time::Duration;
 use libsqlite3_sys as ffi;
 
 use crate::db::Connection;
-use crate::error::Result;
+use crate::error::{Result, SyncError};
 use crate::protocol::{origin, replica};
 use crate::snapshot::Snapshot;
 use crate::transport::Transport;
 use crate::transport::local::LocalTransport;
 use crate::transport::ssh::SshConnectOptions;
+use tokio::sync::mpsc;
+use tonic::transport::Channel;
 
 const LOCAL_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -315,6 +317,161 @@ pub async fn pull_sync_with_tuning(
     )
     .await?;
 
+    let run_result = replica::run_with_tuning(&replica_conn, &mut transport, tuning).await;
+    let close_result = transport.close().await;
+
+    run_result?;
+    close_result?;
+    Ok(())
+}
+
+/// Push a local origin database to a remote replica over gRPC.
+pub async fn grpc_push_sync(
+    origin_path: &Path,
+    url: &str,
+    database: &str,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    let tuning = SyncTuning::from_env();
+    grpc_push_sync_with_tuning(origin_path, url, database, auth_token, &tuning).await
+}
+
+/// Push a local origin database to a remote replica over gRPC with explicit
+/// runtime tuning.
+pub async fn grpc_push_sync_with_tuning(
+    origin_path: &Path,
+    url: &str,
+    database: &str,
+    auth_token: Option<&str>,
+    tuning: &SyncTuning,
+) -> Result<()> {
+    use crate::proto::rsqlite::v1::replication_service_client::ReplicationServiceClient;
+    use crate::proto::rsqlite::v1::sync_init::ClientRole;
+    use crate::proto::rsqlite::v1::{SyncInit, SyncMessage, sync_message};
+    use crate::transport::grpc::{DEFAULT_GRPC_CHANNEL_CAPACITY, GrpcTransport};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let origin_conn = Connection::open(origin_path, ffi::SQLITE_OPEN_READONLY)?;
+    let snap = Snapshot::begin(&origin_conn)?;
+
+    let channel = Channel::from_shared(url.to_string())
+        .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| SyncError::Network(format!("failed to connect to gRPC server: {e}")))?;
+
+    let mut client = ReplicationServiceClient::new(channel);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<SyncMessage>(DEFAULT_GRPC_CHANNEL_CAPACITY);
+
+    let init_msg = SyncMessage {
+        payload: Some(sync_message::Payload::Init(SyncInit {
+            database: database.to_string(),
+            client_role: ClientRole::Origin.into(),
+            auth_token: auth_token.unwrap_or_default().to_string(),
+        })),
+    };
+    outgoing_tx
+        .send(init_msg)
+        .await
+        .map_err(|e| SyncError::Network(format!("failed to send SyncInit: {e}")))?;
+
+    let stream = ReceiverStream::new(outgoing_rx);
+    let mut request = tonic::Request::new(stream);
+    if let Some(token) = auth_token {
+        let auth_value = format!("Bearer {token}");
+        request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::try_from(auth_value.as_str())
+                .map_err(|e| SyncError::Protocol(format!("invalid auth token: {e}")))?,
+        );
+    }
+
+    let streaming = client
+        .sync(request)
+        .await
+        .map_err(|e| SyncError::Network(format!("failed to establish gRPC stream: {e}")))?
+        .into_inner();
+
+    let mut transport = GrpcTransport::new(outgoing_tx, streaming);
+    let run_result = origin::run_with_tuning(&snap, &mut transport, tuning).await;
+    let close_result = transport.close().await;
+
+    run_result?;
+    close_result?;
+    snap.commit()?;
+    Ok(())
+}
+
+/// Pull a remote origin database into a local replica over gRPC.
+pub async fn grpc_pull_sync(
+    replica_path: &Path,
+    url: &str,
+    database: &str,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    let tuning = SyncTuning::from_env();
+    grpc_pull_sync_with_tuning(replica_path, url, database, auth_token, &tuning).await
+}
+
+/// Pull a remote origin database into a local replica over gRPC with explicit
+/// runtime tuning.
+pub async fn grpc_pull_sync_with_tuning(
+    replica_path: &Path,
+    url: &str,
+    database: &str,
+    auth_token: Option<&str>,
+    tuning: &SyncTuning,
+) -> Result<()> {
+    use crate::proto::rsqlite::v1::replication_service_client::ReplicationServiceClient;
+    use crate::proto::rsqlite::v1::sync_init::ClientRole;
+    use crate::proto::rsqlite::v1::{SyncInit, SyncMessage, sync_message};
+    use crate::transport::grpc::{DEFAULT_GRPC_CHANNEL_CAPACITY, GrpcTransport};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let replica_conn = Connection::open(
+        replica_path,
+        ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+    )?;
+
+    let channel = Channel::from_shared(url.to_string())
+        .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| SyncError::Network(format!("failed to connect to gRPC server: {e}")))?;
+
+    let mut client = ReplicationServiceClient::new(channel);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<SyncMessage>(DEFAULT_GRPC_CHANNEL_CAPACITY);
+
+    let init_msg = SyncMessage {
+        payload: Some(sync_message::Payload::Init(SyncInit {
+            database: database.to_string(),
+            client_role: ClientRole::Replica.into(),
+            auth_token: auth_token.unwrap_or_default().to_string(),
+        })),
+    };
+    outgoing_tx
+        .send(init_msg)
+        .await
+        .map_err(|e| SyncError::Network(format!("failed to send SyncInit: {e}")))?;
+
+    let stream = ReceiverStream::new(outgoing_rx);
+    let mut request = tonic::Request::new(stream);
+    if let Some(token) = auth_token {
+        let auth_value = format!("Bearer {token}");
+        request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::try_from(auth_value.as_str())
+                .map_err(|e| SyncError::Protocol(format!("invalid auth token: {e}")))?,
+        );
+    }
+
+    let streaming = client
+        .sync(request)
+        .await
+        .map_err(|e| SyncError::Network(format!("failed to establish gRPC stream: {e}")))?
+        .into_inner();
+
+    let mut transport = GrpcTransport::new(outgoing_tx, streaming);
     let run_result = replica::run_with_tuning(&replica_conn, &mut transport, tuning).await;
     let close_result = transport.close().await;
 

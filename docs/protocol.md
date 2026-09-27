@@ -167,6 +167,17 @@ Hash algorithm by version:
 
 Current version is `2`.
 
+## Transports
+
+`rsqlite-rsync` supports multiple underlying transports implementing the same replication protocol state machine:
+
+1. **Length-Prefixed IO (SSH / Stdio / Local Pipe)**:
+   - Encoded with [bincode v2](https://docs.rs/bincode/latest/bincode/) with 4-byte little-endian length framing over standard input/output streams or SSH exec channels.
+2. **Native gRPC Streaming (`ReplicationService.Sync`)**:
+   - Bidirectional HTTP/2 streaming RPC defined in `rsqlite.v1.ReplicationService`.
+   - Each frame is a strongly-typed Protobuf `SyncMessage` containing one of the replication payload variants (`SyncInit`, `SyncHello`, `SyncHelloAck`, `SyncGroupHashes`, `SyncGroupsNeedFine`, `SyncPageHashes`, `SyncSendPages`, `SyncPagesAck`, `SyncDone`, `SyncError`).
+   - The stream begins with a `SyncInit` handshake specifying the target database name, client role (`ClientRole::Replica` for pull sync or `ClientRole::Origin` for push sync), and bearer authentication token.
+
 ## Bandwidth analysis
 
 | Scenario | Approximate bytes on wire |

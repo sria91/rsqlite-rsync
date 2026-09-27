@@ -73,9 +73,10 @@ pub struct Connection {
     write_fd: Option<Mutex<File>>,
 }
 
-// SAFETY: `sqlite3` can be used from a single thread at a time.  We never
+// SAFETY: `sqlite3` can be used from a single thread at a time. We never
 // share a `Connection` across threads without synchronisation.
 unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
 
 impl Connection {
     /// Open an existing database file (or create a new one) at `path`.

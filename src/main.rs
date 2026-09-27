@@ -28,8 +28,9 @@ use cli::{
 };
 use rsqlite_rsync::endpoint::Endpoint;
 use rsqlite_rsync::error::{Result, SyncError};
-use rsqlite_rsync::gateway::{AuthConfig, DatabaseEngine, SqlGatewayServer};
+use rsqlite_rsync::gateway::{AuthConfig, DatabaseEngine, ReplicationServer, SqlGatewayServer};
 use rsqlite_rsync::ha::{HaSharedState, NodeRole, parse_freshness_ledger};
+use rsqlite_rsync::proto::rsqlite::v1::replication_service_server::ReplicationServiceServer as TonicReplicationServiceServer;
 use rsqlite_rsync::proto::rsqlite::v1::sql_gateway_server::SqlGatewayServer as TonicSqlGatewayServer;
 use rsqlite_rsync::transport::ssh::{SshAuthMode, SshConnectOptions};
 use rsqlite_rsync::{SyncTuning, pull_sync_with_tuning, push_sync_with_tuning};
@@ -80,6 +81,10 @@ struct Args {
     /// SSH connect timeout in seconds.
     #[arg(long, default_value_t = 10)]
     ssh_connect_timeout: u32,
+
+    /// Optional auth token when replicating to/from a gRPC endpoint.
+    #[arg(long, env = "RSQLITE_GRPC_AUTH_TOKEN")]
+    grpc_auth_token: Option<String>,
 
     /// Path to a batch manifest for multi-database sync.
     #[arg(long)]
@@ -459,6 +464,32 @@ async fn run(args: Args) -> Result<()> {
             )
             .await?;
         }
+        (Endpoint::Local(o), Endpoint::Grpc { url, database }) => {
+            info!("gRPC Push sync: {} → {url} ({database})", o.display());
+            if args.dry_run {
+                eprintln!("dry-run: would push {o:?} → {url} ({database})");
+                return Ok(());
+            }
+            let auth_token = args
+                .grpc_auth_token
+                .as_deref()
+                .or(args.ha_grpc_auth_token.as_deref());
+            rsqlite_rsync::grpc_push_sync_with_tuning(&o, &url, &database, auth_token, &tuning)
+                .await?;
+        }
+        (Endpoint::Grpc { url, database }, Endpoint::Local(r)) => {
+            info!("gRPC Pull sync: {url} ({database}) → {}", r.display());
+            if args.dry_run {
+                eprintln!("dry-run: would pull {url} ({database}) → {r:?}");
+                return Ok(());
+            }
+            let auth_token = args
+                .grpc_auth_token
+                .as_deref()
+                .or(args.ha_grpc_auth_token.as_deref());
+            rsqlite_rsync::grpc_pull_sync_with_tuning(&r, &url, &database, auth_token, &tuning)
+                .await?;
+        }
         _ => unreachable!(),
     }
 
@@ -536,6 +567,7 @@ async fn run_batch_mode(args: Args) -> Result<()> {
             connect_timeout_secs: args.ssh_connect_timeout.max(1),
         },
         tuning: SyncTuning::from_env(),
+        grpc_auth_token: args.grpc_auth_token,
     };
 
     let report = batch::run_batch_sync(specs, runtime_options).await;
@@ -965,10 +997,14 @@ async fn run_ha_mode(args: Args) -> Result<()> {
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
         let engine = DatabaseEngine::new(data_dir)?;
-        let gateway_server = SqlGatewayServer::new(engine, ha_shared_state.clone());
+        let gateway_server = SqlGatewayServer::new(engine.clone(), ha_shared_state.clone());
+        let auth_for_interceptor = auth_config.clone();
         let svc = TonicSqlGatewayServer::with_interceptor(gateway_server, move |req| {
-            auth_config.check(req)
+            auth_for_interceptor.check(req)
         });
+        let repl_server =
+            ReplicationServer::new(engine, auth_config.clone(), SyncTuning::from_env());
+        let repl_svc = TonicReplicationServiceServer::new(repl_server);
         let mut shutdown_rx_grpc = shutdown_tx.subscribe();
 
         let addr: std::net::SocketAddr = bind_addr.parse().map_err(|error| {
@@ -979,6 +1015,7 @@ async fn run_ha_mode(args: Args) -> Result<()> {
         Some(tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(svc)
+                .add_service(repl_svc)
                 .serve_with_shutdown(addr, async move {
                     let _ = shutdown_rx_grpc.changed().await;
                 })

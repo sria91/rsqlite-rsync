@@ -6,10 +6,11 @@
 use std::path::PathBuf;
 
 /// An endpoint identifying a database location.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
     Local(PathBuf),
     Remote { user_host: String, path: String },
+    Grpc { url: String, database: String },
 }
 
 impl Endpoint {
@@ -42,18 +43,52 @@ impl Endpoint {
 
     /// Parse a string into an endpoint.
     ///
-    /// Strings of the form `[user@]host:path` are parsed as remote endpoints.
+    /// URLs with schemes `grpc://`, `grpcs://`, `http://`, or `https://` are parsed as
+    /// gRPC endpoints.
+    /// Strings of the form `[user@]host:path` are parsed as remote SSH endpoints.
     /// Everything else is treated as a local filesystem path.
     ///
     /// On Windows, a single letter before `:` is treated as a drive letter
     /// rather than a remote host.
     pub fn parse(s: &str) -> Self {
+        if let Some((url, database)) = Self::parse_grpc_parts(s) {
+            return Endpoint::Grpc { url, database };
+        }
+
         // Support bracketed IPv6 (`[addr]:path`) and split on the final `:`
         // for unbracketed inputs so hosts containing `:` remain intact.
         if let Some((user_host, path)) = Self::parse_remote_parts(s) {
             return Endpoint::Remote { user_host, path };
         }
         Endpoint::Local(PathBuf::from(s))
+    }
+
+    fn parse_grpc_parts(s: &str) -> Option<(String, String)> {
+        let (is_tls, rest) = if let Some(rest) = s.strip_prefix("grpc://") {
+            (false, rest)
+        } else if let Some(rest) = s.strip_prefix("grpcs://") {
+            (true, rest)
+        } else if let Some(rest) = s.strip_prefix("http://") {
+            (false, rest)
+        } else {
+            let rest = s.strip_prefix("https://")?;
+            (true, rest)
+        };
+
+        let (host_port, db_path) = match rest.split_once('/') {
+            Some((hp, path)) => (hp, path),
+            None => (rest, ""),
+        };
+
+        if host_port.is_empty() {
+            return None;
+        }
+
+        let scheme = if is_tls { "https" } else { "http" };
+        let url = format!("{scheme}://{host_port}");
+        let database = db_path.trim_start_matches('/').to_string();
+
+        Some((url, database))
     }
 
     fn parse_remote_parts(s: &str) -> Option<(String, String)> {
@@ -105,9 +140,14 @@ impl Endpoint {
         !is_windows_drive && !path_part.is_empty() && Self::looks_like_remote_host(host_part)
     }
 
-    /// Returns `true` if this endpoint is remote.
+    /// Returns `true` if this endpoint is remote (SSH or gRPC).
     pub fn is_remote(&self) -> bool {
-        matches!(self, Endpoint::Remote { .. })
+        matches!(self, Endpoint::Remote { .. } | Endpoint::Grpc { .. })
+    }
+
+    /// Returns `true` if this endpoint is a gRPC URL.
+    pub fn is_grpc(&self) -> bool {
+        matches!(self, Endpoint::Grpc { .. })
     }
 }
 
@@ -115,6 +155,36 @@ impl Endpoint {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn parse_grpc_paths() {
+        assert_eq!(
+            Endpoint::parse("grpc://127.0.0.1:50051/app.db"),
+            Endpoint::Grpc {
+                url: "http://127.0.0.1:50051".to_string(),
+                database: "app.db".to_string(),
+            }
+        );
+
+        assert_eq!(
+            Endpoint::parse("grpcs://secure.leader.internal:443/tenant/db.sqlite"),
+            Endpoint::Grpc {
+                url: "https://secure.leader.internal:443".to_string(),
+                database: "tenant/db.sqlite".to_string(),
+            }
+        );
+
+        assert_eq!(
+            Endpoint::parse("http://localhost:50051/test.db"),
+            Endpoint::Grpc {
+                url: "http://localhost:50051".to_string(),
+                database: "test.db".to_string(),
+            }
+        );
+
+        assert!(Endpoint::parse("grpc://127.0.0.1:50051/app.db").is_remote());
+        assert!(Endpoint::parse("grpc://127.0.0.1:50051/app.db").is_grpc());
+    }
 
     #[test]
     fn parse_local_paths() {

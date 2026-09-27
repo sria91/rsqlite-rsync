@@ -4,11 +4,12 @@ This runbook provides a concrete k3s deployment pattern for single-writer SQLite
 
 ## Architecture
 
-Each pod in a `StatefulSet` runs five containers:
+Each pod in a `StatefulSet` runs four containers:
 
-- `rsqlite-rsync` HA controller:
+- `rsqlite-rsync` HA controller & gRPC Server:
   - decides writer vs replica from Kubernetes Lease
-  - exposes readiness/liveness endpoints
+  - exposes readiness/liveness endpoints (`/healthz`, `/ready`)
+  - serves the gRPC SQL Gateway and bidirectional streaming `ReplicationService` on port 50051 (bearer token authenticated)
   - writes role state and audit logs
 - lease-updater sidecar:
   - publishes lease ownership and renewals when local role is writer
@@ -33,21 +34,12 @@ Each pod in a `StatefulSet` runs five containers:
   - **default command** (`default-replica-sync.sh`, used unless you set
     `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` on `apply-k3s-ha-stack.sh`):
     resolves the current writer from the Lease, then pulls every `*.db`
-    file it finds there via `rsqlite-rsync`'s own SSH transport (against
-    the sshd sidecar below), no hardcoded database name. This is what
-    makes the reference manifest actually replicate data rather than
-    just role state — override the whole command for a real transport/
-    auth model in production, same as before
-- sshd sidecar:
-  - serves the default replica-sync command above: read-only access to
-    the data dir over SSH on port 2222, key auth only
-  - trust model, appropriate for this reference/test manifest and not
-    meant to carry into production as-is: a single SSH keypair
-    (`sqlite-ha-ssh-keys` Secret) shared by every pod — any pod can SSH
-    into any other — and `StrictHostKeyChecking=no` on the client side,
-    since host keys are regenerated fresh on every pod restart and the
-    pod behind any given writer hostname changes across failovers
-    anyway, so real host-key pinning wouldn't mean anything here
+    file it finds via `rsqlite-rsync`'s native gRPC streaming replication
+    transport (`grpc://${writer_host}:50051/${db}`) authenticated with the
+    shared `sqlite-ha-grpc-auth` bearer token, no hardcoded database name.
+    This is what makes the reference manifest replicate data efficiently over
+    HTTP/2 rather than requiring an external SSH daemon sidecar — override the
+    command if plugging in a custom transport or external sync mechanism
 - label-updater sidecar:
   - patches this pod's own `role=writer`/`role=replica` label from its
     local `role_state.txt`
@@ -83,9 +75,10 @@ holds the role.
 - k3s cluster with a writable node filesystem path for hostPath storage (see [Node Storage](#node-storage) below)
 - image for `rsqlite-rsync` available to cluster
 - RBAC permission for lease updater (`get/list/watch/create/update/patch` on Lease)
-- a sync command for replica pods — a working SSH-based default is now
-  built into this manifest (see Architecture above), so this is only
-  needed if you want to override it with a real transport/auth model
+- a sync command for replica pods — a working gRPC-based default is built into
+  this manifest using the embedded `ReplicationService` on port 50051 and the
+  `sqlite-ha-grpc-auth` Secret (see Architecture above), so this is only needed
+  if you want to override it with a custom transport or sync mechanism
 
 ## Apply The Stack
 
@@ -94,7 +87,7 @@ Run these commands from the repository root:
 1. Apply with required variables:
    - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-k3s-ha-stack.sh`
 2. Optional overrides:
-   - `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` (default: `sh /scripts/default-replica-sync.sh`, which syncs all `*.db` files via the SSH sidecar; override if using a custom sync command/transport)
+   - `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` (default: `sh /scripts/default-replica-sync.sh`, which syncs all `*.db` files via native gRPC replication on port 50051; override if using a custom sync command/transport)
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
    - `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`)
    - `RSQLITE_RSYNC_CLIENT_POD_NAME` (default: `sqlite-ha-client`, when applying the client pod)

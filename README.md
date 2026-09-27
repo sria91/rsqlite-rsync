@@ -54,14 +54,20 @@ The last three forms are covered in
   of the database size when diffs are small.
 - **Versioned hashing** — protocol v2 uses BLAKE3 for page and group hashes
   (v1 compatibility uses SHA-256).
-- **Local and remote** — ORIGIN or REPLICA can be `[user@]host:path` (via SSH).
+- **Local, SSH, and gRPC remote sync** — ORIGIN or REPLICA can be a local path,
+  an SSH spec (`[user@]host:path`), or a native gRPC streaming URL
+  (`grpc://host:port/database`, `grpcs://`, `http://`, `https://`).
+- **Native gRPC replication transport** — bidirectional HTTP/2 streaming
+  replication over the embedded `ReplicationService` on port 50051 with
+  constant-time Bearer token authentication, removing the need for external
+  SSH daemons in Kubernetes and container environments.
 - **Interactive SSH option** — choose fast-fail non-interactive auth or
   terminal-prompted interactive auth.
 - **Operationally safe** — when REPLICA is not being modified by other
   processes, sync applies origin pages directly and can be retried after a
   failed run.
 - **Batch mode** — sync many origin/replica pairs from one manifest, with
-  per-entry retries, timeouts, and backoff.
+  per-entry retries, timeouts, backoff, and mixed SSH/gRPC/local endpoints.
 - **HA control loop** — single-writer lease-based orchestration (file or
   Kubernetes Lease), with readiness probes for lease/promotion state.
 - **SQL Gateway** — optional embedded gRPC server exposing SQL execution
@@ -69,6 +75,11 @@ The last three forms are covered in
   Rust client crate supporting leader discovery, automatic failover, and
   bearer-token authentication (required by default; see
   [Security](#security)).
+- **Connection pooling** — dedicated `rsqlite-rsync-pool` crate providing
+  connection pool managers for `bb8` (async), `deadpool` (async), and `r2d2`
+  (sync/blocking).
+- **Async & synchronous clients** — standalone `rsqlite-rsync-client` crate
+  providing both `tokio`-based async client and synchronous blocking client APIs.
 - **Pure Rust** — built on [`libsqlite3-sys`](https://crates.io/crates/libsqlite3-sys).
 
 ## Installation
@@ -94,14 +105,30 @@ rsqlite-rsync origin.db replica.db
 
 ### Push to remote
 
+Via SSH:
+
 ```bash
 rsqlite-rsync origin.db user@server:/data/replica.db
 ```
 
+Via native gRPC streaming:
+
+```bash
+rsqlite-rsync origin.db grpc://server:50051/replica.db --grpc-auth-token "$TOKEN"
+```
+
 ### Pull from remote
+
+Via SSH:
 
 ```bash
 rsqlite-rsync user@server:/data/origin.db replica.db
+```
+
+Via native gRPC streaming:
+
+```bash
+rsqlite-rsync grpc://server:50051/origin.db replica.db --grpc-auth-token "$TOKEN"
 ```
 
 ### Options
@@ -110,7 +137,8 @@ rsqlite-rsync user@server:/data/origin.db replica.db
 |------|-------------|
 | `-v, --verbose` | Show pages synced and bytes transferred |
 | `-n, --dry-run` | Compute diff but do not write REPLICA |
-| `--exe PATH` | Path to `rsqlite-rsync` on the remote machine |
+| `--grpc-auth-token TOKEN` | Bearer token for gRPC sync authentication (env `RSQLITE_GRPC_AUTH_TOKEN`) |
+| `--exe PATH` | Path to `rsqlite-rsync` on the remote machine (SSH only) |
 | `--ssh-opt OPT` | Extra argument passed to `ssh` (repeatable) |
 | `--ssh-auth <non-interactive\|interactive>` | SSH auth mode (default: `non-interactive`) |
 | `--ssh-connect-timeout SECONDS` | SSH connect timeout (default: `10`) |
@@ -551,23 +579,24 @@ This is a Cargo workspace. The main package (`rsqlite-rsync`, binary +
 | Module | Purpose |
 |--------|---------|
 | `db` | Safe FFI wrappers around `libsqlite3-sys` |
-| `endpoint` | Parsing of local vs. `[user@]host:path` endpoints |
+| `endpoint` | Parsing of local vs. `[user@]host:path` and `grpc[s]://` endpoints |
 | `hash` | Page and page-group hashing (v2: BLAKE3, v1: SHA-256) |
 | `protocol` | Wire messages, origin and replica state machines |
-| `transport` | Pluggable I/O: in-process (`local`), stdio framing, or SSH subprocess |
+| `transport` | Pluggable I/O: in-process (`local`), stdio framing, SSH subprocess, or gRPC streaming (`GrpcTransport`) |
 | `snapshot` | Read-consistent snapshot via `BEGIN DEFERRED` |
 | `ha` | Lease-based single-writer control loop (file and Kubernetes lease sources) |
-| `gateway` | Embedded gRPC SQL Gateway (`DatabaseEngine`, `SqlGatewayServer`) |
+| `gateway` | Embedded gRPC SQL Gateway (`DatabaseEngine`, `SqlGatewayServer`) & `ReplicationServiceServer` |
 | `error` | Unified `SyncError` type |
 | `client` (re-export) | gRPC client with leader discovery/failover, from `rsqlite-rsync-client` |
-| `proto` (re-export) | Generated gRPC types, from `rsqlite-rsync-proto` |
+| `proto` (re-export) | Generated gRPC types (`SqlGateway`, `ReplicationService`), from `rsqlite-rsync-proto` |
 
 Workspace members:
 
 | Crate | Purpose |
 |-------|---------|
-| [`crates/rsqlite-rsync-proto`](crates/rsqlite-rsync-proto) | Protobuf/tonic-generated `SqlGateway` service types, compiled from `proto/rsqlite/v1/sqlite.proto` |
-| [`crates/rsqlite-rsync-client`](crates/rsqlite-rsync-client) | Standalone async gRPC client for the SQL Gateway, usable without depending on this crate |
+| [`crates/rsqlite-rsync-proto`](crates/rsqlite-rsync-proto) | Protobuf/tonic-generated `SqlGateway` and `ReplicationService` types, compiled from `proto/rsqlite/v1/sqlite.proto` |
+| [`crates/rsqlite-rsync-client`](crates/rsqlite-rsync-client) | Standalone async and sync/blocking gRPC client for the SQL Gateway with transparent leader failover, usable without depending on the root crate |
+| [`crates/rsqlite-rsync-pool`](crates/rsqlite-rsync-pool) | Connection pool adapters for `rsqlite-rsync-client` supporting `bb8`, `deadpool`, and `r2d2` |
 
 ## Performance tuning (optional)
 
@@ -593,7 +622,9 @@ cargo test --bin rsqlite-rsync
 cargo test --test ha_mode
 cargo test --test grpc_gateway
 cargo test --test grpc_failover
+cargo test --test grpc_replication
 cargo test -p rsqlite-rsync-client
+cargo test -p rsqlite-rsync-pool
 ```
 
 Run Kubernetes manifest validator tests:
@@ -614,6 +645,8 @@ cargo bench
 |---------|-----------------|-----------------|
 | Language | C | Rust |
 | SSH transport | built-in | `ssh` subprocess |
+| gRPC replication transport | no | native bidirectional streaming (`grpc://`) |
+| Connection pooling | no | `rsqlite-rsync-pool` (`bb8`, `deadpool`, `r2d2`) |
 | Protocol hashing | SHA-256 | v2: BLAKE3 (v1: SHA-256) |
 | Protocol versioning | n/a | negotiated (current: v2) |
 | WAL requirement | removed in 3.50.0 | no requirement |

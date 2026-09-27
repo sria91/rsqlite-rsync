@@ -91,5 +91,9 @@ name = "grpc_failover"
 path = "tests/integration/grpc_failover.rs"
 
 [[test]]
+name = "grpc_replication"
+path = "tests/integration/grpc_replication.rs"
+
+[[test]]
 name = "push_pull_fake_ssh"
 path = "tests/integration/push_pull_fake_ssh.rs"
