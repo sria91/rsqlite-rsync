@@ -72,7 +72,7 @@ For non-async environments (CLI tools, scripts, or legacy codebases), enable the
 
 ```toml
 [dependencies]
-rsqlite-rsync-client = { version = "0.2", features = ["blocking"] }
+rsqlite-rsync-client = { version = "0.4", features = ["blocking"] }
 ```
 
 ```rust,no_run
