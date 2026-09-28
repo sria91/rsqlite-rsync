@@ -18,6 +18,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::ptr;
+use std::sync::Arc;
 
 pub use libsqlite3_sys as ffi;
 use std::sync::Mutex;
@@ -64,7 +65,7 @@ fn validate_page_no(page_no: u32) -> Result<()> {
 ///
 /// The connection is closed automatically when this value is dropped.
 pub struct Connection {
-    db: Mutex<*mut ffi::sqlite3>,
+    db: Arc<Mutex<*mut ffi::sqlite3>>,
     /// Cached page size in bytes (set once on open).
     page_size: u32,
     /// Cached read file handle — reused across all `read_page` calls.
@@ -75,6 +76,8 @@ pub struct Connection {
 
 // SAFETY: All accesses to the raw SQLite handle and file descriptors are synchronized
 // via Mutex, making it safe to send and share `Connection` across threads.
+// PreparedStatement shares the same Arc<Mutex<...>> for the db handle, so all
+// SQLite FFI calls (step, reset, bind, finalize) also acquire this lock.
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
@@ -137,7 +140,7 @@ impl Connection {
         // All setup succeeded — disarm the guard and hand ownership to Connection.
         std::mem::forget(guard);
         Ok(Connection {
-            db: Mutex::new(db),
+            db: Arc::new(Mutex::new(db)),
             page_size,
             read_fd,
             write_fd,
@@ -464,12 +467,17 @@ pub enum StepResult {
 }
 
 /// A prepared SQLite statement.
+///
+/// All FFI operations (step, reset, bind, finalize) acquire the parent
+/// connection's `Mutex` via the shared `Arc`, ensuring that concurrent
+/// `Connection` users cannot interleave SQLite calls on the same handle.
 pub struct PreparedStatement {
     stmt: *mut ffi::sqlite3_stmt,
-    db: *mut ffi::sqlite3,
+    db: Arc<Mutex<*mut ffi::sqlite3>>,
 }
 
-// SAFETY: `sqlite3_stmt` is owned and accessed from a single thread.
+// SAFETY: The raw `sqlite3_stmt` is synchronized via the shared `db` mutex.
+// All FFI calls acquire the lock, preventing concurrent access from multiple threads.
 unsafe impl Send for PreparedStatement {}
 
 impl PreparedStatement {
@@ -485,7 +493,7 @@ impl PreparedStatement {
                 ffi::sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
             )?;
         }
-        Ok(PreparedStatement { stmt, db })
+        Ok(PreparedStatement { stmt, db: Arc::clone(&conn.db) })
     }
 
     /// Returns `true` if this statement is guaranteed to not change the database.
@@ -495,12 +503,15 @@ impl PreparedStatement {
 
     /// Step the statement execution.
     pub fn step(&mut self) -> Result<StepResult> {
+        let db_guard = self.db.lock().unwrap();
+        let db = *db_guard;
         let rc = unsafe { ffi::sqlite3_step(self.stmt) };
         match rc {
             ffi::SQLITE_ROW => Ok(StepResult::Row),
             ffi::SQLITE_DONE => Ok(StepResult::Done),
             _ => {
-                check(self.db, rc)?;
+                // Hold the lock across sqlite3_errmsg inside check()
+                check(db, rc)?;
                 Ok(StepResult::Done)
             }
         }
@@ -508,12 +519,14 @@ impl PreparedStatement {
 
     /// Reset the prepared statement back to its initial state for re-execution.
     pub fn reset(&mut self) -> Result<()> {
-        unsafe { check(self.db, ffi::sqlite3_reset(self.stmt)) }
+        let db_guard = self.db.lock().unwrap();
+        unsafe { check(*db_guard, ffi::sqlite3_reset(self.stmt)) }
     }
 
     /// Reset all parameter bindings back to NULL.
     pub fn clear_bindings(&mut self) -> Result<()> {
-        unsafe { check(self.db, ffi::sqlite3_clear_bindings(self.stmt)) }
+        let db_guard = self.db.lock().unwrap();
+        unsafe { check(*db_guard, ffi::sqlite3_clear_bindings(self.stmt)) }
     }
 
     /// Look up the 1-based index of a named parameter (e.g., ":id", "@name", "$val", or bare "id").
@@ -537,24 +550,28 @@ impl PreparedStatement {
 
     /// Bind a NULL value to 1-indexed parameter `idx`.
     pub fn bind_null(&mut self, idx: i32) -> Result<()> {
-        unsafe { check(self.db, ffi::sqlite3_bind_null(self.stmt, idx)) }
+        let db_guard = self.db.lock().unwrap();
+        unsafe { check(*db_guard, ffi::sqlite3_bind_null(self.stmt, idx)) }
     }
 
     /// Bind a 64-bit integer value to 1-indexed parameter `idx`.
     pub fn bind_int64(&mut self, idx: i32, val: i64) -> Result<()> {
-        unsafe { check(self.db, ffi::sqlite3_bind_int64(self.stmt, idx, val)) }
+        let db_guard = self.db.lock().unwrap();
+        unsafe { check(*db_guard, ffi::sqlite3_bind_int64(self.stmt, idx, val)) }
     }
 
     /// Bind a 64-bit float value to 1-indexed parameter `idx`.
     pub fn bind_double(&mut self, idx: i32, val: f64) -> Result<()> {
-        unsafe { check(self.db, ffi::sqlite3_bind_double(self.stmt, idx, val)) }
+        let db_guard = self.db.lock().unwrap();
+        unsafe { check(*db_guard, ffi::sqlite3_bind_double(self.stmt, idx, val)) }
     }
 
     /// Bind a UTF-8 text string to 1-indexed parameter `idx`.
     pub fn bind_text(&mut self, idx: i32, val: &str) -> Result<()> {
+        let db_guard = self.db.lock().unwrap();
         unsafe {
             check(
-                self.db,
+                *db_guard,
                 ffi::sqlite3_bind_text(
                     self.stmt,
                     idx,
@@ -568,9 +585,10 @@ impl PreparedStatement {
 
     /// Bind raw blob bytes to 1-indexed parameter `idx`.
     pub fn bind_blob(&mut self, idx: i32, val: &[u8]) -> Result<()> {
+        let db_guard = self.db.lock().unwrap();
         unsafe {
             check(
-                self.db,
+                *db_guard,
                 ffi::sqlite3_bind_blob(
                     self.stmt,
                     idx,
@@ -662,6 +680,7 @@ impl PreparedStatement {
 impl Drop for PreparedStatement {
     fn drop(&mut self) {
         if !self.stmt.is_null() {
+            let _db = self.db.lock().unwrap();
             unsafe {
                 ffi::sqlite3_finalize(self.stmt);
             }

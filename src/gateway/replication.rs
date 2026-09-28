@@ -31,6 +31,15 @@ use crate::transport::grpc::{DEFAULT_GRPC_CHANNEL_CAPACITY, GrpcTransport};
 /// Default timeout for individual replication sessions (120 seconds).
 pub const DEFAULT_REPLICATION_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Short grace period for sending error/close messages after a session timeout.
+///
+/// After a replication timeout fires, the outgoing `mpsc::Sender::send` can
+/// block indefinitely if the consumer has stalled and the bounded channel is
+/// full. This keeps the spawned task alive long past the session timeout.
+/// Wrapping post-timeout sends in a second, short timeout bounds the worst
+/// case to `DEFAULT_REPLICATION_TIMEOUT + POST_TIMEOUT_GRACE`.
+const POST_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
+
 /// gRPC Replication Service server handler.
 #[derive(Clone)]
 pub struct ReplicationServer {
@@ -167,23 +176,31 @@ impl ReplicationService for ReplicationServer {
                         Ok(Ok(())) => {}
                         Ok(Err(ref e)) => {
                             tracing::error!(database = %db_name, error = %e, "server origin sync failed");
-                            let _ = transport
-                                .send(&Message::Error {
+                            let _ = tokio::time::timeout(
+                                POST_TIMEOUT_GRACE,
+                                transport.send(&Message::Error {
                                     message: e.to_string(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
                         Err(_) => {
                             tracing::error!(database = %db_name, "server origin sync timed out");
-                            let _ = transport
-                                .send(&Message::Error {
+                            let _ = tokio::time::timeout(
+                                POST_TIMEOUT_GRACE,
+                                transport.send(&Message::Error {
                                     message: "replication session timed out".to_string(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
                     }
                     let _ = snap.commit();
-                    let _ = transport.close().await;
+                    let _ = tokio::time::timeout(
+                        POST_TIMEOUT_GRACE,
+                        transport.close(),
+                    )
+                    .await;
                 });
             }
             ClientRole::Origin => {
@@ -224,22 +241,30 @@ impl ReplicationService for ReplicationServer {
                         Ok(Ok(())) => {}
                         Ok(Err(ref e)) => {
                             tracing::error!(database = %db_name, error = %e, "server replica sync failed");
-                            let _ = transport
-                                .send(&Message::Error {
+                            let _ = tokio::time::timeout(
+                                POST_TIMEOUT_GRACE,
+                                transport.send(&Message::Error {
                                     message: e.to_string(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
                         Err(_) => {
                             tracing::error!(database = %db_name, "server replica sync timed out");
-                            let _ = transport
-                                .send(&Message::Error {
+                            let _ = tokio::time::timeout(
+                                POST_TIMEOUT_GRACE,
+                                transport.send(&Message::Error {
                                     message: "replication session timed out".to_string(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
                     }
-                    let _ = transport.close().await;
+                    let _ = tokio::time::timeout(
+                        POST_TIMEOUT_GRACE,
+                        transport.close(),
+                    )
+                    .await;
                 });
             }
             _ => unreachable!(),
