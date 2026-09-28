@@ -88,6 +88,23 @@ use tonic::transport::{ClientTlsConfig, Endpoint};
 
 const LOCAL_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Normalize user-facing gRPC URL schemes to the `http`/`https` schemes that
+/// tonic's `Endpoint::from_shared` expects.
+///
+/// * `grpc://`  → `http://`
+/// * `grpcs://` → `https://`
+///
+/// Other schemes (including `http://` and `https://`) are returned unchanged.
+fn normalize_grpc_url(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("grpcs://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = url.strip_prefix("grpc://") {
+        format!("http://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
 /// Runtime tuning knobs for CPU-sensitive hashing paths.
 #[derive(Debug, Clone)]
 pub struct SyncTuning {
@@ -354,9 +371,10 @@ pub async fn grpc_push_sync_with_tuning(
     let origin_conn = Connection::open(origin_path, ffi::SQLITE_OPEN_READONLY)?;
     let snap = Snapshot::begin(&origin_conn)?;
 
-    let mut endpoint = Endpoint::from_shared(url.to_string())
+    let normalized = normalize_grpc_url(url);
+    let mut endpoint = Endpoint::from_shared(normalized.clone())
         .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?;
-    if url.starts_with("https://") || url.starts_with("grpcs://") {
+    if normalized.starts_with("https://") {
         endpoint = endpoint
             .tls_config(ClientTlsConfig::new())
             .map_err(|e| SyncError::Network(format!("failed to configure TLS: {e}")))?;
@@ -439,9 +457,10 @@ pub async fn grpc_pull_sync_with_tuning(
         ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
     )?;
 
-    let mut endpoint = Endpoint::from_shared(url.to_string())
+    let normalized = normalize_grpc_url(url);
+    let mut endpoint = Endpoint::from_shared(normalized.clone())
         .map_err(|e| SyncError::Network(format!("invalid gRPC URL: {e}")))?;
-    if url.starts_with("https://") || url.starts_with("grpcs://") {
+    if normalized.starts_with("https://") {
         endpoint = endpoint
             .tls_config(ClientTlsConfig::new())
             .map_err(|e| SyncError::Network(format!("failed to configure TLS: {e}")))?;
@@ -600,5 +619,37 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_grpc_url_grpcs() {
+        assert_eq!(
+            normalize_grpc_url("grpcs://example.com:443"),
+            "https://example.com:443"
+        );
+    }
+
+    #[test]
+    fn test_normalize_grpc_url_grpc() {
+        assert_eq!(
+            normalize_grpc_url("grpc://example.com:50051"),
+            "http://example.com:50051"
+        );
+    }
+
+    #[test]
+    fn test_normalize_grpc_url_https_passthrough() {
+        assert_eq!(
+            normalize_grpc_url("https://example.com:443"),
+            "https://example.com:443"
+        );
+    }
+
+    #[test]
+    fn test_normalize_grpc_url_http_passthrough() {
+        assert_eq!(
+            normalize_grpc_url("http://example.com:50051"),
+            "http://example.com:50051"
+        );
     }
 }
