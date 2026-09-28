@@ -58,6 +58,48 @@ impl AuthConfig {
             Err(Status::unauthenticated("invalid bearer token"))
         }
     }
+
+    /// Check whether a given raw token matches the configured secret.
+    pub fn check_token(&self, token: &str) -> Result<(), Status> {
+        let Some(expected) = &self.token else {
+            return Ok(());
+        };
+        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+            Ok(())
+        } else {
+            Err(Status::unauthenticated("invalid auth token"))
+        }
+    }
+
+    /// Check request metadata or explicit token payload against this auth configuration.
+    pub fn check_request_or_token(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        payload_token: Option<&str>,
+    ) -> Result<(), Status> {
+        let Some(expected) = &self.token else {
+            return Ok(());
+        };
+
+        if let Some(header) = metadata.get("authorization")
+            && let Ok(value) = header.to_str()
+            && let Some(provided) = value.strip_prefix("Bearer ")
+            && constant_time_eq(provided.as_bytes(), expected.as_bytes())
+        {
+            return Ok(());
+        }
+
+        if let Some(token) = payload_token
+            && !token.is_empty()
+            && constant_time_eq(token.as_bytes(), expected.as_bytes())
+        {
+            return Ok(());
+        }
+
+        Err(Status::unauthenticated(
+            "missing or invalid authorization credentials",
+        ))
+    }
 }
 
 /// Compare two byte strings without branching on *where* they first differ,
@@ -140,6 +182,38 @@ mod tests {
     fn required_accepts_matching_token() {
         let auth = AuthConfig::required("secret".into());
         assert!(auth.check(request_with_header("Bearer secret")).is_ok());
+    }
+
+    #[test]
+    fn check_token_tests() {
+        let auth_req = AuthConfig::required("secret".into());
+        assert!(auth_req.check_token("secret").is_ok());
+        assert!(auth_req.check_token("wrong").is_err());
+
+        let auth_dis = AuthConfig::disabled();
+        assert!(auth_dis.check_token("anything").is_ok());
+        assert!(auth_dis.check_token("").is_ok());
+    }
+
+    #[test]
+    fn check_request_or_token_tests() {
+        let auth = AuthConfig::required("secret".into());
+        let meta = tonic::metadata::MetadataMap::new();
+        assert!(auth.check_request_or_token(&meta, Some("secret")).is_ok());
+        assert!(auth.check_request_or_token(&meta, Some("wrong")).is_err());
+        assert!(auth.check_request_or_token(&meta, None).is_err());
+
+        let mut meta_with_bearer = tonic::metadata::MetadataMap::new();
+        meta_with_bearer.insert("authorization", "Bearer secret".parse().unwrap());
+        assert!(auth.check_request_or_token(&meta_with_bearer, None).is_ok());
+
+        let mut meta_with_wrong = tonic::metadata::MetadataMap::new();
+        meta_with_wrong.insert("authorization", "Bearer wrong".parse().unwrap());
+        assert!(auth.check_request_or_token(&meta_with_wrong, None).is_err());
+        assert!(
+            auth.check_request_or_token(&meta_with_wrong, Some("secret"))
+                .is_ok()
+        );
     }
 
     #[test]

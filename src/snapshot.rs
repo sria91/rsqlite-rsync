@@ -104,6 +104,11 @@ impl Drop for Snapshot<'_> {
     }
 }
 
+// SAFETY: `Snapshot` owns a unique reference to its `Connection` for the lifetime of
+// the snapshot and only invokes methods on `conn` at commit/drop time. Since `Connection`
+// is `Send`, moving `Snapshot` across threads is safe. It is not `Sync`.
+unsafe impl Send for Snapshot<'_> {}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────

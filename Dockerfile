@@ -49,6 +49,7 @@ FROM alpine:3.21 AS runtime
 
 RUN apk add --no-cache \
     ca-certificates \
+    jq \
     kubectl \
     openssh-client \
     openssh-server \

@@ -38,7 +38,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 futures = "0.3"
 serde_yaml = "0.9"
 toml = "1.1"
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
 comfy-table = "8"
 rustyline = "18"
 rsqlite-rsync-proto = { path = "crates/rsqlite-rsync-proto" }
@@ -89,6 +89,10 @@ path = "tests/integration/grpc_gateway.rs"
 [[test]]
 name = "grpc_failover"
 path = "tests/integration/grpc_failover.rs"
+
+[[test]]
+name = "grpc_replication"
+path = "tests/integration/grpc_replication.rs"
 
 [[test]]
 name = "push_pull_fake_ssh"

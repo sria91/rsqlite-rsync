@@ -60,6 +60,13 @@ service SqlGateway {
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
 }
 
+// ── Replication Service Definition ──────────────────────────────────────────
+
+service ReplicationService {
+  // Bidirectional streaming synchronization for both Push and Pull replication
+  rpc Sync(stream SyncMessage) returns (stream SyncMessage);
+}
+
 // ── Execute Messages ─────────────────────────────────────────────────────────
 
 message ExecuteRequest {
@@ -196,3 +203,77 @@ message DropDatabaseResponse {
   bool existed = 1;         // False if the database file was already absent
   uint64 generation = 2;    // Cluster writer generation when executed
 }
+
+// ── Replication Messages ─────────────────────────────────────────────────────
+
+message SyncMessage {
+  oneof payload {
+    SyncInit init = 1;
+    SyncHello hello = 2;
+    SyncHelloAck hello_ack = 3;
+    SyncGroupHashes group_hashes = 4;
+    SyncGroupsNeedFine groups_need_fine = 5;
+    SyncPageHashes page_hashes = 6;
+    SyncSendPages send_pages = 7;
+    SyncPagesAck pages_ack = 8;
+    SyncDone done = 9;
+    SyncError error = 10;
+  }
+}
+
+message SyncInit {
+  string database = 1;
+  enum ClientRole {
+    CLIENT_ROLE_UNSPECIFIED = 0;
+    CLIENT_ROLE_REPLICA = 1; // Pull sync (client is replica, server is origin)
+    CLIENT_ROLE_ORIGIN = 2;  // Push sync (client is origin, server is replica)
+  }
+  ClientRole client_role = 2;
+  string auth_token = 3;
+}
+
+message SyncHello {
+  uint32 version = 1;
+  uint32 page_size = 2;
+  uint32 page_count = 3;
+}
+
+message SyncHelloAck {
+  uint32 version = 1;
+  uint32 page_size = 2;
+  uint32 page_count = 3;
+}
+
+message SyncGroupHashes {
+  uint32 first_group = 1;
+  bytes hashes = 2; // Contiguous packed 32-byte hashes
+}
+
+message SyncGroupsNeedFine {
+  repeated uint32 group_indices = 1;
+}
+
+message SyncPageHashes {
+  repeated uint32 page_nos = 1;
+  bytes hashes = 2; // Contiguous packed 32-byte hashes
+}
+
+message SyncPageData {
+  uint32 page_no = 1;
+  bytes data = 2;
+}
+
+message SyncSendPages {
+  repeated SyncPageData pages = 1;
+}
+
+message SyncPagesAck {
+  repeated uint32 page_nos = 1;
+}
+
+message SyncDone {}
+
+message SyncError {
+  string message = 1;
+}
+

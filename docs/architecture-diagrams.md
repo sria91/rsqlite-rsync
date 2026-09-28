@@ -49,12 +49,12 @@ flowchart TB
         %% --- Node A (Leader) ---
         subgraph NodeLeader["Node A (Active Leader / Writer)"]
             direction TB
-            L_GW["SqlGatewayServer (gRPC :50051)<br/>• Auth Token Validator<br/>• Write Access Gate: ALLOWED"]
-            L_Engine["DatabaseEngine & rusqlite<br/>• Snapshot Isolation<br/>• WAL Mode Read/Write"]
+            L_GW["SqlGatewayServer & ReplicationServiceServer (gRPC :50051)<br/>• Auth Token Validator<br/>• Write Access Gate: ALLOWED<br/>• gRPC Delta-Replication Service"]
+            L_Engine["DatabaseEngine & rsqlite<br/>• Snapshot Isolation<br/>• WAL Mode Read/Write"]
             L_DB[("SQLite Database<br/>Primary WAL file")]
             L_HA["HaController (Role: Writer)<br/>• Renews Lease Heartbeat<br/>• Tracks Freshness Ledger"]
 
-            L_GW -->|"Dispatches Query/Execute"| L_Engine
+            L_GW -->|"Dispatches Query/Execute/Sync"| L_Engine
             L_Engine -->|"Reads & Writes"| L_DB
             L_HA -->|"Updates Freshness"| L_Engine
         end
@@ -62,12 +62,12 @@ flowchart TB
         %% --- Node B (Replica) ---
         subgraph NodeReplica["Node B (Standby Replica)"]
             direction TB
-            R_GW["SqlGatewayServer (gRPC :50051)<br/>• Auth Token Validator<br/>• Write Access Gate: REJECTED"]
-            R_Engine["DatabaseEngine & rusqlite<br/>• Read-Only Snapshot Engine"]
+            R_GW["SqlGatewayServer & ReplicationServiceServer (gRPC :50051)<br/>• Auth Token Validator<br/>• Write Access Gate: REJECTED<br/>• gRPC Delta-Replication Service"]
+            R_Engine["DatabaseEngine & rsqlite<br/>• Read-Only Snapshot Engine"]
             R_DB[("SQLite Database<br/>Replicated WAL file")]
             R_HA["HaController (Role: Replica)<br/>• Observes Lease Expiration<br/>• Fencing & Lineage Safety Check"]
 
-            R_GW -->|"Optional Reads"| R_Engine
+            R_GW -->|"Optional Reads / Inbound gRPC Sync"| R_Engine
             R_Engine -->|"Reads Only"| R_DB
             R_HA -->|"Monitors Lag"| R_Engine
         end
@@ -82,7 +82,7 @@ flowchart TB
         SidecarReplica["Replica Sync Agent<br/>(rsqlite-rsync page applicator)"]
         
         subgraph TransportLayer["Pluggable Transport Layer"]
-            Trans["Transport Trait<br/>• SshTransport (SSH Tunnel)<br/>• StdioTransport (Pipes)<br/>• LocalTransport (Memory)"]
+            Trans["Transport Trait<br/>• GrpcTransport (HTTP/2 gRPC Streaming)<br/>• SshTransport (SSH Tunnel)<br/>• StdioTransport (Pipes)<br/>• LocalTransport (Memory)"]
         end
 
         SidecarReplica -->|"1. Send Page Hash Table"| Trans
@@ -112,15 +112,15 @@ flowchart TB
 ```mermaid
 graph TD
     subgraph CargoWorkspace["Cargo Workspace"]
-        Proto["crates/rsqlite-rsync-proto<br/>• Protobuf schema (v1)<br/>• Generated Tonic traits & structs"]
+        Proto["crates/rsqlite-rsync-proto<br/>• Protobuf schema (v1)<br/>• SqlGateway & ReplicationService traits<br/>• Generated Tonic traits & structs"]
         Client["crates/rsqlite-rsync-client<br/>• Async client (tokio/tonic)<br/>• Blocking sync wrapper<br/>• Leader discovery & retry"]
         Pool["crates/rsqlite-rsync-pool<br/>• bb8 manager<br/>• deadpool manager<br/>• r2d2 manager"]
-        ServerBin["rsqlite-rsync (Binary / src/)<br/>• CLI daemon & REPL<br/>• Gateway gRPC server<br/>• HA controller<br/>• Delta-sync engine"]
+        ServerBin["rsqlite-rsync (Binary / src/)<br/>• CLI daemon & REPL<br/>• Gateway & Replication gRPC servers<br/>• HA controller<br/>• Delta-sync engine (gRPC/SSH/Local)"]
     end
 
     Client -->|uses stubs| Proto
     Pool -->|manages| Client
-    ServerBin -->|implements service| Proto
+    ServerBin -->|implements services| Proto
 ```
 
 ---
@@ -130,12 +130,24 @@ graph TD
 ```mermaid
 flowchart TD
     ClientReq([Incoming gRPC Request<br/>Query / Execute / Batch]) --> Server[SqlGatewayServer<br/>Tonic gRPC Service Dispatcher]
+    ReplReq([Incoming gRPC Sync Stream<br/>ReplicationService.Sync]) --> ReplServer[ReplicationServer<br/>Bidirectional Streaming gRPC Service]
+    
     Server --> Auth[Auth Middleware<br/>Bearer Token Validation]
+    ReplServer --> ReplAuth[Auth Validator<br/>Metadata Bearer or SyncInit Token]
+
     Auth --> RoleGate{Write Access Gate<br/>SqlGatewayServer::check_write_access}
 
     RoleGate -->|Write on Replica| ErrorResp["Return gRPC FAILED_PRECONDITION<br/>Header: x-rsqlite-leader-endpoint (optional)"]
     RoleGate -->|Read OR Authorized Leader Write| Engine[DatabaseEngine<br/>Request Dispatcher]
-    Engine --> SQLiteConn["rusqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control"]
+    
+    ReplAuth --> ReplRoleGate{Sync Role Gate<br/>ClientRole::Origin vs Replica}
+    ReplRoleGate -->|Origin: Push to Local DB| ReplWrite["replica::run_with_tuning<br/>Open Read-Write Connection"]
+    ReplRoleGate -->|Replica: Pull from Local DB| ReplRead["origin::run_with_tuning<br/>Open Read-Only Snapshot"]
+    
+    ReplWrite --> SQLiteConn
+    ReplRead --> SQLiteConn
+
+    Engine --> SQLiteConn["rsqlite Connection Engine<br/>• In-memory / WAL file<br/>• Snapshot isolation<br/>• Concurrency control"]
 
     SQLiteConn --> Disk[("SQLite DB File<br/>db.sqlite + WAL")]
 ```
@@ -148,26 +160,27 @@ flowchart TD
 sequenceDiagram
     autonumber
     participant Replica as Replica Node
-    participant Transport as Transport Layer (SSH / Stdio / Local)
+    participant Transport as Transport Layer (gRPC / SSH / Stdio / Local)
     participant Origin as Origin (Leader Node)
     participant SQLite as SQLite Database (WAL)
 
-    Replica->>Transport: Initiate Sync Session
+    Note over Replica,Origin: If gRPC: Stream begins with SyncInit (DB name, ClientRole, AuthToken)
+    Replica->>Transport: Initiate Sync Session (SyncInit / SSH exec)
     Transport->>Origin: Forward Sync Request
     
     Replica->>Replica: Hash local database pages
-    Replica->>Transport: Send Page Hash Table
+    Replica->>Transport: Send Page Hash Table (SyncGroupHashes / SyncPageHashes)
     Transport->>Origin: Deliver Replica Hashes
 
     Origin->>SQLite: Snapshot::begin() (Consistent Read)
     Origin->>Origin: Hash Origin pages & compute diff delta
     
-    Origin->>Transport: Stream modified pages only (PageData chunks)
+    Origin->>Transport: Stream modified pages only (SyncSendPages / PageData chunks)
     Transport->>Replica: Deliver Delta Pages
     
     Replica->>Replica: Apply pages & verify negotiated hash (BLAKE3 / SHA-256)
-    Replica->>Transport: Send Sync ACK & Ledger Update
-    Transport->>Origin: Sync Complete
+    Replica->>Transport: Send Sync ACK (SyncPagesAck) & Ledger Update
+    Transport->>Origin: Sync Complete (SyncDone)
 ```
 
 ---
@@ -262,14 +275,14 @@ flowchart TD
     %% Mode 1: One-Shot Sync
     Switch -->|"rsqlite-rsync <origin> <replica>"| M1["1. One-Shot Sync Mode"]
     subgraph Mode1["Direct Point-to-Point Sync"]
-        M1 --> M1_Core["Sync Engine<br/>• Local or SSH Transport<br/>• Single database pair<br/>• Optional --dry-run"]
+        M1 --> M1_Core["Sync Engine<br/>• Local, SSH, or gRPC (grpc://)<br/>• Single database pair<br/>• Optional --dry-run / --grpc-auth-token"]
         M1_Core --> M1_Exit(["Sync completed & exits"])
     end
 
     %% Mode 2: Batch Sync
     Switch -->|"--batch-manifest <file>"| M2["2. Batch Sync Mode"]
     subgraph Mode2["Multi-Database Batch Sync"]
-        M2 --> M2_Pool["Parallel Worker Pool<br/>• --batch-jobs N<br/>• Retry policies with backoff/jitter<br/>• Structured JSON/Text reporting"]
+        M2 --> M2_Pool["Parallel Worker Pool<br/>• --batch-jobs N<br/>• Supports Local, SSH, and gRPC endpoints<br/>• Retry policies with backoff/jitter<br/>• Structured JSON/Text reporting"]
         M2_Pool --> M2_Exit(["All jobs finished & exits"])
     end
 
@@ -277,7 +290,7 @@ flowchart TD
     Switch -->|"--ha"| M3["3. High Availability Daemon Mode"]
     subgraph Mode3["Long-Running Cluster Daemon"]
         M3 --> M3_HA["HA Controller Loop<br/>• Lease observation/validation<br/>• Role: Leader vs Replica<br/>• Freshness ledger & health probes"]
-        M3 --> M3_GW["Embedded gRPC SQL Gateway<br/>• Optional --ha-grpc-bind<br/>• Bearer token auth<br/>• NOT_LEADER write redirection"]
+        M3 --> M3_GW["Embedded gRPC Server (SQL Gateway + Replication)<br/>• Port --ha-grpc-bind<br/>• SqlGatewayServer (Queries & Mutations)<br/>• ReplicationServiceServer (Live Delta Sync)<br/>• Bearer token auth<br/>• NOT_LEADER write redirection"]
     end
 
     %% Mode 4: Client & SQL REPL
@@ -294,7 +307,7 @@ flowchart TD
 
 Comparison between running `rsqlite-rsync` in Standalone (SA) local mode vs. a distributed High Availability (HA) cluster.
 
-> **Security Note on Transports:** The gRPC SQL Gateway does not terminate TLS internally. Plaintext HTTP endpoints (such as `http://node-a:50051`) are suitable only within trusted network perimeters or behind TLS/mTLS termination proxies; untrusted networks must terminate TLS in front of the gateway.
+> **Security Note on Transports:** The gRPC SQL Gateway and Replication Service do not terminate TLS internally. Plaintext HTTP endpoints (such as `http://node-a:50051`) are suitable only within trusted network perimeters or behind TLS/mTLS termination proxies; untrusted networks must terminate TLS in front of the gateway.
 
 ```mermaid
 flowchart TB
@@ -318,7 +331,7 @@ flowchart TB
         end
 
         subgraph HA_Leader["Node A (Leader)"]
-            L_GW["SqlGatewayServer (gRPC)<br/>• Port 50051<br/>• Bearer Token Auth"]
+            L_GW["SqlGateway & Replication gRPC Server<br/>• Port 50051<br/>• Bearer Token Auth<br/>• Live Streaming Replication"]
             L_Ctrl["HaController<br/>• Role: Leader<br/>• Renews Lease"]
             L_DB[("SQLite Database<br/>(WAL Mode - Read/Write)")]
             
@@ -327,7 +340,7 @@ flowchart TB
         end
 
         subgraph HA_Replica["Node B (Replica / Standby)"]
-            R_GW["SqlGatewayServer (gRPC)<br/>• Port 50051<br/>• Bearer Token Auth"]
+            R_GW["SqlGateway & Replication gRPC Server<br/>• Port 50051<br/>• Bearer Token Auth<br/>• Live Streaming Replication"]
             R_Ctrl["HaController<br/>• Role: Replica<br/>• Monitors Lease & Lag"]
             R_DB[("SQLite Database<br/>(Replicated Snapshot)")]
             
@@ -338,7 +351,7 @@ flowchart TB
         HA_App -->|"1. Reads & Writes"| L_GW
         R_GW --x|"2. Rejects Writes (NOT_LEADER + Optional x-rsqlite-leader-endpoint)"| HA_App
 
-        L_DB ==>|"3. External replica-sync sidecar (rsqlite-rsync)"| R_DB
+        L_DB ==>|"3. Native gRPC delta-sync replication stream"| R_DB
     end
 ```
 
@@ -403,7 +416,7 @@ sequenceDiagram
 
 ## 11. Pluggable Transport Layer Architecture
 
-Abstraction hierarchy for data-plane sync transfers across in-memory buffers, local files, and secure SSH tunnels.
+Abstraction hierarchy for data-plane sync transfers across in-memory buffers, local files, secure SSH tunnels, and bidirectional gRPC streams.
 
 ```mermaid
 classDiagram
@@ -412,6 +425,13 @@ classDiagram
         +send(msg: Message) Result~()~
         +recv() Result~Message~
         +close() Result~()~
+    }
+
+    class GrpcTransport {
+        -tx: mpsc::Sender~SyncMessage~
+        -rx: Streaming~SyncMessage~
+        +new(tx, rx)
+        +into_parts() (Sender, Streaming)
     }
 
     class LocalTransport {
@@ -433,6 +453,7 @@ classDiagram
         +cleanup_control_path()
     }
 
+    Transport <|.. GrpcTransport : implements
     Transport <|.. LocalTransport : implements
     Transport <|.. StdioTransport : implements
     Transport <|.. SshTransport : implements

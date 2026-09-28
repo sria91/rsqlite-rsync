@@ -30,6 +30,7 @@ pub(crate) struct BatchRuntimeOptions {
     pub ssh_opts: Vec<String>,
     pub ssh_options: SshConnectOptions,
     pub tuning: SyncTuning,
+    pub grpc_auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,7 @@ pub(crate) struct BatchSyncSpec {
     pub retry_backoff_ms: Option<u64>,
     pub retry_backoff_max_ms: Option<u64>,
     pub retry_jitter_pct: Option<u8>,
+    pub grpc_auth_token: Option<String>,
 }
 
 impl BatchSyncSpec {
@@ -107,6 +109,8 @@ struct BatchEntryWire {
     retry_backoff_max_ms: Option<u64>,
     #[serde(default)]
     retry_jitter_pct: Option<u8>,
+    #[serde(default)]
+    grpc_auth_token: Option<String>,
 }
 
 pub(crate) fn load_manifest(path: &Path, format: ManifestFormat) -> Result<Vec<BatchSyncSpec>> {
@@ -213,6 +217,7 @@ pub(crate) fn load_manifest(path: &Path, format: ManifestFormat) -> Result<Vec<B
             retry_backoff_ms: entry.retry_backoff_ms,
             retry_backoff_max_ms: entry.retry_backoff_max_ms,
             retry_jitter_pct: entry.retry_jitter_pct,
+            grpc_auth_token: entry.grpc_auth_token,
         });
     }
 
@@ -474,9 +479,56 @@ async fn run_one_inner(
             )
             .await?;
         }
-        (Endpoint::Remote { .. }, Endpoint::Remote { .. }) => {
+        (Endpoint::Local(o), Endpoint::Grpc { url, database }) => {
+            info!(origin = %o.display(), grpc_url = %url, database = %database, dry_run, "batch gRPC push sync");
+            if dry_run {
+                return Ok(());
+            }
+
+            let auth_token = spec
+                .grpc_auth_token
+                .as_deref()
+                .or(options.grpc_auth_token.as_deref());
+
+            rsqlite_rsync::grpc_push_sync_with_tuning(
+                &o,
+                &url,
+                &database,
+                auth_token,
+                &options.tuning,
+            )
+            .await?;
+        }
+        (Endpoint::Grpc { url, database }, Endpoint::Local(r)) => {
+            info!(grpc_url = %url, database = %database, replica = %r.display(), dry_run, "batch gRPC pull sync");
+            if dry_run {
+                return Ok(());
+            }
+
+            let auth_token = spec
+                .grpc_auth_token
+                .as_deref()
+                .or(options.grpc_auth_token.as_deref());
+
+            rsqlite_rsync::grpc_pull_sync_with_tuning(
+                &r,
+                &url,
+                &database,
+                auth_token,
+                &options.tuning,
+            )
+            .await?;
+        }
+        (Endpoint::Remote { .. }, Endpoint::Remote { .. })
+        | (Endpoint::Remote { .. }, Endpoint::Grpc { .. })
+        | (Endpoint::Grpc { .. }, Endpoint::Remote { .. }) => {
             return Err(SyncError::Protocol(
                 "at least one of ORIGIN or REPLICA must be local".into(),
+            ));
+        }
+        (Endpoint::Grpc { .. }, Endpoint::Grpc { .. }) => {
+            return Err(SyncError::Protocol(
+                "gRPC to gRPC sync not supported".into(),
             ));
         }
     }
@@ -545,6 +597,7 @@ mod tests {
             ssh_opts: Vec::new(),
             ssh_options: SshConnectOptions::default(),
             tuning: SyncTuning::default(),
+            grpc_auth_token: None,
         }
     }
 
@@ -559,6 +612,7 @@ mod tests {
             retry_backoff_ms: None,
             retry_backoff_max_ms: None,
             retry_jitter_pct: None,
+            grpc_auth_token: None,
         }
     }
 
@@ -1042,6 +1096,7 @@ mod tests {
             retry_backoff_ms: Some(1),
             retry_backoff_max_ms: None,
             retry_jitter_pct: None,
+            grpc_auth_token: None,
         };
 
         let mut opts = default_runtime_options();
@@ -1072,6 +1127,7 @@ mod tests {
             retry_backoff_ms: None,
             retry_backoff_max_ms: None,
             retry_jitter_pct: None,
+            grpc_auth_token: None,
         };
         assert!(run_one_inner(&spec_local, true, &opts).await.is_ok());
 
@@ -1086,6 +1142,7 @@ mod tests {
             retry_backoff_ms: None,
             retry_backoff_max_ms: None,
             retry_jitter_pct: None,
+            grpc_auth_token: None,
         };
         assert!(run_one_inner(&spec_push, true, &opts).await.is_ok());
 
@@ -1100,6 +1157,7 @@ mod tests {
             retry_backoff_ms: None,
             retry_backoff_max_ms: None,
             retry_jitter_pct: None,
+            grpc_auth_token: None,
         };
         assert!(run_one_inner(&spec_pull, true, &opts).await.is_ok());
     }

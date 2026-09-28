@@ -10,6 +10,7 @@
 use crate::error::{Result, SyncError};
 use crate::protocol::messages::{MAX_MESSAGE_SIZE, Message, decode};
 
+pub mod grpc;
 pub mod local;
 pub mod ssh;
 pub mod stdio;
