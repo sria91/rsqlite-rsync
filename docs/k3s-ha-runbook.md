@@ -90,6 +90,7 @@ Run these commands from the repository root:
    - `RSQLITE_RSYNC_IMAGE=ghcr.io/YOUR_ORG/rsqlite-rsync:TAG scripts/apply-k3s-ha-stack.sh`
 2. Optional overrides:
    - `RSQLITE_RSYNC_REPLICA_SYNC_COMMAND` (default: `sh /scripts/default-replica-sync.sh`, which syncs all `*.db` files via native gRPC replication on port 50051; override if using a custom sync command/transport)
+   - `RSQLITE_RSYNC_KUBECTL_IMAGE` (default: `bitnami/kubectl:1.32.2`, pinned image for reproducible sidecar/init execution)
    - `RSQLITE_RSYNC_NAMESPACE` (default: `sqlite-ha`)
    - `RSQLITE_RSYNC_HOST_DATA_DIR` (default: `/var/lib/rsqlite-rsync-ha`)
    - `RSQLITE_RSYNC_CLIENT_POD_NAME` (default: `sqlite-ha-client`, when applying the client pod)

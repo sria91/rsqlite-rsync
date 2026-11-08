@@ -10,6 +10,8 @@ if [[ ! -f "$template" ]]; then
 fi
 
 : "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:0.5.0 or ghcr.io/sria91/rsqlite-rsync@sha256:<64-hex-digest>)}"
+# Pinned kubectl image for initContainers and sidecars (reproducible deployments)
+RSQLITE_RSYNC_KUBECTL_IMAGE="${RSQLITE_RSYNC_KUBECTL_IMAGE:-bitnami/kubectl:1.32.2}"
 # Defaults to the manifest's own gRPC-based sync (default-replica-sync.sh,
 # using the embedded ReplicationService on port 50051 + sqlite-ha-grpc-auth
 # Secret) if unset. Set this to plug in a custom transport/auth model instead.
@@ -41,11 +43,13 @@ escape_sed_replacement() {
 }
 
 image_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_IMAGE")"
+kubectl_image_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_KUBECTL_IMAGE")"
 sync_cmd_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_REPLICA_SYNC_COMMAND")"
 host_data_dir_escaped="$(escape_sed_replacement "$RSQLITE_RSYNC_HOST_DATA_DIR")"
 
 sed \
   -e "s|__RSQLITE_RSYNC_IMAGE__|$image_escaped|g" \
+  -e "s|__RSQLITE_RSYNC_KUBECTL_IMAGE__|$kubectl_image_escaped|g" \
   -e "s|__RSQLITE_RSYNC_REPLICA_SYNC_COMMAND__|$sync_cmd_escaped|g" \
   -e "s|__RSQLITE_RSYNC_HOST_DATA_DIR__|$host_data_dir_escaped|g" \
   "$template" > "$rendered"
@@ -72,6 +76,7 @@ echo "Applied k3s HA stack"
 echo "namespace: $RSQLITE_RSYNC_NAMESPACE"
 echo "hostDataDir: $RSQLITE_RSYNC_HOST_DATA_DIR"
 echo "image: $RSQLITE_RSYNC_IMAGE"
+echo "kubectlImage: $RSQLITE_RSYNC_KUBECTL_IMAGE"
 echo "gRPC gateway token: kubectl -n $RSQLITE_RSYNC_NAMESPACE get secret sqlite-ha-grpc-auth -o go-template='{{.data.token | base64decode}}'"
 kubectl -n "$RSQLITE_RSYNC_NAMESPACE" rollout restart statefulset/sqlite-ha
 kubectl get pods -n "$RSQLITE_RSYNC_NAMESPACE" -w

@@ -146,6 +146,16 @@ data:
           local_generation="${role_state#writer:}"
           now_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
 
+          # Verify that this pod is indeed the recorded holder in Kubernetes before renewing.
+          # If another pod has claimed the Lease (e.g. during failover or a network blip),
+          # do not blindly overwrite it using merge patch or apply.
+          current_holder="$(kubectl -n "${POD_NAMESPACE}" get lease "${lease_name}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+          if [ -z "$current_holder" ] || [ "$current_holder" != "${POD_NAME}" ]; then
+            try_claim
+            sleep "$renew_sleep"
+            continue
+          fi
+
           observed_generation="$(current_generation)"
           if [ -n "$observed_generation" ] && [ "$observed_generation" != "$local_generation" ]; then
             if [ "$observed_generation" -gt "$local_generation" ] 2>/dev/null; then
@@ -289,6 +299,8 @@ data:
       else
         databases="$(printf '%s' "$status_json" | grep '"name":' | sed -e 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/' || true)"
       fi
+    else
+      databases="$(printf '%s' "$databases" | tr ',' '\n')"
     fi
 
     if [ -z "$databases" ]; then
@@ -296,6 +308,12 @@ data:
     fi
 
     sync_failed=0
+    # Disable globbing (pathname expansion) and split strictly on newlines
+    # so database names containing spaces, tabs, or wildcards are parsed safely.
+    old_ifs="$IFS"
+    set -f
+    IFS='
+'
     for name in $databases; do
       [ -n "$name" ] || continue
 
@@ -306,6 +324,8 @@ data:
         sync_failed=1
       fi
     done
+    IFS="$old_ifs"
+    set +f
 
     # Remove local databases the writer no longer has if discovery and sync succeeded
     if [ "$sync_failed" -eq 0 ] && [ -n "$databases" ]; then
@@ -317,12 +337,18 @@ data:
         fi
         local_name="$(basename "$local_path")"
         found=0
+        old_ifs="$IFS"
+        set -f
+        IFS='
+'
         for name in $databases; do
           if [ "$name" = "$local_name" ]; then
             found=1
             break
           fi
         done
+        IFS="$old_ifs"
+        set +f
         if [ "$found" -eq 0 ]; then
           echo "default-replica-sync: removing stale database ${local_name}" >&2
           rm -f "${local_path}" "${local_path}-wal" "${local_path}-shm"
@@ -420,7 +446,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       initContainers:
         - name: data-dir-permissions
-          image: bitnami/kubectl:latest
+          image: __RSQLITE_RSYNC_KUBECTL_IMAGE__
           imagePullPolicy: IfNotPresent
           command:
             - /bin/sh
@@ -519,7 +545,7 @@ spec:
               mountPath: /var/lib/sqlite
 
         - name: lease-updater
-          image: bitnami/kubectl:latest
+          image: __RSQLITE_RSYNC_KUBECTL_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/scripts/lease-updater.sh"]
           env:
@@ -587,7 +613,7 @@ spec:
               mountPath: /var/lib/sqlite
 
         - name: label-updater
-          image: bitnami/kubectl:latest
+          image: __RSQLITE_RSYNC_KUBECTL_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/scripts/label-updater.sh"]
           env:
