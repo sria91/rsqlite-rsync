@@ -206,7 +206,7 @@ kind: ConfigMap
 metadata:
   name: shared"
 
-  capture_result "$a,$b" "ConfigMap/shared" ""
+  capture_result "$a,$b" "ConfigMap/shared" "" 1 1
 
   assert_exit_code "$result_code" 0
 }
