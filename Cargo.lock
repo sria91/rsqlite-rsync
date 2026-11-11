@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-rsync"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-rsync-client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "rsqlite-rsync-proto",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-rsync-pool"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bb8",
  "deadpool",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-rsync-proto"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

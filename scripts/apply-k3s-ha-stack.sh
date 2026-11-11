@@ -9,7 +9,7 @@ if [[ ! -f "$template" ]]; then
   exit 1
 fi
 
-: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:0.5.0 or ghcr.io/sria91/rsqlite-rsync@sha256:<64-hex-digest>)}"
+: "${RSQLITE_RSYNC_IMAGE:?Set RSQLITE_RSYNC_IMAGE to a pullable image (for example ghcr.io/sria91/rsqlite-rsync:0.5.1 or ghcr.io/sria91/rsqlite-rsync@sha256:<64-hex-digest>)}"
 # Pinned kubectl image for initContainers and sidecars (reproducible deployments)
 RSQLITE_RSYNC_KUBECTL_IMAGE="${RSQLITE_RSYNC_KUBECTL_IMAGE:-bitnami/kubectl:1.32.2}"
 # Defaults to the manifest's own gRPC-based sync (default-replica-sync.sh,
