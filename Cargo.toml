@@ -20,7 +20,7 @@ name = "rsqlite_rsync"
 path = "src/lib.rs"
 
 [dependencies]
-libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+libsqlite3-sys = { version = "0.39", features = ["bundled"] }
 clap = { version = "4", features = ["derive", "env"] }
 sha2 = "0.11"
 blake3 = "1"
